@@ -1,0 +1,33 @@
+name: Run BB Touch Bot
+
+on:
+  schedule:
+    - cron: '1 0,4,8,12,16,20 * * *'  # Every 4 hours at 1 minute past the hour
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Cache conda packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.conda/pkgs
+          key: ${{ runner.os }}-conda-pkgs-${{ hashFiles('environment.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-conda-pkgs-
+
+      - name: Set up Miniconda and create environment
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          environment-file: environment.yml
+          activate-environment: bb-touch-bot
+          auto-update-conda: true
+
+      - name: Run bot
+        shell: bash -l {0}
+        run: python RsiBot.py
