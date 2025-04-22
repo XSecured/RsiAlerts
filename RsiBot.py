@@ -32,9 +32,10 @@ BB_STDDEV = 2
 PROXY_LIST_URL = "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 
 class ProxyManager:
-    def __init__(self, proxy_url, test_url, max_proxies=20, timeout=5):
+    def __init__(self, proxy_url, test_url, test_params, max_proxies=20, timeout=5):
         self.proxy_url = proxy_url
         self.test_url = test_url
+        self.test_params = test_params
         self.max_proxies = max_proxies
         self.timeout = timeout
         self.lock = threading.Lock()
@@ -60,7 +61,7 @@ class ProxyManager:
         for proxy in raw_proxies:
             proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
             try:
-                r = requests.get(self.test_url, proxies=proxies, timeout=self.timeout)
+                r = requests.get(self.test_url, params=self.test_params, proxies=proxies, timeout=self.timeout)
                 if r.status_code == 200:
                     valid.append(proxy)
                     logging.info(f"Proxy {proxy} works.")
@@ -209,7 +210,8 @@ def main():
 
     proxy_manager = ProxyManager(
         proxy_url=PROXY_LIST_URL,
-        test_url=BINANCE_FUTURES_EXCHANGE_INFO,
+        test_url=BINANCE_FUTURES_KLINES,
+        test_params={"symbol": "BTCUSDT", "interval": "1d", "limit": 1},
         max_proxies=20,
         timeout=5
     )
