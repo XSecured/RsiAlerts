@@ -45,6 +45,17 @@ class ProxyManager:
             logging.error("No working proxies found. Exiting.")
             raise RuntimeError("No working proxies available.")
 
+    def test_single_proxy(self, proxy):
+        proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+        try:
+            r = requests.get(self.test_url, params=self.test_params, proxies=proxies, timeout=self.timeout)
+            if r.status_code == 200:
+                logging.info(f"Proxy {proxy} works.")
+                return proxy
+        except Exception:
+            pass
+        return None
+
     def fetch_and_test_proxies(self):
         logging.info("Fetching proxy list...")
         try:
@@ -57,18 +68,18 @@ class ProxyManager:
 
         random.shuffle(raw_proxies)
         valid = []
-        logging.info(f"Testing proxies to find up to {self.max_proxies} working ones...")
-        for proxy in raw_proxies:
-            proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
-            try:
-                r = requests.get(self.test_url, params=self.test_params, proxies=proxies, timeout=self.timeout)
-                if r.status_code == 200:
+
+        logging.info(f"Testing proxies to find up to {self.max_proxies} working ones (multithreaded)...")
+
+        with ThreadPoolExecutor(max_workers=50) as executor:
+            futures = {executor.submit(self.test_single_proxy, proxy): proxy for proxy in raw_proxies}
+            for future in as_completed(futures):
+                proxy = future.result()
+                if proxy:
                     valid.append(proxy)
-                    logging.info(f"Proxy {proxy} works.")
-                if len(valid) >= self.max_proxies:
-                    break
-            except Exception:
-                continue
+                    if len(valid) >= self.max_proxies:
+                        break
+
         logging.info(f"Found {len(valid)} working proxies.")
         return valid
 
