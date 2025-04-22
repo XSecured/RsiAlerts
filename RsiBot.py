@@ -20,7 +20,7 @@ BINANCE_FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 
 TIMEFRAMES = ['4h', '1d', '1w']
-CANDLE_LIMIT = 50
+CANDLE_LIMIT = 52
 
 UPPER_TOUCH_THRESHOLD = 0.01  # 1%
 LOWER_TOUCH_THRESHOLD = 0.01  # 1%
@@ -48,13 +48,16 @@ class ProxyManager:
     def test_single_proxy(self, proxy):
         proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
         try:
+            import time
+            start = time.time()
             r = requests.get(self.test_url, params=self.test_params, proxies=proxies, timeout=self.timeout)
+            elapsed = time.time() - start
             if r.status_code == 200:
-                logging.info(f"Proxy {proxy} works.")
-                return proxy
+                logging.info(f"Proxy {proxy} works, response time: {elapsed:.2f}s")
+                return proxy, elapsed
         except Exception:
             pass
-        return None
+        return None, None
 
     def fetch_and_test_proxies(self):
         logging.info("Fetching proxy list...")
@@ -69,19 +72,22 @@ class ProxyManager:
         random.shuffle(raw_proxies)
         valid = []
 
-        logging.info(f"Testing proxies to find up to {self.max_proxies} working ones (multithreaded)...")
+        logging.info(f"Testing proxies to find up to {self.max_proxies} fastest working ones (multithreaded)...")
 
         with ThreadPoolExecutor(max_workers=50) as executor:
             futures = {executor.submit(self.test_single_proxy, proxy): proxy for proxy in raw_proxies}
             for future in as_completed(futures):
-                proxy = future.result()
+                proxy, speed = future.result()
                 if proxy:
-                    valid.append(proxy)
-                    if len(valid) >= self.max_proxies:
+                    valid.append((proxy, speed))
+                    if len(valid) >= self.max_proxies * 5:  # test more to pick fastest 5 later
                         break
 
-        logging.info(f"Found {len(valid)} working proxies.")
-        return valid
+        # Sort by speed ascending and keep only top 5
+        valid.sort(key=lambda x: x[1])
+        fastest = [p for p, s in valid[:5]]
+        logging.info(f"Selected top 5 fastest proxies: {fastest}")
+        return fastest
 
     def get_proxy(self):
         with self.lock:
@@ -156,11 +162,18 @@ def scan_symbol(symbol, timeframes, proxy_manager):
         if closes is None or len(closes) < CANDLE_LIMIT:
             logging.warning(f"Not enough data for {symbol} {timeframe}. Skipping.")
             continue
+
+        # Use second last candle to avoid current open candle
+        idx = -2
+        if idx < -len(closes):
+            logging.warning(f"Not enough candles for {symbol} {timeframe} to skip open candle. Skipping.")
+            continue
+
         rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
-        idx = -1
         if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]):
             logging.warning(f"NaN values for {symbol} {timeframe}, skipping.")
             continue
+
         rsi_val = rsi[idx]
         bb_upper_val = bb_upper[idx]
         bb_lower_val = bb_lower[idx]
@@ -210,6 +223,26 @@ def send_telegram_alert(bot_token, chat_id, message):
     except Exception as e:
         logging.error(f"Exception sending Telegram alert: {e}")
 
+def format_results_by_timeframe(results):
+    # Group results by timeframe
+    grouped = {}
+    for r in results:
+        grouped.setdefault(r['timeframe'], []).append(r)
+
+    messages = []
+    for timeframe, items in grouped.items():
+        header = f"*BB Touches on {timeframe} timeframe*\n"
+        lines = []
+        for item in items:
+            line = (
+                f"- *{item['symbol']}* touching *{item['touch_type']}* BB\n"
+                f"  RSI: {item['rsi']:.2f}, BB Upper: {item['bb_upper']:.2f}, BB Lower: {item['bb_lower']:.2f}\n"
+                f"  Time: {item['timestamp']}"
+            )
+            lines.append(line)
+        messages.append(header + "\n".join(lines))
+    return messages
+
 def main():
     TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -233,15 +266,9 @@ def main():
         logging.info("No BB touches detected at this time.")
         return
 
-    for res in results:
-        msg = (
-            f"*{res['symbol']}* on *{res['timeframe']}* timeframe\n"
-            f"RSI: {res['rsi']:.2f}\n"
-            f"BB Upper: {res['bb_upper']:.2f}\n"
-            f"BB Lower: {res['bb_lower']:.2f}\n"
-            f"Touch Type: {res['touch_type']}\n"
-            f"Timestamp: {res['timestamp']}"
-        )
+    messages = format_results_by_timeframe(results)
+
+    for msg in messages:
         send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
 
 if __name__ == "__main__":
