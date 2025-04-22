@@ -7,6 +7,7 @@ from datetime import datetime
 import os
 import threading
 import random
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
@@ -20,7 +21,7 @@ BINANCE_FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 
 TIMEFRAMES = ['4h', '1d', '1w']
-CANDLE_LIMIT = 52
+CANDLE_LIMIT = 50
 
 UPPER_TOUCH_THRESHOLD = 0.01  # 1%
 LOWER_TOUCH_THRESHOLD = 0.01  # 1%
@@ -32,23 +33,22 @@ BB_STDDEV = 2
 PROXY_LIST_URL = "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 
 class ProxyManager:
-    def __init__(self, proxy_url, test_url, test_params, max_proxies=20, timeout=5):
+    def __init__(self, proxy_url, test_url, test_params, max_proxies=20, timeout=5, max_failures=10):
         self.proxy_url = proxy_url
         self.test_url = test_url
         self.test_params = test_params
         self.max_proxies = max_proxies
         self.timeout = timeout
+        self.max_failures = max_failures
         self.lock = threading.Lock()
-        self.proxies = self.fetch_and_test_proxies()
+        self.failure_counts = {}
+        self.proxies = []
         self.index = 0
-        if not self.proxies:
-            logging.error("No working proxies found. Exiting.")
-            raise RuntimeError("No working proxies available.")
+        self.refresh_proxies()
 
     def test_single_proxy(self, proxy):
         proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
         try:
-            import time
             start = time.time()
             r = requests.get(self.test_url, params=self.test_params, proxies=proxies, timeout=self.timeout)
             elapsed = time.time() - start
@@ -72,76 +72,102 @@ class ProxyManager:
         random.shuffle(raw_proxies)
         valid = []
 
-        logging.info(f"Testing proxies to find up to {self.max_proxies} fastest working ones (multithreaded)...")
+        logging.info(f"Testing proxies to find stable working ones (multithreaded)...")
 
         with ThreadPoolExecutor(max_workers=50) as executor:
-            futures = {executor.submit(self.test_single_proxy, proxy): proxy for proxy in raw_proxies}
+            futures = {executor.submit(self.test_single_proxy, proxy): proxy for proxy in raw_proxies[:200]}  # Test first 200 proxies max
             for future in as_completed(futures):
                 proxy, speed = future.result()
                 if proxy:
                     valid.append((proxy, speed))
-                    if len(valid) >= self.max_proxies * 5:  # test more to pick fastest 5 later
+                    if len(valid) >= self.max_proxies * 3:  # Test more to pick fastest later
                         break
 
-        # Sort by speed ascending and keep only top 5
+        # Sort by speed ascending and keep top max_proxies
         valid.sort(key=lambda x: x[1])
-        fastest = [p for p, s in valid[:5]]
-        logging.info(f"Selected top 5 fastest proxies: {fastest}")
+        fastest = [p for p, s in valid[:self.max_proxies]]
+        logging.info(f"Selected top {self.max_proxies} fastest proxies.")
         return fastest
+
+    def refresh_proxies(self):
+        with self.lock:
+            self.proxies = self.fetch_and_test_proxies()
+            self.failure_counts = {p: 0 for p in self.proxies}
+            self.index = 0
+            if not self.proxies:
+                logging.error("No working proxies found after refresh!")
 
     def get_proxy(self):
         with self.lock:
             if not self.proxies:
-                raise RuntimeError("No working proxies available.")
+                logging.error("Proxy list empty, refreshing proxies...")
+                self.refresh_proxies()
+                if not self.proxies:
+                    raise RuntimeError("No working proxies available after refresh.")
             proxy = self.proxies[self.index % len(self.proxies)]
             self.index += 1
             return {"http": f"http://{proxy}", "https": f"http://{proxy}"}
 
     def mark_bad(self, proxy):
+        if not proxy:
+            return
         with self.lock:
             p = proxy["http"].replace("http://", "")
-            if p in self.proxies:
-                self.proxies.remove(p)
-                logging.warning(f"Removed bad proxy: {p}")
+            if p in self.failure_counts:
+                self.failure_counts[p] += 1
+                if self.failure_counts[p] >= self.max_failures:
+                    if p in self.proxies:
+                        self.proxies.remove(p)
+                        logging.warning(f"Removed bad proxy {p} after {self.max_failures} failures")
+                    del self.failure_counts[p]
+            else:
+                logging.warning(f"Marking unknown proxy {p} as bad")
             if not self.proxies:
-                logging.error("All proxies removed! No working proxies left.")
-                raise RuntimeError("No working proxies left.")
+                logging.error("All proxies removed! Refreshing proxy list...")
+                self.refresh_proxies()
+
+def make_request(url, params=None, proxy_manager=None, timeout=8, retries=3):
+    for attempt in range(retries):
+        proxy = proxy_manager.get_proxy() if proxy_manager else None
+        try:
+            resp = requests.get(url, params=params, proxies=proxy, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            if proxy_manager and proxy:
+                logging.error(f"Error with proxy {proxy.get('https')}: {e}")
+                proxy_manager.mark_bad(proxy)
+            else:
+                logging.error(f"Direct connection error: {e}")
+            if attempt == retries - 1:
+                raise
+            time.sleep(1)
+    return None
 
 def get_perpetual_usdt_symbols(proxy_manager):
-    for attempt in range(5):
-        proxy = proxy_manager.get_proxy()
-        try:
-            logging.info(f"Fetching symbols using proxy {proxy['https']}")
-            resp = requests.get(BINANCE_FUTURES_EXCHANGE_INFO, proxies=proxy, timeout=8)
-            resp.raise_for_status()
-            data = resp.json()
-            symbols = [
-                s['symbol'] for s in data['symbols']
-                if s['contractType'] == 'PERPETUAL' and s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
-            ]
-            logging.info(f"Found {len(symbols)} USDT perpetual symbols.")
-            return symbols
-        except Exception as e:
-            logging.error(f"Error fetching symbols with proxy {proxy['https']}: {e}")
-            proxy_manager.mark_bad(proxy)
-    logging.error("Failed to fetch symbols after multiple attempts.")
-    return []
+    try:
+        logging.info("Fetching symbols...")
+        data = make_request(BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
+        symbols = [
+            s['symbol'] for s in data['symbols']
+            if s['contractType'] == 'PERPETUAL' and s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
+        ]
+        logging.info(f"Found {len(symbols)} USDT perpetual symbols.")
+        return symbols
+    except Exception as e:
+        logging.error(f"Failed to fetch symbols: {e}")
+        return []
 
 def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
-    for attempt in range(3):
-        proxy = proxy_manager.get_proxy()
-        try:
-            resp = requests.get(BINANCE_FUTURES_KLINES, params=params, proxies=proxy, timeout=8)
-            resp.raise_for_status()
-            data = resp.json()
-            closes = [float(k[4]) for k in data]
-            timestamps = [k[0] for k in data]
-            return closes, timestamps
-        except Exception as e:
-            logging.error(f"Error fetching klines for {symbol} {interval} with proxy {proxy['https']}: {e}")
-            proxy_manager.mark_bad(proxy)
-    return None, None
+    try:
+        data = make_request(BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
+        closes = [float(k[4]) for k in data]
+        timestamps = [k[0] for k in data]
+        return closes, timestamps
+    except Exception as e:
+        logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
+        return None, None
 
 def calculate_rsi_bb(closes):
     closes_np = np.array(closes)
@@ -163,8 +189,7 @@ def scan_symbol(symbol, timeframes, proxy_manager):
             logging.warning(f"Not enough data for {symbol} {timeframe}. Skipping.")
             continue
 
-        # Use second last candle to avoid current open candle
-        idx = -2
+        idx = -2  # Use second last candle to avoid current open candle
         if idx < -len(closes):
             logging.warning(f"Not enough candles for {symbol} {timeframe} to skip open candle. Skipping.")
             continue
@@ -199,14 +224,25 @@ def scan_for_bb_touches_multithreaded(proxy_manager):
     if not symbols:
         logging.error("No symbols to scan.")
         return []
+
     results = []
+    total_symbols = len(symbols)
+    completed = 0
+
+    # Use 8 threads for scanning
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(scan_symbol, symbol, TIMEFRAMES, proxy_manager): symbol for symbol in symbols}
         for future in as_completed(futures):
+            symbol = futures[future]
             try:
-                results.extend(future.result())
+                symbol_results = future.result()
+                results.extend(symbol_results)
             except Exception as e:
-                logging.error(f"Error in thread scanning symbol: {e}")
+                logging.error(f"Error in thread scanning {symbol}: {e}")
+            completed += 1
+            logging.info(f"Completed {completed}/{total_symbols} symbols")
+
+    logging.info(f"Scan completed for all {total_symbols} symbols")
     return results
 
 def send_telegram_alert(bot_token, chat_id, message):
@@ -217,30 +253,48 @@ def send_telegram_alert(bot_token, chat_id, message):
         'parse_mode': 'Markdown'
     }
     try:
-        response = requests.post(url, data=payload)
-        if response.status_code != 200:
-            logging.error(f"Telegram alert failed: {response.text}")
+        for attempt in range(3):
+            response = requests.post(url, data=payload)
+            if response.status_code == 200:
+                return
+            time.sleep(1)
+        logging.error(f"Telegram alert failed: {response.text}")
     except Exception as e:
         logging.error(f"Exception sending Telegram alert: {e}")
 
 def format_results_by_timeframe(results):
-    # Group results by timeframe
+    if not results:
+        return ["*No BB touches detected at this time.*"]
+
     grouped = {}
     for r in results:
         grouped.setdefault(r['timeframe'], []).append(r)
 
     messages = []
-    for timeframe, items in grouped.items():
-        header = f"*BB Touches on {timeframe} timeframe*\n"
+    for timeframe, items in sorted(grouped.items()):
+        header = f"*🔍 BB Touches on {timeframe} Timeframe ({len(items)} symbols)*\n"
+
+        upper_touches = [i for i in items if i['touch_type'] == 'UPPER']
+        lower_touches = [i for i in items if i['touch_type'] == 'LOWER']
+
         lines = []
-        for item in items:
-            line = (
-                f"- *{item['symbol']}* touching *{item['touch_type']}* BB\n"
-                f"  RSI: {item['rsi']:.2f}, BB Upper: {item['bb_upper']:.2f}, BB Lower: {item['bb_lower']:.2f}\n"
-                f"  Time: {item['timestamp']}"
-            )
-            lines.append(line)
-        messages.append(header + "\n".join(lines))
+        if upper_touches:
+            lines.append("*⬆️ UPPER BB Touches:*")
+            for item in sorted(upper_touches, key=lambda x: x['symbol']):
+                lines.append(f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}")
+
+        if lower_touches:
+            if upper_touches:
+                lines.append("")  # spacing
+            lines.append("*⬇️ LOWER BB Touches:*")
+            for item in sorted(lower_touches, key=lambda x: x['symbol']):
+                lines.append(f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}")
+
+        messages.append(header + "\n" + "\n".join(lines))
+
+    timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    messages = [m + f"\n\n_Report generated at {timestamp}_" for m in messages]
+
     return messages
 
 def main():
@@ -257,14 +311,11 @@ def main():
         test_url=BINANCE_FUTURES_KLINES,
         test_params={"symbol": "BTCUSDT", "interval": "1d", "limit": 1},
         max_proxies=20,
-        timeout=5
+        timeout=5,
+        max_failures=10
     )
 
     results = scan_for_bb_touches_multithreaded(proxy_manager)
-
-    if not results:
-        logging.info("No BB touches detected at this time.")
-        return
 
     messages = format_results_by_timeframe(results)
 
