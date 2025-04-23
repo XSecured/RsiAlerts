@@ -107,7 +107,7 @@ class ProxyManager:
     def fetch_and_test_proxies(self):
         """Fetch proxies from multiple sources and test them"""
         raw_proxies = []
-        
+    
         # Try multiple proxy sources
         for url in self.proxy_urls:
             try:
@@ -117,38 +117,55 @@ class ProxyManager:
                 new_proxies = [line.strip() for line in resp.text.split('\n') if line.strip()]
                 logging.info(f"Found {len(new_proxies)} raw proxies from {url}")
                 raw_proxies.extend(new_proxies)
-                if len(raw_proxies) > 200:  # We have enough raw proxies to test
+                if len(raw_proxies) > 200:  # Enough raw proxies to test
                     break
             except Exception as e:
                 logging.error(f"Failed to fetch proxy list from {url}: {e}")
-        
+    
         # Remove duplicates and blacklisted proxies
         raw_proxies = [p for p in set(raw_proxies) if p not in self.proxy_blacklist]
         random.shuffle(raw_proxies)
+    
         valid = []
+        proxy_speeds = []
 
         logging.info(f"Testing proxies against Binance endpoints...")
-        
-        # Test proxies in parallel
+    
         with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(self.test_single_proxy, proxy): proxy 
-                      for proxy in raw_proxies[:100]}  # Test up to 100 at once
-            
+            futures = {executor.submit(self.test_single_proxy, proxy): proxy for proxy in raw_proxies[:100]}
             for future in as_completed(futures):
                 proxy, speed = future.result()
-                if proxy:
-                    valid.append((proxy, speed))
-                    if len(valid) >= self.min_pool_size * 2:
-                        # Cancel pending futures once we have enough
+                if proxy and speed is not None:
+                    proxy_speeds.append((proxy, speed))
+                    if len(proxy_speeds) >= self.min_pool_size * 3:
+                        # Enough proxies tested, cancel remaining
                         for f in futures:
                             if not f.done():
                                 f.cancel()
                         break
 
+        # Filter proxies by speed threshold (<= 10 seconds)
+        valid = [(p, s) for p, s in proxy_speeds if s <= 10]
+    
+        if len(valid) < self.min_pool_size:
+            logging.warning(f"Found only {len(valid)} fast proxies, accepting some slower ones...")
+            # Accept some slower proxies up to 20 seconds
+            remaining_slots = self.min_pool_size - len(valid)
+            slower_proxies = sorted(
+                [(p, s) for p, s in proxy_speeds if s > 10 and s <= 20],
+                key=lambda x: x[1]
+            )
+            for p, s in slower_proxies:
+                if remaining_slots <= 0:
+                    break
+                valid.append((p, s))
+                remaining_slots -= 1
+
         valid.sort(key=lambda x: x[1])  # Sort by speed
         fastest = [p for p, s in valid[:self.min_pool_size * 2]]
-        logging.info(f"Selected top {len(fastest)} fastest proxies.")
+        logging.info(f"Selected top {len(fastest)} proxies after filtering by speed.")
         return fastest
+
 
     def refresh_proxies(self, blocking=False):
         """Refresh proxy pool"""
