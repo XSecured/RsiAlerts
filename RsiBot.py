@@ -33,10 +33,8 @@ BB_STDDEV = 2
 PROXY_LIST_URL = "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 
 class ProxyManager:
-    def __init__(self, proxy_url, test_url, test_params, max_proxies=20, timeout=5, max_failures=10):
+    def __init__(self, proxy_url, max_proxies=20, timeout=5, max_failures=10):
         self.proxy_url = proxy_url
-        self.test_url = test_url
-        self.test_params = test_params
         self.max_proxies = max_proxies
         self.timeout = timeout
         self.max_failures = max_failures
@@ -47,17 +45,26 @@ class ProxyManager:
         self.refresh_proxies()
 
     def test_single_proxy(self, proxy):
+        """Test proxy against BOTH Binance endpoints we'll be using"""
         proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
         try:
+            # Test 1: Exchange Info endpoint
             start = time.time()
-            r = requests.get(self.test_url, params=self.test_params, proxies=proxies, timeout=self.timeout)
+            r1 = requests.get(BINANCE_FUTURES_EXCHANGE_INFO, proxies=proxies, timeout=self.timeout)
+            if r1.status_code != 200:
+                return None, None
+                
+            # Test 2: Klines endpoint with BTC/USDT
+            params = {"symbol": "BTCUSDT", "interval": "1d", "limit": 1}
+            r2 = requests.get(BINANCE_FUTURES_KLINES, params=params, proxies=proxies, timeout=self.timeout)
+            if r2.status_code != 200:
+                return None, None
+                
             elapsed = time.time() - start
-            if r.status_code == 200:
-                logging.info(f"Proxy {proxy} works, response time: {elapsed:.2f}s")
-                return proxy, elapsed
+            logging.info(f"Proxy {proxy} works with ALL endpoints, response time: {elapsed:.2f}s")
+            return proxy, elapsed
         except Exception:
-            pass
-        return None, None
+            return None, None
 
     def fetch_and_test_proxies(self):
         logging.info("Fetching proxy list...")
@@ -72,21 +79,21 @@ class ProxyManager:
         random.shuffle(raw_proxies)
         valid = []
 
-        logging.info(f"Testing proxies to find stable working ones (multithreaded)...")
+        logging.info(f"Testing proxies against Binance endpoints (multithreaded)...")
 
         with ThreadPoolExecutor(max_workers=50) as executor:
-            futures = {executor.submit(self.test_single_proxy, proxy): proxy for proxy in raw_proxies[:200]}  # Test first 200 proxies max
+            futures = {executor.submit(self.test_single_proxy, proxy): proxy for proxy in raw_proxies[:200]}
             for future in as_completed(futures):
                 proxy, speed = future.result()
                 if proxy:
                     valid.append((proxy, speed))
-                    if len(valid) >= self.max_proxies * 3:  # Test more to pick fastest later
+                    if len(valid) >= self.max_proxies * 3:
                         break
 
         # Sort by speed ascending and keep top max_proxies
         valid.sort(key=lambda x: x[1])
         fastest = [p for p, s in valid[:self.max_proxies]]
-        logging.info(f"Selected top {self.max_proxies} fastest proxies.")
+        logging.info(f"Selected top {len(fastest)} fastest proxies that work with ALL Binance endpoints.")
         return fastest
 
     def refresh_proxies(self):
@@ -145,18 +152,37 @@ def make_request(url, params=None, proxy_manager=None, timeout=8, retries=3):
     return None
 
 def get_perpetual_usdt_symbols(proxy_manager):
-    try:
-        logging.info("Fetching symbols...")
-        data = make_request(BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
-        symbols = [
-            s['symbol'] for s in data['symbols']
-            if s['contractType'] == 'PERPETUAL' and s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
-        ]
-        logging.info(f"Found {len(symbols)} USDT perpetual symbols.")
-        return symbols
-    except Exception as e:
-        logging.error(f"Failed to fetch symbols: {e}")
-        return []
+    """Keep trying until we successfully fetch symbols - never give up!"""
+    backoff_time = 1
+    max_backoff = 30
+    attempt = 1
+    
+    while True:  # Infinite loop - we'll only exit when successful
+        try:
+            logging.info(f"Fetching symbols attempt #{attempt}...")
+            data = make_request(BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
+            symbols = [
+                s['symbol'] for s in data['symbols']
+                if s['contractType'] == 'PERPETUAL' and s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
+            ]
+            symbol_count = len(symbols)
+            logging.info(f"Found {symbol_count} USDT perpetual symbols.")
+            
+            # Extra validation - make sure we got a reasonable amount of symbols
+            if symbol_count < 10:
+                logging.warning(f"Only found {symbol_count} symbols, which seems too few. Retrying...")
+                attempt += 1
+                time.sleep(backoff_time)
+                backoff_time = min(backoff_time * 2, max_backoff)
+                continue
+                
+            return symbols
+        except Exception as e:
+            logging.error(f"Failed to fetch symbols (attempt #{attempt}): {e}")
+            # If all proxies are bad, this will trigger a refresh
+            attempt += 1
+            time.sleep(backoff_time)
+            backoff_time = min(backoff_time * 2, max_backoff)
 
 def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
@@ -221,10 +247,6 @@ def scan_symbol(symbol, timeframes, proxy_manager):
 
 def scan_for_bb_touches_multithreaded(proxy_manager):
     symbols = get_perpetual_usdt_symbols(proxy_manager)
-    if not symbols:
-        logging.error("No symbols to scan.")
-        return []
-
     results = []
     total_symbols = len(symbols)
     completed = 0
@@ -308,8 +330,6 @@ def main():
 
     proxy_manager = ProxyManager(
         proxy_url=PROXY_LIST_URL,
-        test_url=BINANCE_FUTURES_KLINES,
-        test_params={"symbol": "BTCUSDT", "interval": "1d", "limit": 1},
         max_proxies=20,
         timeout=5,
         max_failures=10
