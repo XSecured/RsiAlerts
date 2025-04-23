@@ -9,6 +9,8 @@ import threading
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Configure logging
 logging.basicConfig(
@@ -31,121 +33,230 @@ BB_LENGTH = 34
 BB_STDDEV = 2
 
 PROXY_LIST_URL = "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
+ALTERNATE_PROXY_URLS = [
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
+    "https://raw.githubusercontent.com/mertguvencli/http-proxy-list/main/proxy-list/data.txt"
+]
+
+# Create a session for direct connections with retry logic
+def create_retry_session(retries=3, backoff_factor=0.3):
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=(500, 502, 504),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
+# Global direct session for fallback
+DIRECT_SESSION = create_retry_session()
 
 class ProxyManager:
-    def __init__(self, proxy_url, pool_size=10, timeout=5, max_failures=3):
-        self.proxy_url = proxy_url
-        self.pool_size = pool_size
+    def __init__(self, proxy_urls, min_pool_size=5, timeout=5, max_failures=3):
+        self.proxy_urls = [proxy_urls] if isinstance(proxy_urls, str) else proxy_urls
+        self.min_pool_size = min_pool_size
         self.timeout = timeout
         self.max_failures = max_failures
         self.lock = threading.Lock()
-        self.proxies = []  # list of dicts: {'proxy': proxy_str, 'failures': 0}
-        self.current_index = 0
-        self.refresh_proxies()
+        self.proxies = []  # list of dicts: {'proxy': proxy_str, 'failures': 0, 'last_used': timestamp}
+        self.proxy_blacklist = set()  # Store failed proxies to avoid retesting them
+        self.refresh_needed = False
+        self.last_refresh = 0
+        self.init_proxies()
 
+    def init_proxies(self):
+        """Initialize proxy pool"""
+        logging.info("Initializing proxy pool...")
+        self.refresh_proxies(blocking=True)
+        
     def test_single_proxy(self, proxy):
+        """Test a single proxy with Binance API endpoints"""
+        if proxy in self.proxy_blacklist:
+            return None, None
+            
         proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
         try:
             start = time.time()
-            r1 = requests.get(BINANCE_FUTURES_EXCHANGE_INFO, proxies=proxies, timeout=self.timeout)
+            r1 = requests.get(
+                BINANCE_FUTURES_EXCHANGE_INFO, 
+                proxies=proxies, 
+                timeout=self.timeout
+            )
             if r1.status_code != 200:
+                self.proxy_blacklist.add(proxy)
                 return None, None
+                
             params = {"symbol": "BTCUSDT", "interval": "1d", "limit": 1}
-            r2 = requests.get(BINANCE_FUTURES_KLINES, params=params, proxies=proxies, timeout=self.timeout)
+            r2 = requests.get(
+                BINANCE_FUTURES_KLINES, 
+                params=params, 
+                proxies=proxies, 
+                timeout=self.timeout
+            )
             if r2.status_code != 200:
+                self.proxy_blacklist.add(proxy)
                 return None, None
+                
             elapsed = time.time() - start
             logging.info(f"Proxy {proxy} works, response time: {elapsed:.2f}s")
             return proxy, elapsed
         except Exception:
+            self.proxy_blacklist.add(proxy)
             return None, None
 
     def fetch_and_test_proxies(self):
-        logging.info("Fetching proxy list...")
-        try:
-            resp = requests.get(self.proxy_url, timeout=10)
-            resp.raise_for_status()
-            raw_proxies = [line.strip() for line in resp.text.split('\n') if line.strip()]
-        except Exception as e:
-            logging.error(f"Failed to fetch proxy list: {e}")
-            return []
-
+        """Fetch proxies from multiple sources and test them"""
+        raw_proxies = []
+        
+        # Try multiple proxy sources
+        for url in self.proxy_urls:
+            try:
+                logging.info(f"Fetching proxies from {url}...")
+                resp = DIRECT_SESSION.get(url, timeout=10)
+                resp.raise_for_status()
+                new_proxies = [line.strip() for line in resp.text.split('\n') if line.strip()]
+                logging.info(f"Found {len(new_proxies)} raw proxies from {url}")
+                raw_proxies.extend(new_proxies)
+                if len(raw_proxies) > 200:  # We have enough raw proxies to test
+                    break
+            except Exception as e:
+                logging.error(f"Failed to fetch proxy list from {url}: {e}")
+        
+        # Remove duplicates and blacklisted proxies
+        raw_proxies = [p for p in set(raw_proxies) if p not in self.proxy_blacklist]
         random.shuffle(raw_proxies)
         valid = []
 
-        logging.info(f"Testing proxies against Binance endpoints (multithreaded)...")
-
-        with ThreadPoolExecutor(max_workers=50) as executor:
-            futures = {executor.submit(self.test_single_proxy, proxy): proxy for proxy in raw_proxies[:200]}
+        logging.info(f"Testing proxies against Binance endpoints...")
+        
+        # Test proxies in parallel
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(self.test_single_proxy, proxy): proxy 
+                      for proxy in raw_proxies[:100]}  # Test up to 100 at once
+            
             for future in as_completed(futures):
                 proxy, speed = future.result()
                 if proxy:
                     valid.append((proxy, speed))
-                    if len(valid) >= self.pool_size * 3:
+                    if len(valid) >= self.min_pool_size * 2:
+                        # Cancel pending futures once we have enough
+                        for f in futures:
+                            if not f.done():
+                                f.cancel()
                         break
 
-        valid.sort(key=lambda x: x[1])
-        fastest = [p for p, s in valid[:self.pool_size]]
+        valid.sort(key=lambda x: x[1])  # Sort by speed
+        fastest = [p for p, s in valid[:self.min_pool_size * 2]]
         logging.info(f"Selected top {len(fastest)} fastest proxies.")
         return fastest
 
-    def refresh_proxies(self):
+    def refresh_proxies(self, blocking=False):
+        """Refresh proxy pool"""
         with self.lock:
+            # Don't refresh too frequently
+            if time.time() - self.last_refresh < 30:
+                return
+            self.last_refresh = time.time()
+            
+        if blocking:
+            self._do_refresh()
+        else:
+            # Background refresh
+            refresh_thread = threading.Thread(target=self._do_refresh)
+            refresh_thread.daemon = True
+            refresh_thread.start()
+    
+    def _do_refresh(self):
+        """Actual proxy refresh logic"""
+        try:
             new_proxies = self.fetch_and_test_proxies()
-            self.proxies = [{'proxy': p, 'failures': 0} for p in new_proxies]
-            self.current_index = 0
-            if not self.proxies:
-                logging.error("No working proxies found after refresh!")
+            with self.lock:
+                # Keep existing proxies with low failure count
+                existing_good = [p for p in self.proxies if p['failures'] < self.max_failures/2]
+                
+                # Add new proxies
+                new_formatted = [{'proxy': p, 'failures': 0, 'last_used': 0} for p in new_proxies 
+                                if p not in [x['proxy'] for x in existing_good]]
+                
+                # Combine and sort by reliability
+                self.proxies = sorted(existing_good + new_formatted, key=lambda x: x['failures'])
+                self.refresh_needed = False
+                
+                logging.info(f"Proxy pool refreshed. Now have {len(self.proxies)} proxies.")
+        except Exception as e:
+            logging.error(f"Error refreshing proxies: {e}")
 
     def get_proxy(self):
+        """Get a proxy using least-recently-used strategy"""
         with self.lock:
-            if not self.proxies:
-                logging.error("Proxy list empty, refreshing proxies...")
-                self.refresh_proxies()
+            # Refresh if needed
+            if len(self.proxies) < self.min_pool_size:
+                if not self.refresh_needed:
+                    self.refresh_needed = True
+                    self.refresh_proxies(blocking=False)
+                    
+                # Return None if no proxies available (triggers direct connection)
                 if not self.proxies:
-                    raise RuntimeError("No working proxies available after refresh.")
-            # Round robin over proxies
-            proxy_info = self.proxies[self.current_index % len(self.proxies)]
+                    return None
+            
+            # Sort by failures and last used time
+            self.proxies.sort(key=lambda x: (x['failures'], x['last_used']))
+            proxy_info = self.proxies[0]
+            
+            # Mark as recently used
+            proxy_info['last_used'] = time.time()
+            
             return proxy_info
 
     def mark_bad(self, proxy_info):
+        """Mark a proxy as having failed"""
+        if not proxy_info:
+            return
+            
         with self.lock:
+            if proxy_info not in self.proxies:
+                return
+                
             proxy_info['failures'] += 1
+            
+            # Remove if too many failures
             if proxy_info['failures'] >= self.max_failures:
-                proxy_str = proxy_info['proxy']
-                logging.warning(f"Removing proxy {proxy_str} after {self.max_failures} failures")
+                proxy_addr = proxy_info['proxy']
+                logging.warning(f"Removing proxy {proxy_addr} after {self.max_failures} failures")
                 self.proxies.remove(proxy_info)
-                # Immediately try to add a new proxy to keep pool size
-                new_proxies = self.fetch_and_test_proxies()
-                for p in new_proxies:
-                    if p not in [pr['proxy'] for pr in self.proxies]:
-                        self.proxies.append({'proxy': p, 'failures': 0})
-                        logging.info(f"Added new proxy {p} to pool")
-                        break
-                if not self.proxies:
-                    logging.error("All proxies removed and no new proxies found!")
-                    raise RuntimeError("No working proxies left!")
+                self.proxy_blacklist.add(proxy_addr)
+                
+                # Trigger refresh if needed
+                if len(self.proxies) < self.min_pool_size and not self.refresh_needed:
+                    self.refresh_needed = True
+                    self.refresh_proxies(blocking=False)
 
-def make_request(url, params=None, proxy_manager=None, timeout=8):
-    while True:
+def make_request(url, params=None, proxy_manager=None, max_retries=5, timeout=10):
+    retries = 0
+    while retries < max_retries:
         proxy_info = proxy_manager.get_proxy() if proxy_manager else None
-        proxies = None
-        if proxy_info:
-            proxies = {"http": f"http://{proxy_info['proxy']}", "https": f"http://{proxy_info['proxy']}"}
+        if not proxy_info:
+            raise RuntimeError("No working proxies available.")
+        proxies = {"http": f"http://{proxy_info['proxy']}", "https": f"http://{proxy_info['proxy']}"}
         try:
             resp = requests.get(url, params=params, proxies=proxies, timeout=timeout)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            if proxy_manager and proxy_info:
-                logging.error(f"Error with proxy {proxy_info['proxy']}: {e}")
-                proxy_manager.mark_bad(proxy_info)
-            else:
-                logging.error(f"Direct connection error: {e}")
-                raise
-            # Try next proxy immediately
+            logging.error(f"Error with proxy {proxy_info['proxy']}: {e}")
+            proxy_manager.mark_bad(proxy_info)
+            retries += 1
+            time.sleep(0.5 * retries)
+    raise RuntimeError(f"Failed to make request after {max_retries} attempts")
+
 
 def get_perpetual_usdt_symbols(proxy_manager):
+    """Fetch USDT perpetual futures from Binance"""
     attempts = 5
     for attempt in range(1, attempts + 1):
         try:
@@ -167,6 +278,7 @@ def get_perpetual_usdt_symbols(proxy_manager):
     raise RuntimeError("Failed to fetch symbols after multiple attempts")
 
 def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
+    """Fetch klines/candlestick data from Binance"""
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
     try:
         data = make_request(BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
@@ -178,6 +290,7 @@ def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
         return None, None
 
 def calculate_rsi_bb(closes):
+    """Calculate RSI and Bollinger Bands"""
     closes_np = np.array(closes)
     rsi = talib.RSI(closes_np, timeperiod=RSI_PERIOD)
     bb_upper, bb_middle, bb_lower = talib.BBANDS(
@@ -190,6 +303,7 @@ def calculate_rsi_bb(closes):
     return rsi, bb_upper, bb_middle, bb_lower
 
 def scan_symbol(symbol, timeframes, proxy_manager):
+    """Scan a symbol across timeframes for BB touches"""
     results = []
     for timeframe in timeframes:
         closes, timestamps = fetch_klines(symbol, timeframe, proxy_manager)
@@ -228,27 +342,43 @@ def scan_symbol(symbol, timeframes, proxy_manager):
     return results
 
 def scan_for_bb_touches_multithreaded(proxy_manager):
+    """Scan for BB touches with improved batching"""
     symbols = get_perpetual_usdt_symbols(proxy_manager)
     results = []
     total_symbols = len(symbols)
     completed = 0
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(scan_symbol, symbol, TIMEFRAMES, proxy_manager): symbol for symbol in symbols}
-        for future in as_completed(futures):
-            symbol = futures[future]
-            try:
-                symbol_results = future.result()
-                results.extend(symbol_results)
-            except Exception as e:
-                logging.error(f"Error in thread scanning {symbol}: {e}")
-            completed += 1
-            logging.info(f"Completed {completed}/{total_symbols} symbols")
+    
+    # Process in batches of 20 symbols
+    batch_size = 20
+    for i in range(0, total_symbols, batch_size):
+        batch = symbols[i:i+batch_size]
+        batch_results = []
+        
+        logging.info(f"Processing batch {i//batch_size + 1}/{(total_symbols+batch_size-1)//batch_size} ({len(batch)} symbols)")
+        
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(scan_symbol, symbol, TIMEFRAMES, proxy_manager): symbol for symbol in batch}
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    symbol_results = future.result()
+                    batch_results.extend(symbol_results)
+                except Exception as e:
+                    logging.error(f"Error scanning {symbol}: {e}")
+                completed += 1
+                logging.info(f"Completed {completed}/{total_symbols} symbols")
+                
+        results.extend(batch_results)
+        
+        # Small delay between batches
+        if i + batch_size < total_symbols:
+            time.sleep(1)
 
     logging.info(f"Scan completed for all {total_symbols} symbols")
     return results
 
 def send_telegram_alert(bot_token, chat_id, message):
+    """Send a message to Telegram"""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         'chat_id': chat_id,
@@ -257,7 +387,7 @@ def send_telegram_alert(bot_token, chat_id, message):
     }
     try:
         for attempt in range(3):
-            response = requests.post(url, data=payload)
+            response = DIRECT_SESSION.post(url, data=payload)
             if response.status_code == 200:
                 return
             time.sleep(1)
@@ -266,6 +396,7 @@ def send_telegram_alert(bot_token, chat_id, message):
         logging.error(f"Exception sending Telegram alert: {e}")
 
 def format_results_by_timeframe(results):
+    """Format results into messages grouped by timeframe"""
     if not results:
         return ["*No BB touches detected at this time.*"]
 
@@ -301,6 +432,7 @@ def format_results_by_timeframe(results):
     return messages
 
 def main():
+    """Main entry point for the scanner"""
     TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -309,19 +441,30 @@ def main():
 
     logging.info("Starting BB touch scanner bot...")
 
+    # Initialize proxy manager with multiple sources
     proxy_manager = ProxyManager(
-        proxy_url=PROXY_LIST_URL,
-        pool_size=10,
+        proxy_urls=[PROXY_LIST_URL] + ALTERNATE_PROXY_URLS,
+        min_pool_size=5,
         timeout=5,
         max_failures=3
     )
 
-    results = scan_for_bb_touches_multithreaded(proxy_manager)
+    start_time = time.time()
+    try:
+        results = scan_for_bb_touches_multithreaded(proxy_manager)
+        messages = format_results_by_timeframe(results)
 
-    messages = format_results_by_timeframe(results)
-
-    for msg in messages:
-        send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+        for msg in messages:
+            send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+            
+        elapsed = time.time() - start_time
+        logging.info(f"Scan completed in {elapsed:.2f} seconds")
+        
+    except Exception as e:
+        logging.error(f"Fatal error in scanner: {e}")
+        # Send error notification to Telegram
+        error_msg = f"*⚠️ Scanner Error*\n\nThe scanner encountered an error:\n`{str(e)}`"
+        send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, error_msg)
 
 if __name__ == "__main__":
     main()
