@@ -256,11 +256,18 @@ def make_request(url, params=None, proxy_manager=None, max_retries=5, timeout=10
 
 
 def get_perpetual_usdt_symbols(proxy_manager):
-    """Fetch USDT perpetual futures from Binance"""
+    """Fetch USDT perpetual futures from Binance with robust proxy handling"""
     attempts = 5
     for attempt in range(1, attempts + 1):
         try:
-            logging.info(f"Fetching symbols attempt #{attempt}...")
+            # Cycle through proxies
+            proxy_info = proxy_manager.get_proxy()
+            if not proxy_info:
+                logging.warning("No available proxies to fetch symbols, waiting and retrying...")
+                time.sleep(5)  # Wait before retrying
+                continue
+            
+            logging.info(f"Fetching symbols attempt #{attempt} using proxy: {proxy_info['proxy']}")
             data = make_request(BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
             symbols = [
                 s['symbol'] for s in data['symbols']
@@ -276,6 +283,7 @@ def get_perpetual_usdt_symbols(proxy_manager):
             logging.error(f"Failed to fetch symbols: {e}")
             time.sleep(2)
     raise RuntimeError("Failed to fetch symbols after multiple attempts")
+
 
 def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
     """Fetch klines/candlestick data from Binance"""
@@ -444,8 +452,8 @@ def main():
     # Initialize proxy manager with multiple sources
     proxy_manager = ProxyManager(
         proxy_urls=[PROXY_LIST_URL] + ALTERNATE_PROXY_URLS,
-        min_pool_size=5,
-        timeout=5,
+        min_pool_size=10,
+        timeout=15,
         max_failures=3
     )
 
