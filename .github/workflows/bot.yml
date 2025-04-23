@@ -2,7 +2,7 @@ name: Run BB Touch Bot
 
 on:
   schedule:
-    - cron: '1 0,4,8,12,16,20 * * *'  # Every 4 hours at 1 minute past the hour
+    - cron: '0 */1 * * *'  # Every 4 hours at 1 minute past the hour
 
 jobs:
   run-bot:
