@@ -75,39 +75,34 @@ class ProxyManager:
         self.refresh_proxies(blocking=True)
         
     def test_single_proxy(self, proxy):
-        """Test a single proxy with Binance API endpoints"""
         if proxy in self.proxy_blacklist:
             return None, None
-            
+        
         proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
         try:
             start = time.time()
-            r1 = requests.get(
-                BINANCE_FUTURES_EXCHANGE_INFO, 
-                proxies=proxies, 
-                timeout=self.timeout
-            )
+            # Test against Binance API with shorter timeout
+            r1 = requests.get(BINANCE_FUTURES_EXCHANGE_INFO, 
+                          proxies=proxies, 
+                          timeout=self.timeout)
             if r1.status_code != 200:
                 self.proxy_blacklist.add(proxy)
                 return None, None
-                
-            params = {"symbol": "BTCUSDT", "interval": "1d", "limit": 1}
-            r2 = requests.get(
-                BINANCE_FUTURES_KLINES, 
-                params=params, 
-                proxies=proxies, 
-                timeout=self.timeout
-            )
-            if r2.status_code != 200:
+            
+            elapsed = time.time() - start
+        
+            # Only accept proxies faster than 10 seconds
+            if elapsed > 10:
+                logging.info(f"Proxy {proxy} works but too slow ({elapsed:.2f}s), skipping")
                 self.proxy_blacklist.add(proxy)
                 return None, None
-                
-            elapsed = time.time() - start
+            
             logging.info(f"Proxy {proxy} works, response time: {elapsed:.2f}s")
             return proxy, elapsed
         except Exception:
             self.proxy_blacklist.add(proxy)
             return None, None
+
 
     def fetch_and_test_proxies(self):
         """Fetch proxies from multiple sources and test them"""
@@ -192,26 +187,23 @@ class ProxyManager:
             logging.error(f"Error refreshing proxies: {e}")
 
     def get_proxy(self):
-        """Get a proxy using least-recently-used strategy"""
         with self.lock:
-            # Refresh if needed
             if len(self.proxies) < self.min_pool_size:
-                if not self.refresh_needed:
-                    self.refresh_needed = True
-                    self.refresh_proxies(blocking=False)
-                    
-                # Return None if no proxies available (triggers direct connection)
-                if not self.proxies:
-                    return None
+                logging.warning(f"Proxy pool has only {len(self.proxies)} proxies, refreshing...")
+                self.refresh_proxies()
             
-            # Sort by failures and last used time
-            self.proxies.sort(key=lambda x: (x['failures'], x['last_used']))
+            if not self.proxies:
+                logging.error("No working proxies available. Cannot proceed.")
+                raise RuntimeError("No working proxies in pool")
+            
+            # Sort by failures and response time
+            self.proxies.sort(key=lambda x: (x['failures'], x['response_time']))
             proxy_info = self.proxies[0]
-            
-            # Mark as recently used
+        
+            # Mark as used and move to end of list to prevent immediate reuse
             proxy_info['last_used'] = time.time()
-            
             return proxy_info
+
 
     def mark_bad(self, proxy_info):
         """Mark a proxy as having failed"""
@@ -236,23 +228,32 @@ class ProxyManager:
                     self.refresh_needed = True
                     self.refresh_proxies(blocking=False)
 
-def make_request(url, params=None, proxy_manager=None, max_retries=5, timeout=10):
-    retries = 0
-    while retries < max_retries:
-        proxy_info = proxy_manager.get_proxy() if proxy_manager else None
-        if not proxy_info:
-            raise RuntimeError("No working proxies available.")
-        proxies = {"http": f"http://{proxy_info['proxy']}", "https": f"http://{proxy_info['proxy']}"}
+def make_request(url, params=None, proxy_manager=None, max_retries=5):
+    for attempt in range(max_retries):
+        proxy_info = proxy_manager.get_proxy()
+        proxies = {"http": f"http://{proxy_info['proxy']}", 
+                   "https": f"http://{proxy_info['proxy']}"}
+        
         try:
+            # Use a timeout proportional to the proxy's known speed
+            timeout = min(10, proxy_info['response_time'] * 2)
+            logging.info(f"Attempt {attempt+1}/{max_retries} with proxy {proxy_info['proxy']}")
+            
             resp = requests.get(url, params=params, proxies=proxies, timeout=timeout)
             resp.raise_for_status()
             return resp.json()
+            
         except Exception as e:
-            logging.error(f"Error with proxy {proxy_info['proxy']}: {e}")
+            logging.error(f"Request failed with proxy {proxy_info['proxy']}: {e}")
             proxy_manager.mark_bad(proxy_info)
-            retries += 1
-            time.sleep(0.5 * retries)
+            
+            # Exponential backoff before retry
+            wait_time = 2 ** attempt
+            logging.info(f"Waiting {wait_time}s before next attempt...")
+            time.sleep(wait_time)
+    
     raise RuntimeError(f"Failed to make request after {max_retries} attempts")
+
 
 
 def get_perpetual_usdt_symbols(proxy_manager):
