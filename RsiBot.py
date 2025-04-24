@@ -30,9 +30,7 @@ BB_STDDEV = 2
 
 # Multiple proxy sources for redundancy
 PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt"
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 ]
 
 class ProxyManager:
