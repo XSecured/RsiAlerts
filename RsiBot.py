@@ -21,9 +21,9 @@ logging.basicConfig(
 BINANCE_FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 TIMEFRAMES = ['4h', '1d', '1w']
-CANDLE_LIMIT = 50
-UPPER_TOUCH_THRESHOLD = 0.01  # 1%
-LOWER_TOUCH_THRESHOLD = 0.01  # 1%
+CANDLE_LIMIT = 55
+UPPER_TOUCH_THRESHOLD = 0.02  # 1%
+LOWER_TOUCH_THRESHOLD = 0.02  # 1%
 RSI_PERIOD = 14
 BB_LENGTH = 34
 BB_STDDEV = 2
