@@ -481,14 +481,14 @@ def main():
         messages = format_results_by_timeframe(results)
         
         for i, msg in enumerate(messages, 1):
-        logging.info(f"Sending message {i}/{len(messages)}")
-        chunks = split_message(msg)
-        for idx, chunk in enumerate(chunks, 1):
-            if len(chunks) > 1:
-                chunk = f"{chunk}\n\n_Part {idx} of {len(chunks)}_"
-            success = send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, chunk)
-            if not success:
-                logging.error(f"Failed to send part {idx} of message {i}")
+            logging.info(f"Sending message {i}/{len(messages)}")
+            chunks = split_message(msg)
+            for idx, chunk in enumerate(chunks, 1):
+                if len(chunks) > 1:
+                    chunk = f"{chunk}\n\n_Part {idx} of {len(chunks)}_"
+                success = send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, chunk)
+                if not success:
+                    logging.error(f"Failed to send part {idx} of message {i}")
         
         elapsed = time.time() - start_time
         logging.info(f"Bot run completed successfully in {elapsed:.2f} seconds")
