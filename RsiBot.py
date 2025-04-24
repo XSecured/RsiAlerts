@@ -203,7 +203,6 @@ class ProxyManager:
                     break
 
 def make_request(url, params=None, proxy_manager=None, max_attempts=3):
-    """Make a request using proxies with retries"""
     for attempt in range(max_attempts):
         try:
             # Get a proxy
@@ -215,9 +214,9 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=3):
             endpoint = url.split('/')[-1] if '/' in url else url
             logging.info(f"Request to {endpoint}: using proxy {proxy_str} (attempt {attempt+1}/{max_attempts})")
             
-            # Make the request, with timeout based on proxy speed
+            # Make the request WITH VERIFICATION DISABLED
             timeout = min(15, max(5, proxy_info['speed'] * 2))
-            resp = requests.get(url, params=params, proxies=proxies, timeout=timeout)
+            resp = requests.get(url, params=params, proxies=proxies, timeout=timeout, verify=False)
             resp.raise_for_status()
             
             # Success!
@@ -226,7 +225,8 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=3):
             
         except Exception as e:
             logging.error(f"Request failed: {str(e)}")
-            proxy_manager.mark_failure(proxy_info)
+            if 'proxy_info' in locals():  # Fix the variable scope issue
+                proxy_manager.mark_failure(proxy_info)
             
             # Last attempt failed
             if attempt == max_attempts - 1:
@@ -236,6 +236,7 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=3):
             wait_time = 2 * (attempt + 1)
             logging.info(f"Retrying in {wait_time} seconds...")
             time.sleep(wait_time)
+
 
 def get_perpetual_usdt_symbols(proxy_manager):
     """Fetch all USDT perpetual futures symbols"""
