@@ -412,8 +412,32 @@ def format_results_by_timeframe(results):
 
     return messages
 
+def split_message(text, max_length=4000):
+    """
+    Splits a long text into chunks smaller than max_length,
+    trying to split at newline boundaries for readability.
+    """
+    lines = text.split('\n')
+    chunks = []
+    current_chunk = ""
+
+    for line in lines:
+        # +1 for the newline character
+        if len(current_chunk) + len(line) + 1 > max_length:
+            chunks.append(current_chunk)
+            current_chunk = line
+        else:
+            if current_chunk:
+                current_chunk += "\n" + line
+            else:
+                current_chunk = line
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
 def send_telegram_alert(bot_token, chat_id, message):
-    """Send a message to Telegram"""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         'chat_id': chat_id,
@@ -424,12 +448,13 @@ def send_telegram_alert(bot_token, chat_id, message):
         for attempt in range(3):
             response = requests.post(url, data=payload, timeout=10)
             if response.status_code == 200:
-                logging.info("Telegram message sent successfully")
-                return
+                return True
             time.sleep(1)
         logging.error(f"Telegram alert failed: {response.text}")
+        return False
     except Exception as e:
         logging.error(f"Exception sending Telegram alert: {e}")
+        return False
 
 def main():
     """Main function"""
@@ -458,8 +483,14 @@ def main():
         messages = format_results_by_timeframe(results)
         
         for i, msg in enumerate(messages, 1):
-            logging.info(f"Sending message {i}/{len(messages)}")
-            send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+        logging.info(f"Sending message {i}/{len(messages)}")
+        chunks = split_message(msg)
+        for idx, chunk in enumerate(chunks, 1):
+            if len(chunks) > 1:
+                chunk = f"{chunk}\n\n_Part {idx} of {len(chunks)}_"
+            success = send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, chunk)
+            if not success:
+                logging.error(f"Failed to send part {idx} of message {i}")
         
         elapsed = time.time() - start_time
         logging.info(f"Bot run completed successfully in {elapsed:.2f} seconds")
