@@ -20,10 +20,9 @@ logging.basicConfig(
 # Constants
 BINANCE_FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
-TIMEFRAMES = ['4h', '1d', '1w']
 CANDLE_LIMIT = 55
-UPPER_TOUCH_THRESHOLD = 0.02  # 1%
-LOWER_TOUCH_THRESHOLD = 0.02  # 1%
+UPPER_TOUCH_THRESHOLD = 0.02  # 2%
+LOWER_TOUCH_THRESHOLD = 0.02  # 2%
 RSI_PERIOD = 14
 BB_LENGTH = 34
 BB_STDDEV = 2
@@ -33,6 +32,19 @@ PROXY_SOURCES = [
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 ]
 
+# Timeframe toggles
+TIMEFRAMES_TOGGLE = {
+    '15m': True,
+    '1h': True,
+    '2h': True,
+    '4h': True,
+    '1d': True,
+    '1w': True,
+}
+
+def get_active_timeframes():
+    return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
+
 class ProxyManager:
     def __init__(self, proxy_sources, min_working_proxies=3):
         self.proxy_sources = proxy_sources
@@ -41,18 +53,17 @@ class ProxyManager:
         self.blacklisted = set()
         self.lock = threading.Lock()
         self.refresh_in_progress = False
+        self.selected_proxy = None  # Selected proxy for entire run
         
         # Initialize proxy pool
         self._initialize_proxies()
     
     def _initialize_proxies(self):
-        """Initial proxy setup - blocking operation"""
         logging.info("Starting proxy initialization...")
         self._refresh_proxies(blocking=True)
         logging.info(f"Proxy initialization complete. Found {len(self.proxies)} working proxies")
     
     def _refresh_proxies(self, blocking=False):
-        """Refresh the proxy pool"""
         with self.lock:
             if self.refresh_in_progress:
                 logging.debug("Proxy refresh already in progress, skipping...")
@@ -64,15 +75,11 @@ class ProxyManager:
             new_proxies = self._fetch_and_test_proxies()
             
             with self.lock:
-                # Keep existing good proxies
                 good_existing = [p for p in self.proxies if p['failures'] < 2]
-                # Add new proxies we found
                 new_proxy_addrs = [p['proxy'] for p in good_existing]
                 for proxy, speed in new_proxies:
                     if proxy not in new_proxy_addrs:
                         good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
-                
-                # Update proxy list
                 self.proxies = sorted(good_existing, key=lambda x: (x['failures'], x['speed']))
                 logging.info(f"Proxy pool refreshed. Now have {len(self.proxies)} working proxies")
         except Exception as e:
@@ -82,10 +89,7 @@ class ProxyManager:
                 self.refresh_in_progress = False
     
     def _fetch_and_test_proxies(self):
-        """Fetch and test proxies, return list of (proxy, speed) tuples"""
         all_proxies = set()
-        
-        # Collect proxies from all sources
         for url in self.proxy_sources:
             try:
                 logging.info(f"Fetching proxies from {url}")
@@ -97,29 +101,22 @@ class ProxyManager:
             except Exception as e:
                 logging.error(f"Failed to fetch proxies from {url}: {e}")
         
-        # Shuffle and limit test count
         test_proxies = list(all_proxies)
         random.shuffle(test_proxies)
-        test_proxies = test_proxies[:200]  # Test at most 200
+        test_proxies = test_proxies[:200]
         
         logging.info(f"Testing {len(test_proxies)} proxies against Binance...")
         working = []
         
-        # Test proxies in parallel
         with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(self._test_proxy, proxy): proxy 
-                      for proxy in test_proxies}
-            
+            futures = {executor.submit(self._test_proxy, proxy): proxy for proxy in test_proxies}
             for future in as_completed(futures):
                 result = future.result()
-                if result[0]:  # If proxy works
+                if result[0]:
                     working.append(result)
                     logging.info(f"Proxy {result[0]} works, response time: {result[1]:.2f}s")
-                
-                    # If we found enough fast proxies, we can stop testing
                     fast_proxies = [p for p, s in working if s < 5]
                     if len(fast_proxies) >= self.min_working_proxies:
-                        # Cancel remaining futures
                         for f in futures:
                             if not f.done():
                                 f.cancel()
@@ -128,76 +125,66 @@ class ProxyManager:
         if not working:
             logging.warning("No working proxies found!")
             return []
-            
-        # Filter by speed threshold
-        fast_proxies = [(p, s) for p, s in working if s < 10]  # Consider proxies < 10s as fast
         
-        # If we don't have enough fast proxies, include some slower ones
+        fast_proxies = [(p, s) for p, s in working if s < 10]
         if len(fast_proxies) < self.min_working_proxies:
             logging.warning(f"Found only {len(fast_proxies)} fast proxies, accepting some slower ones...")
             slower = [(p, s) for p, s in working if 10 <= s <= 20]
-            slower.sort(key=lambda x: x[1])  # Sort by speed
+            slower.sort(key=lambda x: x[1])
             fast_proxies.extend(slower[:self.min_working_proxies - len(fast_proxies)])
         
-        return sorted(fast_proxies, key=lambda x: x[1])  # Sort by speed
+        return sorted(fast_proxies, key=lambda x: x[1])
     
     def _test_proxy(self, proxy):
-        """Test a single proxy against Binance API"""
         if proxy in self.blacklisted:
             return None, None
         
-        proxies = {
-            "http": f"http://{proxy}",
-            "https": f"http://{proxy}"
-        }
+        proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
         
         try:
-            # Test against a light Binance endpoint
             start = time.time()
-            response = requests.get(
-                BINANCE_FUTURES_EXCHANGE_INFO,
-                proxies=proxies,
-                timeout=15
-            )
-            
+            response = requests.get(BINANCE_FUTURES_EXCHANGE_INFO, proxies=proxies, timeout=15)
             if response.status_code != 200:
                 self.blacklisted.add(proxy)
                 return None, None
-            
-            # Calculate response time
             elapsed = time.time() - start
             return proxy, elapsed
-            
         except Exception:
             self.blacklisted.add(proxy)
             return None, None
     
     def get_proxy(self):
-        """Get the best available proxy"""
         with self.lock:
+            if self.selected_proxy:
+                logging.debug(f"Using selected proxy: {self.selected_proxy['proxy']}")
+                return self.selected_proxy
+            
             if not self.proxies:
                 raise RuntimeError("No working proxies available. Cannot proceed.")
-                
-            # Find least used proxy with best speed
+            
             self.proxies.sort(key=lambda x: (x['failures'], x['speed']))
             return self.proxies[0]
     
-    def mark_failure(self, proxy_info):
-        """Mark a proxy as having failed"""
+    def mark_success(self, proxy_info):
         with self.lock:
-            # Find the proxy in our list
+            if not self.selected_proxy:
+                self.selected_proxy = proxy_info
+                logging.info(f"Selected proxy for entire run: {proxy_info['proxy']}")
+    
+    def mark_failure(self, proxy_info):
+        with self.lock:
+            if self.selected_proxy and proxy_info['proxy'] == self.selected_proxy['proxy']:
+                logging.warning(f"Selected proxy {proxy_info['proxy']} failed, clearing selection")
+                self.selected_proxy = None
+            
             for p in self.proxies:
                 if p['proxy'] == proxy_info['proxy']:
                     p['failures'] += 1
                     logging.warning(f"Proxy {p['proxy']} failure count now {p['failures']}")
-                    
-                    # Remove if too many failures
                     if p['failures'] >= 3:
                         logging.warning(f"Removing failed proxy {p['proxy']}")
                         self.proxies.remove(p)
                         self.blacklisted.add(p['proxy'])
-                        
-                        # Trigger refresh if needed
                         if len(self.proxies) < self.min_working_proxies and not self.refresh_in_progress:
                             threading.Thread(target=self._refresh_proxies, daemon=True).start()
                     break
@@ -205,43 +192,33 @@ class ProxyManager:
 def make_request(url, params=None, proxy_manager=None, max_attempts=3):
     for attempt in range(max_attempts):
         try:
-            # Get a proxy
             proxy_info = proxy_manager.get_proxy()
             proxy_str = proxy_info['proxy']
             proxies = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
             
-            # Log which proxy we're using
             endpoint = url.split('/')[-1] if '/' in url else url
             logging.info(f"Request to {endpoint}: using proxy {proxy_str} (attempt {attempt+1}/{max_attempts})")
             
-            # Make the request WITH VERIFICATION DISABLED
             timeout = min(15, max(5, proxy_info['speed'] * 2))
             resp = requests.get(url, params=params, proxies=proxies, timeout=timeout, verify=False)
             resp.raise_for_status()
             
-            # Success!
+            proxy_manager.mark_success(proxy_info)
+            
             logging.info(f"Request successful: {endpoint}")
             return resp.json()
-            
         except Exception as e:
             logging.error(f"Request failed: {str(e)}")
-            if 'proxy_info' in locals():  # Fix the variable scope issue
+            if 'proxy_info' in locals():
                 proxy_manager.mark_failure(proxy_info)
-            
-            # Last attempt failed
             if attempt == max_attempts - 1:
                 raise RuntimeError(f"Request failed after {max_attempts} attempts")
-            
-            # Wait before retrying
             wait_time = 2 * (attempt + 1)
             logging.info(f"Retrying in {wait_time} seconds...")
             time.sleep(wait_time)
 
-
 def get_perpetual_usdt_symbols(proxy_manager):
-    """Fetch all USDT perpetual futures symbols"""
     logging.info("Starting to fetch symbols list...")
-    
     for attempt in range(5):
         try:
             logging.info(f"Fetching symbols (attempt {attempt+1}/5)...")
@@ -252,23 +229,18 @@ def get_perpetual_usdt_symbols(proxy_manager):
                 s['quoteAsset'] == 'USDT' and 
                 s['status'] == 'TRADING'
             ]
-            
             logging.info(f"Successfully fetched {len(symbols)} USDT perpetual symbols")
             if len(symbols) < 10:
                 logging.warning(f"Too few symbols found ({len(symbols)}), retrying...")
                 time.sleep(3)
                 continue
-                
             return symbols
-            
         except Exception as e:
             logging.error(f"Failed to fetch symbols: {str(e)}")
             time.sleep(5)
-            
     raise RuntimeError("Failed to fetch symbols after multiple attempts")
 
 def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
-    """Fetch klines (candlestick data) for a symbol and timeframe"""
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
     try:
         logging.debug(f"Fetching {symbol} {interval} klines...")
@@ -281,7 +253,6 @@ def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
         return None, None
 
 def calculate_rsi_bb(closes):
-    """Calculate RSI and Bollinger Bands on RSI"""
     closes_np = np.array(closes)
     rsi = talib.RSI(closes_np, timeperiod=RSI_PERIOD)
     bb_upper, bb_middle, bb_lower = talib.BBANDS(
@@ -289,29 +260,25 @@ def calculate_rsi_bb(closes):
         timeperiod=BB_LENGTH,
         nbdevup=BB_STDDEV,
         nbdevdn=BB_STDDEV,
-        matype=0  # SMA
+        matype=0
     )
     return rsi, bb_upper, bb_middle, bb_lower
 
 def scan_symbol(symbol, timeframes, proxy_manager):
-    """Scan a single symbol for RSI touching BB bands"""
     results = []
     for timeframe in timeframes:
         closes, timestamps = fetch_klines(symbol, timeframe, proxy_manager)
         if closes is None or len(closes) < CANDLE_LIMIT:
             logging.warning(f"Not enough data for {symbol} {timeframe}. Skipping.")
             continue
-
-        idx = -2  # second last candle to avoid current open candle
+        idx = -2
         if idx < -len(closes):
             logging.warning(f"Not enough candles for {symbol} {timeframe} to skip open candle. Skipping.")
             continue
-
         rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
         if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]):
             logging.warning(f"NaN values for {symbol} {timeframe}, skipping.")
             continue
-
         rsi_val = rsi[idx]
         bb_upper_val = bb_upper[idx]
         bb_lower_val = bb_lower[idx]
@@ -333,27 +300,19 @@ def scan_symbol(symbol, timeframes, proxy_manager):
     return results
 
 def scan_for_bb_touches(proxy_manager):
-    """Main scanning function that processes all symbols"""
-    # First, get all symbols
     symbols = get_perpetual_usdt_symbols(proxy_manager)
     results = []
     total_symbols = len(symbols)
     completed = 0
-    
-    # Process in batches to avoid overwhelming resources
     batch_size = 20
+    active_timeframes = get_active_timeframes()
+    logging.info(f"Active timeframes: {active_timeframes}")
     for i in range(0, total_symbols, batch_size):
         batch = symbols[i:i+batch_size]
         batch_results = []
-        
-        batch_num = i//batch_size + 1
-        total_batches = (total_symbols + batch_size - 1) // batch_size
-        logging.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} symbols)")
-        
+        logging.info(f"Processing batch {i//batch_size + 1}/{(total_symbols + batch_size - 1)//batch_size}")
         with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(scan_symbol, symbol, TIMEFRAMES, proxy_manager): symbol 
-                       for symbol in batch}
-            
+            futures = {executor.submit(scan_symbol, symbol, active_timeframes, proxy_manager): symbol for symbol in batch}
             for future in as_completed(futures):
                 symbol = futures[future]
                 try:
@@ -361,67 +320,47 @@ def scan_for_bb_touches(proxy_manager):
                     batch_results.extend(symbol_results)
                 except Exception as e:
                     logging.error(f"Error scanning {symbol}: {e}")
-                    
                 completed += 1
                 if completed % 10 == 0 or completed == total_symbols:
                     logging.info(f"Completed {completed}/{total_symbols} symbols")
-                
         results.extend(batch_results)
-        
-        # Brief pause between batches
         if i + batch_size < total_symbols:
             time.sleep(1)
-
     logging.info(f"Scan completed for all {total_symbols} symbols")
     return results
 
 def format_results_by_timeframe(results):
-    """Format results for Telegram messages"""
     if not results:
         return ["*No BB touches detected at this time.*"]
-
     grouped = {}
     for r in results:
         grouped.setdefault(r['timeframe'], []).append(r)
-
     messages = []
     for timeframe, items in sorted(grouped.items()):
         header = f"*🔍 BB Touches on {timeframe} Timeframe ({len(items)} symbols)*\n"
-
         upper_touches = [i for i in items if i['touch_type'] == 'UPPER']
         lower_touches = [i for i in items if i['touch_type'] == 'LOWER']
-
         lines = []
         if upper_touches:
             lines.append("*⬆️ UPPER BB Touches:*")
             for item in sorted(upper_touches, key=lambda x: x['symbol']):
                 lines.append(f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}")
-
         if lower_touches:
             if upper_touches:
-                lines.append("")  # spacing
+                lines.append("")
             lines.append("*⬇️ LOWER BB Touches:*")
             for item in sorted(lower_touches, key=lambda x: x['symbol']):
                 lines.append(f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}")
-
         messages.append(header + "\n" + "\n".join(lines))
-
     timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     messages = [m + f"\n\n_Report generated at {timestamp}_" for m in messages]
-
     return messages
 
 def split_message(text, max_length=4000):
-    """
-    Splits a long text into chunks smaller than max_length,
-    trying to split at newline boundaries for readability.
-    """
     lines = text.split('\n')
     chunks = []
     current_chunk = ""
-
     for line in lines:
-        # +1 for the newline character
         if len(current_chunk) + len(line) + 1 > max_length:
             chunks.append(current_chunk)
             current_chunk = line
@@ -430,10 +369,8 @@ def split_message(text, max_length=4000):
                 current_chunk += "\n" + line
             else:
                 current_chunk = line
-
     if current_chunk:
         chunks.append(current_chunk)
-
     return chunks
 
 def send_telegram_alert(bot_token, chat_id, message):
@@ -456,10 +393,7 @@ def send_telegram_alert(bot_token, chat_id, message):
         return False
 
 def main():
-    """Main function"""
     start_time = time.time()
-    
-    # Get environment variables
     TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -469,18 +403,13 @@ def main():
     logging.info("Starting BB touch scanner bot...")
 
     try:
-        # Initialize proxy manager - critically important step
         logging.info("Initializing proxy manager...")
         proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=3)
-        
-        # Start the scanning process
         logging.info("Starting scan process...")
         results = scan_for_bb_touches(proxy_manager)
-        
-        # Format and send results
         logging.info(f"Scan complete, formatting {len(results)} results...")
         messages = format_results_by_timeframe(results)
-        
+
         for i, msg in enumerate(messages, 1):
             logging.info(f"Sending message {i}/{len(messages)}")
             chunks = split_message(msg)
@@ -490,15 +419,13 @@ def main():
                 success = send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, chunk)
                 if not success:
                     logging.error(f"Failed to send part {idx} of message {i}")
-        
+
         elapsed = time.time() - start_time
         logging.info(f"Bot run completed successfully in {elapsed:.2f} seconds")
-        
+
     except Exception as e:
         elapsed = time.time() - start_time
         logging.error(f"Fatal error after {elapsed:.2f}s: {e}")
-        
-        # Try to send error to Telegram
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             error_msg = f"*⚠️ Scanner Error*\n\nThe bot encountered an error after running for {elapsed:.2f}s:\n`{str(e)}`"
             send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, error_msg)
