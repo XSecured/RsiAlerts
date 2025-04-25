@@ -35,7 +35,7 @@ PROXY_SOURCES = [
 # Timeframe toggles
 TIMEFRAMES_TOGGLE = {
     '3m': True,
-    '5m': True
+    '5m': True,
     '15m': True,
     '30m': True,
     '1h': True,
