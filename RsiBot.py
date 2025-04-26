@@ -28,10 +28,7 @@ BB_LENGTH = 34
 BB_STDDEV = 2
 
 PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
-    # Add more trusted sources as needed
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 ]
 
 # Timeframe toggles
