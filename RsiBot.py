@@ -10,7 +10,7 @@ import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Configure logging with more detail
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -27,7 +27,6 @@ RSI_PERIOD = 14
 BB_LENGTH = 34
 BB_STDDEV = 2
 
-# Multiple proxy sources for redundancy
 PROXY_SOURCES = [
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 ]
@@ -49,221 +48,207 @@ def get_active_timeframes():
     return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
 
 class ProxyManager:
-    def __init__(self, proxy_sources, min_working_proxies=3):
+    def __init__(self, proxy_sources, min_working_proxies=5, max_failures=3, refresh_interval=300):
         self.proxy_sources = proxy_sources
         self.min_working_proxies = min_working_proxies
-        self.proxies = []  # Format: [{'proxy': proxy_str, 'failures': 0, 'speed': response_time}]
+        self.max_failures = max_failures
+        self.proxies = []  # [{'proxy': str, 'failures': int, 'speed': float}]
         self.blacklisted = set()
         self.lock = threading.Lock()
+        self.refresh_interval = refresh_interval  # seconds
+        self.last_refresh = 0
         self.refresh_in_progress = False
-        self.selected_proxy = None  # Selected proxy for entire run
         
-        # Initialize proxy pool
         self._initialize_proxies()
-    
+        # Start background proxy refresher thread
+        threading.Thread(target=self._background_refresh_loop, daemon=True).start()
+
     def _initialize_proxies(self):
-        logging.info("Starting proxy initialization...")
+        logging.info("Initializing proxy pool...")
         self._refresh_proxies(blocking=True)
-        logging.info(f"Proxy initialization complete. Found {len(self.proxies)} working proxies")
-    
+
+    def _background_refresh_loop(self):
+        while True:
+            time.sleep(self.refresh_interval)
+            with self.lock:
+                if not self.refresh_in_progress:
+                    logging.info("Background proxy refresh triggered.")
+                    self._refresh_proxies(blocking=False)
+
     def _refresh_proxies(self, blocking=False):
         with self.lock:
             if self.refresh_in_progress:
-                logging.debug("Proxy refresh already in progress, skipping...")
                 return
             self.refresh_in_progress = True
         
-        try:
-            logging.info("Refreshing proxy pool...")
-            new_proxies = self._fetch_and_test_proxies()
-            
-            with self.lock:
-                good_existing = [p for p in self.proxies if p['failures'] < 2]
-                new_proxy_addrs = [p['proxy'] for p in good_existing]
-                for proxy, speed in new_proxies:
-                    if proxy not in new_proxy_addrs:
-                        good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
-                self.proxies = sorted(good_existing, key=lambda x: (x['failures'], x['speed']))
-                logging.info(f"Proxy pool refreshed. Now have {len(self.proxies)} working proxies")
-        except Exception as e:
-            logging.error(f"Error refreshing proxies: {str(e)}")
-        finally:
-            with self.lock:
-                self.refresh_in_progress = False
-    
+        def refresh():
+            try:
+                logging.info("Refreshing proxies...")
+                new_proxies = self._fetch_and_test_proxies()
+                with self.lock:
+                    good_existing = [p for p in self.proxies if p['failures'] < self.max_failures]
+                    existing_proxies = {p['proxy'] for p in good_existing}
+                    for proxy, speed in new_proxies:
+                        if proxy not in existing_proxies and proxy not in self.blacklisted:
+                            good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
+                    self.proxies = sorted(good_existing, key=lambda x: (x['failures'], x['speed']))
+                    self.last_refresh = time.time()
+                    logging.info(f"Proxy pool refreshed: {len(self.proxies)} proxies available.")
+            except Exception as e:
+                logging.error(f"Error refreshing proxies: {e}")
+            finally:
+                with self.lock:
+                    self.refresh_in_progress = False
+        
+        if blocking:
+            refresh()
+        else:
+            threading.Thread(target=refresh, daemon=True).start()
+
     def _fetch_and_test_proxies(self):
         all_proxies = set()
         for url in self.proxy_sources:
             try:
-                logging.info(f"Fetching proxies from {url}")
-                response = requests.get(url, timeout=10)
-                proxies = [line.strip() for line in response.text.splitlines() 
-                          if line.strip() and line.strip() not in self.blacklisted]
+                resp = requests.get(url, timeout=10)
+                proxies = [line.strip() for line in resp.text.splitlines() if line.strip() and line.strip() not in self.blacklisted]
                 all_proxies.update(proxies)
-                logging.info(f"Found {len(proxies)} candidate proxies from {url}")
+                logging.info(f"Fetched {len(proxies)} proxies from {url}")
             except Exception as e:
                 logging.error(f"Failed to fetch proxies from {url}: {e}")
-        
+
         test_proxies = list(all_proxies)
         random.shuffle(test_proxies)
         test_proxies = test_proxies[:200]
-        
-        logging.info(f"Testing {len(test_proxies)} proxies against Binance...")
+
         working = []
-        
         with ThreadPoolExecutor(max_workers=20) as executor:
             futures = {executor.submit(self._test_proxy, proxy): proxy for proxy in test_proxies}
             for future in as_completed(futures):
-                result = future.result()
-                if result[0]:
-                    working.append(result)
-                    logging.info(f"Proxy {result[0]} works, response time: {result[1]:.2f}s")
-                    fast_proxies = [p for p, s in working if s < 5]
-                    if len(fast_proxies) >= self.min_working_proxies:
+                proxy, speed = future.result()
+                if proxy:
+                    working.append((proxy, speed))
+                    if len(working) >= self.min_working_proxies * 3:
                         for f in futures:
                             if not f.done():
                                 f.cancel()
                         break
-        
         if not working:
             logging.warning("No working proxies found!")
             return []
-        
         fast_proxies = [(p, s) for p, s in working if s < 10]
         if len(fast_proxies) < self.min_working_proxies:
-            logging.warning(f"Found only {len(fast_proxies)} fast proxies, accepting some slower ones...")
             slower = [(p, s) for p, s in working if 10 <= s <= 20]
             slower.sort(key=lambda x: x[1])
             fast_proxies.extend(slower[:self.min_working_proxies - len(fast_proxies)])
-        
         return sorted(fast_proxies, key=lambda x: x[1])
-    
+
     def _test_proxy(self, proxy):
-        if proxy in self.blacklisted:
-            return None, None
-        
         proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
-        
         try:
             start = time.time()
-            response = requests.get(BINANCE_FUTURES_EXCHANGE_INFO, proxies=proxies, timeout=15)
-            if response.status_code != 200:
+            resp = requests.get(BINANCE_FUTURES_EXCHANGE_INFO, proxies=proxies, timeout=15)
+            if resp.status_code != 200:
                 self.blacklisted.add(proxy)
                 return None, None
-            elapsed = time.time() - start
-            return proxy, elapsed
+            return proxy, time.time() - start
         except Exception:
             self.blacklisted.add(proxy)
             return None, None
-    
+
     def get_proxy(self):
         with self.lock:
-            if self.selected_proxy:
-                logging.debug(f"Using selected proxy: {self.selected_proxy['proxy']}")
-                return self.selected_proxy
-            
+            # Refresh if low proxies and time elapsed
+            if len(self.proxies) < self.min_working_proxies and (time.time() - self.last_refresh) > self.refresh_interval:
+                logging.info("Proxy count low, refreshing proxies...")
+                self._refresh_proxies(blocking=False)
             if not self.proxies:
-                raise RuntimeError("No working proxies available. Cannot proceed.")
-            
-            self.proxies.sort(key=lambda x: (x['failures'], x['speed']))
-            return self.proxies[0]
-    
-    def mark_success(self, proxy_info):
-        with self.lock:
-            if not self.selected_proxy:
-                self.selected_proxy = proxy_info
-                logging.info(f"Selected proxy for entire run: {proxy_info['proxy']}")
-    
+                logging.error("No working proxies available. Blocking until proxies are refreshed.")
+                waited = 0
+                while not self.proxies and waited < 120:
+                    time.sleep(5)
+                    waited += 5
+                if not self.proxies:
+                    raise RuntimeError("No working proxies available after waiting.")
+            # Round-robin rotate proxies
+            proxy_info = self.proxies.pop(0)
+            self.proxies.append(proxy_info)
+            return proxy_info
+
     def mark_failure(self, proxy_info):
         with self.lock:
-            if self.selected_proxy and proxy_info['proxy'] == self.selected_proxy['proxy']:
-                logging.warning(f"Selected proxy {proxy_info['proxy']} failed, clearing selection")
-                self.selected_proxy = None
-            
             for p in self.proxies:
                 if p['proxy'] == proxy_info['proxy']:
                     p['failures'] += 1
-                    logging.warning(f"Proxy {p['proxy']} failure count now {p['failures']}")
-                    if p['failures'] >= 3:
-                        logging.warning(f"Removing failed proxy {p['proxy']}")
+                    logging.warning(f"Proxy {p['proxy']} failure count: {p['failures']}")
+                    if p['failures'] >= self.max_failures:
+                        logging.warning(f"Removing proxy {p['proxy']} due to failures")
                         self.proxies.remove(p)
                         self.blacklisted.add(p['proxy'])
-                        if len(self.proxies) < self.min_working_proxies and not self.refresh_in_progress:
-                            threading.Thread(target=self._refresh_proxies, daemon=True).start()
                     break
 
-def make_request(url, params=None, proxy_manager=None, max_attempts=3):
+def make_request(url, params=None, proxy_manager=None, max_attempts=5):
+    last_exc = None
     for attempt in range(max_attempts):
+        proxy_info = None
         try:
             proxy_info = proxy_manager.get_proxy()
-            proxy_str = proxy_info['proxy']
-            proxies = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
-            
-            endpoint = url.split('/')[-1] if '/' in url else url
-            logging.info(f"Request to {endpoint}: using proxy {proxy_str} (attempt {attempt+1}/{max_attempts})")
-            
+            proxies = {"http": f"http://{proxy_info['proxy']}", "https": f"http://{proxy_info['proxy']}"}
+            logging.info(f"Request to {url.split('/')[-1]} using proxy {proxy_info['proxy']} (attempt {attempt+1}/{max_attempts})")
             timeout = min(15, max(5, proxy_info['speed'] * 2))
             resp = requests.get(url, params=params, proxies=proxies, timeout=timeout, verify=False)
             resp.raise_for_status()
-            
-            proxy_manager.mark_success(proxy_info)
-            
-            logging.info(f"Request successful: {endpoint}")
             return resp.json()
         except Exception as e:
-            logging.error(f"Request failed: {str(e)}")
-            if 'proxy_info' in locals():
+            logging.error(f"Request failed: {e}")
+            if proxy_info:
                 proxy_manager.mark_failure(proxy_info)
-            if attempt == max_attempts - 1:
-                raise RuntimeError(f"Request failed after {max_attempts} attempts")
-            wait_time = 2 * (attempt + 1)
-            logging.info(f"Retrying in {wait_time} seconds...")
-            time.sleep(wait_time)
+            last_exc = e
+            logging.info("Retrying in 3 seconds...")
+            time.sleep(3)
+    raise RuntimeError(f"Request failed after {max_attempts} attempts: {last_exc}")
 
 def get_perpetual_usdt_symbols(proxy_manager):
-    logging.info("Starting to fetch symbols list...")
+    logging.info("Fetching USDT perpetual symbols...")
     for attempt in range(5):
         try:
-            logging.info(f"Fetching symbols (attempt {attempt+1}/5)...")
             data = make_request(BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
             symbols = [
                 s['symbol'] for s in data['symbols']
-                if s['contractType'] == 'PERPETUAL' and 
-                s['quoteAsset'] == 'USDT' and 
-                s['status'] == 'TRADING'
+                if s['contractType'] == 'PERPETUAL' and s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
             ]
-            logging.info(f"Successfully fetched {len(symbols)} USDT perpetual symbols")
+            logging.info(f"Fetched {len(symbols)} symbols")
             if len(symbols) < 10:
-                logging.warning(f"Too few symbols found ({len(symbols)}), retrying...")
+                logging.warning("Too few symbols, retrying...")
                 time.sleep(3)
                 continue
             return symbols
         except Exception as e:
-            logging.error(f"Failed to fetch symbols: {str(e)}")
+            logging.error(f"Error fetching symbols: {e}")
             time.sleep(5)
     raise RuntimeError("Failed to fetch symbols after multiple attempts")
 
 def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
-    try:
-        logging.debug(f"Fetching {symbol} {interval} klines...")
-        data = make_request(BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
-        closes = [float(k[4]) for k in data]
-        timestamps = [k[0] for k in data]
-        return closes, timestamps
-    except Exception as e:
-        logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
-        return None, None
+    while True:
+        try:
+            data = make_request(BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
+            closes = [float(k[4]) for k in data]
+            timestamps = [k[0] for k in data]
+            if len(closes) < limit:
+                logging.warning(f"Not enough klines data for {symbol} {interval}, retrying...")
+                time.sleep(5)
+                continue
+            return closes, timestamps
+        except Exception as e:
+            logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
+            logging.info("Waiting 5 seconds before retrying klines fetch...")
+            time.sleep(5)
 
 def calculate_rsi_bb(closes):
     closes_np = np.array(closes)
     rsi = talib.RSI(closes_np, timeperiod=RSI_PERIOD)
     bb_upper, bb_middle, bb_lower = talib.BBANDS(
-        rsi,
-        timeperiod=BB_LENGTH,
-        nbdevup=BB_STDDEV,
-        nbdevdn=BB_STDDEV,
-        matype=0
+        rsi, timeperiod=BB_LENGTH, nbdevup=BB_STDDEV, nbdevdn=BB_STDDEV, matype=0
     )
     return rsi, bb_upper, bb_middle, bb_lower
 
@@ -271,9 +256,6 @@ def scan_symbol(symbol, timeframes, proxy_manager):
     results = []
     for timeframe in timeframes:
         closes, timestamps = fetch_klines(symbol, timeframe, proxy_manager)
-        if closes is None or len(closes) < CANDLE_LIMIT:
-            logging.warning(f"Not enough data for {symbol} {timeframe}. Skipping.")
-            continue
         idx = -2
         if idx < -len(closes):
             logging.warning(f"Not enough candles for {symbol} {timeframe} to skip open candle. Skipping.")
@@ -299,7 +281,7 @@ def scan_symbol(symbol, timeframes, proxy_manager):
                 'touch_type': touch_type,
                 'timestamp': timestamp
             })
-            logging.info(f"Alert: {symbol} on {timeframe} timeframe touching {touch_type} BB line at {timestamp}")
+            logging.info(f"Alert: {symbol} on {timeframe} touching {touch_type} BB line at {timestamp}")
     return results
 
 def scan_for_bb_touches(proxy_manager):
@@ -406,11 +388,8 @@ def main():
     logging.info("Starting BB touch scanner bot...")
 
     try:
-        logging.info("Initializing proxy manager...")
-        proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=3)
-        logging.info("Starting scan process...")
+        proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=5)
         results = scan_for_bb_touches(proxy_manager)
-        logging.info(f"Scan complete, formatting {len(results)} results...")
         messages = format_results_by_timeframe(results)
 
         for i, msg in enumerate(messages, 1):
