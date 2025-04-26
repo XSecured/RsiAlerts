@@ -49,7 +49,7 @@ def get_active_timeframes():
     return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
 
 class ProxyManager:
-    def __init__(self, proxy_sources, min_working_proxies=3):
+    def __init__(self, proxy_sources, min_working_proxies=20):
         self.proxy_sources = proxy_sources
         self.min_working_proxies = min_working_proxies
         self.proxies = []  # Format: [{'proxy': proxy_str, 'failures': 0, 'speed': response_time}]
