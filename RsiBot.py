@@ -28,7 +28,7 @@ RSI_PERIOD = 14
 BB_LENGTH = 34
 BB_STDDEV = 2
 
-# Multiple proxy sources
+# Proxy sources
 PROXY_SOURCES = [
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
@@ -76,7 +76,7 @@ def fetch_proxies_from_url(url: str, default_scheme: str = "http") -> list:
 def test_proxy(proxy: str) -> bool:
     try:
         test_url = "https://api.binance.com/api/v3/time"
-        response = requests.get(test_url, proxies={"http": proxy, "https": proxy}, timeout=10, verify=False)
+        response = requests.get(test_url, proxies={"http": proxy, "https": proxy}, timeout=10, verify=True)
         return response.status_code in range(200, 300)
     except Exception as e:
         if "Connection reset" in str(e):
@@ -89,7 +89,7 @@ def test_proxy_speed(proxy: str) -> float:
     test_url = "https://api.binance.com/api/v3/time"  # lightweight endpoint
     try:
         start_time = time.time()
-        response = requests.get(test_url, proxies={"http": proxy, "https": proxy}, timeout=10, verify=False)
+        response = requests.get(test_url, proxies={"http": proxy, "https": proxy}, timeout=10, verify=True)
         response.raise_for_status()
         end_time = time.time()
         return end_time - start_time
@@ -121,7 +121,6 @@ def test_proxies_concurrently(proxies: list, max_workers: int = 50, max_working:
                 if len(working) >= max_working:
                     break
         finally:
-            # Cancel remaining futures if we already have enough
             if len(working) >= max_working:
                 for f in futures:
                     if not f.done():
@@ -142,13 +141,8 @@ class ProxyPool:
         self.max_failures = max_failures
         self.proxy_cache_file = "working_proxies.json"
         
-        # Try to load cached proxies
         self.load_cached_proxies()
-        
-        # Initialize proxy pool
         self.populate_proxy_pool()
-        
-        # Start background proxy checking threads
         self.start_proxy_checker()
         self.start_fastest_proxy_checker()
         
@@ -180,7 +174,7 @@ class ProxyPool:
                 continue
                 
             random.shuffle(raw_proxies)
-            test_proxies = raw_proxies[:200]  # Test a subset
+            test_proxies = raw_proxies[:200]
             working_proxies = test_proxies_concurrently(test_proxies, max_working=self.min_working_proxies)
             
             with self.lock:
@@ -188,11 +182,8 @@ class ProxyPool:
                 if len(self.proxies) >= self.min_working_proxies:
                     break
                     
-        # Find fastest proxy
         self.update_fastest_proxy()
         logging.info(f"Proxy pool initialized with {len(self.proxies)} proxies. Fastest: {self.fastest_proxy}")
-        
-        # Save working proxies
         self.save_cached_proxies()
             
     def update_fastest_proxy(self, exclude=None):
@@ -213,7 +204,7 @@ class ProxyPool:
     def start_fastest_proxy_checker(self):
         def checker_loop():
             while True:
-                time.sleep(3600)  # Check every hour
+                time.sleep(3600)
                 self.update_fastest_proxy()
                 
         threading.Thread(target=checker_loop, daemon=True).start()
@@ -228,7 +219,6 @@ class ProxyPool:
             if removed > 0:
                 logging.info(f"Removed {removed} dead proxies, {len(self.proxies)} remaining")
                 
-            # If we're low on proxies, get more
             if len(self.proxies) < self.min_working_proxies:
                 logging.info(f"Low on proxies ({len(self.proxies)}), getting more...")
                 self.populate_proxy_pool()
@@ -249,7 +239,6 @@ class ProxyPool:
             else:
                 self.proxy_failures[proxy] += 1
                 
-            # If this proxy has failed too many times and it's our fastest, select new fastest
             if proxy == self.fastest_proxy and self.proxy_failures[proxy] >= self.max_failures:
                 logging.warning(f"Fastest proxy {proxy} failed {self.proxy_failures[proxy]} times, finding new fastest")
                 self.update_fastest_proxy(exclude=proxy)
@@ -261,56 +250,39 @@ class ProxyPool:
                 self.proxy_failures[proxy] = 0
 
 def fetch_with_retry(url, params=None, proxy_pool=None, max_retries=5, backoff_factor=1.0):
-    """
-    Fetch data from URL using proxy, with retry logic on failure
-    """
     session = requests.Session()
     retries = 0
     
     while retries < max_retries:
-        # Use fastest proxy if available
         if proxy_pool and proxy_pool.fastest_proxy:
             proxy_url = proxy_pool.fastest_proxy
             session.proxies = {"http": proxy_url, "https": proxy_url}
             logging.debug(f"Using fastest proxy: {proxy_url}")
         
         try:
-            response = session.get(url, params=params, timeout=15, verify=False)
+            response = session.get(url, params=params, timeout=15, verify=True)
             response.raise_for_status()
             
-            # Success - reset failure count for this proxy
             if proxy_pool and proxy_pool.fastest_proxy:
                 proxy_pool.reset_proxy_failures(proxy_pool.fastest_proxy)
-                
+            
             return response.json()
-            
-        except (requests.exceptions.RequestException) as e:
+        except requests.exceptions.RequestException as e:
             retries += 1
-            error_msg = str(e)
-            
-            # If using a proxy and it failed, mark it
+            logging.warning(f"Request failed (attempt {retries}/{max_retries}): {e}")
             if proxy_pool and proxy_pool.fastest_proxy:
-                logging.warning(f"Request failed with proxy {proxy_pool.fastest_proxy}: {e}")
                 proxy_pool.mark_proxy_failure(proxy_pool.fastest_proxy)
-            else:
-                logging.warning(f"Request failed: {e}")
-                
             if retries >= max_retries:
                 logging.error(f"Failed after {max_retries} retries")
                 raise
-                
-            # Wait with exponential backoff before retrying
             wait_time = backoff_factor * (2 ** (retries - 1))
-            logging.info(f"Retrying in {wait_time:.1f} seconds (attempt {retries}/{max_retries})")
+            logging.info(f"Retrying in {wait_time:.1f} seconds...")
             time.sleep(wait_time)
-            
-    # Should not reach here, but return None just in case
     return None
 
 def get_perpetual_usdt_symbols(proxy_pool):
-    """Fetch USDT perpetual futures from Binance"""
     logging.info("Fetching USDT perpetual symbols...")
-    for attempt in range(3):  # Try up to 3 times
+    for attempt in range(3):
         try:
             data = fetch_with_retry(BINANCE_FUTURES_EXCHANGE_INFO, proxy_pool=proxy_pool)
             symbols = [
@@ -324,39 +296,29 @@ def get_perpetual_usdt_symbols(proxy_pool):
         except Exception as e:
             logging.error(f"Error fetching symbols (attempt {attempt+1}): {e}")
             time.sleep(5)
-    
-    # If we get here, all attempts failed
     raise RuntimeError("Failed to fetch symbols after multiple attempts")
 
 def fetch_klines(symbol, interval, proxy_pool, limit=CANDLE_LIMIT, max_retries=3):
-    """Fetch klines (candlestick data) for a symbol and timeframe with retries"""
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
-    
     for attempt in range(max_retries):
         try:
             data = fetch_with_retry(BINANCE_FUTURES_KLINES, params=params, proxy_pool=proxy_pool)
-            
             if not data or len(data) < limit:
                 logging.warning(f"Received only {len(data) if data else 0}/{limit} klines for {symbol} {interval}")
                 if attempt < max_retries - 1:
                     time.sleep(2)
                     continue
-                    
             closes = [float(k[4]) for k in data]
             timestamps = [k[0] for k in data]
             return closes, timestamps
-            
         except Exception as e:
             logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
             if attempt < max_retries - 1:
                 time.sleep(3)
-    
-    # If all retries failed
     logging.error(f"Failed to fetch klines for {symbol} {interval} after {max_retries} attempts")
     return [], []
 
 def calculate_rsi_bb(closes):
-    """Calculate RSI and Bollinger Bands on RSI"""
     closes_np = np.array(closes)
     rsi = talib.RSI(closes_np, timeperiod=RSI_PERIOD)
     bb_upper, bb_middle, bb_lower = talib.BBANDS(
@@ -365,10 +327,9 @@ def calculate_rsi_bb(closes):
     return rsi, bb_upper, bb_middle, bb_lower
 
 def scan_symbol(symbol, timeframes, proxy_pool):
-    """Scan a single symbol for RSI touching BB bands"""
     results = []
     for timeframe in timeframes:
-        for retry in range(3):  # Retry each timeframe up to 3 times
+        for retry in range(3):
             closes, timestamps = fetch_klines(symbol, timeframe, proxy_pool)
             if len(closes) < CANDLE_LIMIT:
                 if retry < 2:
@@ -378,25 +339,19 @@ def scan_symbol(symbol, timeframes, proxy_pool):
                 else:
                     logging.warning(f"Not enough klines data for {symbol} {timeframe}, skipping after retries")
                     break
-                    
-            # We have enough data, process it
             rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
-            idx = -2  # Use the previous candle to avoid open candle
-            
+            idx = -2
             if idx < -len(closes):
                 logging.warning(f"Not enough candles for {symbol} {timeframe} to skip open candle")
                 break
-                
             if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]):
                 logging.warning(f"NaN values for {symbol} {timeframe}, skipping")
                 break
-                
             rsi_val = rsi[idx]
             bb_upper_val = bb_upper[idx]
             bb_lower_val = bb_lower[idx]
             upper_touch = rsi_val >= bb_upper_val * (1 - UPPER_TOUCH_THRESHOLD)
             lower_touch = rsi_val <= bb_lower_val * (1 + LOWER_TOUCH_THRESHOLD)
-            
             if upper_touch or lower_touch:
                 touch_type = "UPPER" if upper_touch else "LOWER"
                 timestamp = datetime.utcfromtimestamp(timestamps[idx] / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -410,33 +365,23 @@ def scan_symbol(symbol, timeframes, proxy_pool):
                     'timestamp': timestamp
                 })
                 logging.info(f"Alert: {symbol} on {timeframe} touching {touch_type} BB line at {timestamp}")
-            
-            # Success, break retry loop
             break
-            
     return results
 
 def scan_for_bb_touches(proxy_pool):
-    """Main scanning function that processes all symbols"""
     symbols = get_perpetual_usdt_symbols(proxy_pool)
     results = []
     total_symbols = len(symbols)
     completed = 0
-    
     batch_size = 20
     active_timeframes = get_active_timeframes()
     logging.info(f"Active timeframes: {active_timeframes}")
-    
     for i in range(0, total_symbols, batch_size):
         batch = symbols[i:i+batch_size]
         batch_results = []
-        
         logging.info(f"Processing batch {i//batch_size + 1}/{(total_symbols + batch_size - 1)//batch_size}")
-        
         with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(scan_symbol, symbol, active_timeframes, proxy_pool): symbol 
-                       for symbol in batch}
-            
+            futures = {executor.submit(scan_symbol, symbol, active_timeframes, proxy_pool): symbol for symbol in batch}
             for future in as_completed(futures):
                 symbol = futures[future]
                 try:
@@ -444,67 +389,47 @@ def scan_for_bb_touches(proxy_pool):
                     batch_results.extend(symbol_results)
                 except Exception as e:
                     logging.error(f"Error scanning {symbol}: {e}")
-                
                 completed += 1
                 if completed % 10 == 0 or completed == total_symbols:
                     logging.info(f"Completed {completed}/{total_symbols} symbols")
-        
         results.extend(batch_results)
-        
-        # Brief pause between batches to avoid overloading Binance
         if i + batch_size < total_symbols:
             time.sleep(1)
-    
     logging.info(f"Scan completed for all {total_symbols} symbols")
     return results
 
 def format_results_by_timeframe(results):
-    """Format results for Telegram messages"""
     if not results:
         return ["*No BB touches detected at this time.*"]
-        
     grouped = {}
     for r in results:
         grouped.setdefault(r['timeframe'], []).append(r)
-        
     messages = []
     for timeframe, items in sorted(grouped.items()):
         header = f"*🔍 BB Touches on {timeframe} Timeframe ({len(items)} symbols)*\n"
-        
         upper_touches = [i for i in items if i['touch_type'] == 'UPPER']
         lower_touches = [i for i in items if i['touch_type'] == 'LOWER']
-        
         lines = []
         if upper_touches:
             lines.append("*⬆️ UPPER BB Touches:*")
             for item in sorted(upper_touches, key=lambda x: x['symbol']):
                 lines.append(f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}")
-                
         if lower_touches:
             if upper_touches:
-                lines.append("")  # spacing
+                lines.append("")
             lines.append("*⬇️ LOWER BB Touches:*")
             for item in sorted(lower_touches, key=lambda x: x['symbol']):
                 lines.append(f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}")
-                
         messages.append(header + "\n" + "\n".join(lines))
-        
     timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     messages = [m + f"\n\n_Report generated at {timestamp}_" for m in messages]
-    
     return messages
 
 def split_message(text, max_length=4000):
-    """
-    Splits a long text into chunks smaller than max_length,
-    trying to split at newline boundaries for readability.
-    """
     lines = text.split('\n')
     chunks = []
     current_chunk = ""
-
     for line in lines:
-        # +1 for the newline character
         if len(current_chunk) + len(line) + 1 > max_length:
             chunks.append(current_chunk)
             current_chunk = line
@@ -513,10 +438,8 @@ def split_message(text, max_length=4000):
                 current_chunk += "\n" + line
             else:
                 current_chunk = line
-
     if current_chunk:
         chunks.append(current_chunk)
-
     return chunks
 
 def send_telegram_alert(bot_token, chat_id, message):
@@ -550,16 +473,14 @@ def main():
 
     try:
         proxy_pool = ProxyPool(PROXY_SOURCES, min_working_proxies=10, refresh_interval=180)
-        
-        # Wait a moment for proxy initialization
-        time.sleep(5)
-        
+        time.sleep(5)  # Wait for proxies to initialize
+
         if not proxy_pool.fastest_proxy:
             logging.warning("No fastest proxy found yet, proceeding anyway...")
-        
+
         logging.info("Starting scan process...")
         results = scan_for_bb_touches(proxy_pool)
-        
+
         logging.info(f"Scan complete, formatting {len(results)} results...")
         messages = format_results_by_timeframe(results)
 
