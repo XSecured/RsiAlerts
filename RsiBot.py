@@ -28,7 +28,10 @@ BB_LENGTH = 34
 BB_STDDEV = 2
 
 PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
+    # Add more trusted sources as needed
 ]
 
 # Timeframe toggles
@@ -48,7 +51,7 @@ def get_active_timeframes():
     return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
 
 class ProxyManager:
-    def __init__(self, proxy_sources, min_working_proxies=5, max_failures=3, refresh_interval=300):
+    def __init__(self, proxy_sources, min_working_proxies=10, max_failures=3, refresh_interval=180):
         self.proxy_sources = proxy_sources
         self.min_working_proxies = min_working_proxies
         self.max_failures = max_failures
@@ -90,7 +93,7 @@ class ProxyManager:
                     existing_proxies = {p['proxy'] for p in good_existing}
                     for proxy, speed in new_proxies:
                         if proxy not in existing_proxies and proxy not in self.blacklisted:
-                            good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
+                        good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
                     self.proxies = sorted(good_existing, key=lambda x: (x['failures'], x['speed']))
                     self.last_refresh = time.time()
                     logging.info(f"Proxy pool refreshed: {len(self.proxies)} proxies available.")
@@ -135,44 +138,39 @@ class ProxyManager:
         if not working:
             logging.warning("No working proxies found!")
             return []
-        fast_proxies = [(p, s) for p, s in working if s < 10]
-        if len(fast_proxies) < self.min_working_proxies:
-            slower = [(p, s) for p, s in working if 10 <= s <= 20]
-            slower.sort(key=lambda x: x[1])
-            fast_proxies.extend(slower[:self.min_working_proxies - len(fast_proxies)])
-        return sorted(fast_proxies, key=lambda x: x[1])
+        if len(working) < self.min_working_proxies:
+            logging.warning(f"Only {len(working)} working proxies found, less than min_working_proxies={self.min_working_proxies}")
+        return sorted(working, key=lambda x: x[1])
 
     def _test_proxy(self, proxy):
         proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
         try:
             start = time.time()
-            resp = requests.get(BINANCE_FUTURES_EXCHANGE_INFO, proxies=proxies, timeout=15)
+            resp = requests.get(BINANCE_FUTURES_EXCHANGE_INFO, proxies=proxies, timeout=5)
             if resp.status_code != 200:
                 self.blacklisted.add(proxy)
                 return None, None
-            return proxy, time.time() - start
+            speed = time.time() - start
+            if speed > 5:  # Only keep proxies faster than 5 seconds
+                self.blacklisted.add(proxy)
+                return None, None
+            return proxy, speed
         except Exception:
             self.blacklisted.add(proxy)
             return None, None
 
     def get_proxy(self):
         with self.lock:
-            # Refresh if low proxies and time elapsed
-            if len(self.proxies) < self.min_working_proxies and (time.time() - self.last_refresh) > self.refresh_interval:
-                logging.info("Proxy count low, refreshing proxies...")
-                self._refresh_proxies(blocking=False)
             if not self.proxies:
-                logging.error("No working proxies available. Blocking until proxies are refreshed.")
-                waited = 0
-                while not self.proxies and waited < 120:
-                    time.sleep(5)
-                    waited += 5
-                if not self.proxies:
-                    raise RuntimeError("No working proxies available after waiting.")
-            # Round-robin rotate proxies
-            proxy_info = self.proxies.pop(0)
-            self.proxies.append(proxy_info)
-            return proxy_info
+                logging.error("No working proxies available.")
+                raise RuntimeError("No working proxies available.")
+            # Select the fastest proxy with failures < max_failures
+            available = [p for p in self.proxies if p['failures'] < self.max_failures]
+            if not available:
+                logging.error("All proxies have reached failure limit.")
+                raise RuntimeError("All proxies have reached failure limit.")
+            fastest = min(available, key=lambda x: x['speed'])
+            return fastest
 
     def mark_failure(self, proxy_info):
         with self.lock:
@@ -194,8 +192,7 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=5):
             proxy_info = proxy_manager.get_proxy()
             proxies = {"http": f"http://{proxy_info['proxy']}", "https": f"http://{proxy_info['proxy']}"}
             logging.info(f"Request to {url.split('/')[-1]} using proxy {proxy_info['proxy']} (attempt {attempt+1}/{max_attempts})")
-            timeout = min(15, max(5, proxy_info['speed'] * 2))
-            resp = requests.get(url, params=params, proxies=proxies, timeout=timeout, verify=False)
+            resp = requests.get(url, params=params, proxies=proxies, timeout=10, verify=False)  # Fixed timeout
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -229,20 +226,16 @@ def get_perpetual_usdt_symbols(proxy_manager):
 
 def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
-    while True:
-        try:
-            data = make_request(BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
-            closes = [float(k[4]) for k in data]
-            timestamps = [k[0] for k in data]
-            if len(closes) < limit:
-                logging.warning(f"Not enough klines data for {symbol} {interval}, retrying...")
-                time.sleep(5)
-                continue
-            return closes, timestamps
-        except Exception as e:
-            logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
-            logging.info("Waiting 5 seconds before retrying klines fetch...")
-            time.sleep(5)
+    try:
+        data = make_request(BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
+        closes = [float(k[4]) for k in data]
+        timestamps = [k[0] for k in data]
+        if len(closes) < limit:
+            logging.warning(f"Fewer than {limit} klines for {symbol} {interval}")
+        return closes, timestamps
+    except Exception as e:
+        logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
+        return [], []
 
 def calculate_rsi_bb(closes):
     closes_np = np.array(closes)
@@ -256,11 +249,14 @@ def scan_symbol(symbol, timeframes, proxy_manager):
     results = []
     for timeframe in timeframes:
         closes, timestamps = fetch_klines(symbol, timeframe, proxy_manager)
-        idx = -2
+        if len(closes) < CANDLE_LIMIT:
+            logging.warning(f"Not enough klines data for {symbol} {timeframe}, skipping.")
+            continue
+        rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
+        idx = -2  # Use the previous candle to avoid open candle
         if idx < -len(closes):
             logging.warning(f"Not enough candles for {symbol} {timeframe} to skip open candle. Skipping.")
             continue
-        rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
         if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]):
             logging.warning(f"NaN values for {symbol} {timeframe}, skipping.")
             continue
@@ -388,7 +384,7 @@ def main():
     logging.info("Starting BB touch scanner bot...")
 
     try:
-        proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=5)
+        proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=10, refresh_interval=180)
         results = scan_for_bb_touches(proxy_manager)
         messages = format_results_by_timeframe(results)
 
