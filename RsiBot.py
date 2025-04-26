@@ -60,7 +60,6 @@ class ProxyManager:
         self.refresh_in_progress = False
         
         self._initialize_proxies()
-        # Start background proxy refresher thread
         threading.Thread(target=self._background_refresh_loop, daemon=True).start()
 
     def _initialize_proxies(self):
@@ -88,9 +87,9 @@ class ProxyManager:
                 with self.lock:
                     good_existing = [p for p in self.proxies if p['failures'] < self.max_failures]
                     existing_proxies = {p['proxy'] for p in good_existing}
-                    for proxy, speed in new_proxies:
-                        if proxy not in existing_proxies and proxy not in self.blacklisted:
-                            good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
+                    for proxy_info in new_proxies:
+                        if proxy_info['proxy'] not in existing_proxies and proxy_info['proxy'] not in self.blacklisted:
+                            good_existing.append(proxy_info)
                     self.proxies = sorted(good_existing, key=lambda x: (x['failures'], x['speed']))
                     self.last_refresh = time.time()
                     logging.info(f"Proxy pool refreshed: {len(self.proxies)} proxies available.")
@@ -118,56 +117,59 @@ class ProxyManager:
 
         test_proxies = list(all_proxies)
         random.shuffle(test_proxies)
-        test_proxies = test_proxies[:200]
+        test_proxies = test_proxies[:300]
 
         working = []
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(self._test_proxy, proxy): proxy for proxy in test_proxies}
+        with ThreadPoolExecutor(max_workers=30) as executor:
+            futures = {executor.submit(self.test_proxy, proxy): proxy for proxy in test_proxies}
             for future in as_completed(futures):
-                proxy, speed = future.result()
+                proxy = future.result()
                 if proxy:
-                    working.append((proxy, speed))
+                    working.append(proxy)
                     if len(working) >= self.min_working_proxies * 3:
                         for f in futures:
                             if not f.done():
                                 f.cancel()
                         break
+
         if not working:
             logging.warning("No working proxies found!")
             return []
-        if len(working) < self.min_working_proxies:
-            logging.warning(f"Only {len(working)} working proxies found, less than min_working_proxies={self.min_working_proxies}")
-        return sorted(working, key=lambda x: x[1])
 
-    def _test_proxy(self, proxy):
+        # Assign default speed as 1.0 (since we don't measure here)
+        proxy_infos = [{'proxy': p, 'failures': 0, 'speed': 1.0} for p in working]
+        return proxy_infos
+
+    def test_proxy(self, proxy: str) -> str or None:
+        test_url = "https://api.binance.com/api/v3/time"
         proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
         try:
-            start = time.time()
-            resp = requests.get(BINANCE_FUTURES_EXCHANGE_INFO, proxies=proxies, timeout=5)
-            if resp.status_code != 200:
-                self.blacklisted.add(proxy)
-                return None, None
-            speed = time.time() - start
-            if speed > 5:  # Only keep proxies faster than 5 seconds
-                self.blacklisted.add(proxy)
-                return None, None
-            return proxy, speed
-        except Exception:
-            self.blacklisted.add(proxy)
-            return None, None
+            response = requests.get(test_url, proxies=proxies, timeout=10, verify=False)
+            if 200 <= response.status_code < 300:
+                logging.info(f"Proxy {proxy} passed test.")
+                return proxy
+            else:
+                logging.debug(f"Proxy {proxy} returned status {response.status_code}")
+                return None
+        except Exception as e:
+            if "Connection reset" in str(e):
+                logging.debug(f"Proxy {proxy} failed with connection reset")
+            else:
+                logging.debug(f"Proxy {proxy} failed: {e}")
+            return None
 
     def get_proxy(self):
         with self.lock:
             if not self.proxies:
                 logging.error("No working proxies available.")
                 raise RuntimeError("No working proxies available.")
-            # Select the fastest proxy with failures < max_failures
             available = [p for p in self.proxies if p['failures'] < self.max_failures]
             if not available:
                 logging.error("All proxies have reached failure limit.")
                 raise RuntimeError("All proxies have reached failure limit.")
-            fastest = min(available, key=lambda x: x['speed'])
-            return fastest
+            # Return proxy with lowest failures (simple heuristic)
+            available.sort(key=lambda x: x['failures'])
+            return available[0]
 
     def mark_failure(self, proxy_info):
         with self.lock:
@@ -180,6 +182,7 @@ class ProxyManager:
                         self.proxies.remove(p)
                         self.blacklisted.add(p['proxy'])
                     break
+
 
 def make_request(url, params=None, proxy_manager=None, max_attempts=5):
     last_exc = None
