@@ -93,7 +93,7 @@ class ProxyManager:
                     existing_proxies = {p['proxy'] for p in good_existing}
                     for proxy, speed in new_proxies:
                         if proxy not in existing_proxies and proxy not in self.blacklisted:
-                        good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
+                            good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
                     self.proxies = sorted(good_existing, key=lambda x: (x['failures'], x['speed']))
                     self.last_refresh = time.time()
                     logging.info(f"Proxy pool refreshed: {len(self.proxies)} proxies available.")
