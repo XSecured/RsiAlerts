@@ -33,7 +33,7 @@ PROXY_SOURCES = [
 ]
 
 TIMEFRAMES_TOGGLE = {
-    '3m': True,
+    '3m': False,
     '5m': True,
     '15m': True,
     '30m': True,
