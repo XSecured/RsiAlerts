@@ -354,29 +354,42 @@ def scan_for_bb_touches(proxy_manager):
 def format_results_by_timeframe(results):
     if not results:
         return ["*No BB touches detected at this time.*"]
+
+    # Define a custom sorting key for timeframes
+    timeframe_order = {'1w': 7, '1d': 6, '4h': 5, '2h': 4, '1h': 3, '30m': 2, '15m': 1, '5m': 0, '3m': -1}
+
     grouped = {}
     for r in results:
         grouped.setdefault(r['timeframe'], []).append(r)
+
+    # Sort the timeframes based on the custom order
+    sorted_timeframes = sorted(grouped.keys(), key=lambda tf: timeframe_order.get(tf, -2), reverse=True)
+
     messages = []
-    for timeframe, items in sorted(grouped.items()):
+    for timeframe, items in [(tf, grouped[tf]) for tf in sorted_timeframes]:
         header = f"*🔍 BB Touches on {timeframe} Timeframe ({len(items)} symbols)*\n"
         upper_touches = [i for i in items if i['touch_type'] == 'UPPER']
         lower_touches = [i for i in items if i['touch_type'] == 'LOWER']
         lines = []
+
         if upper_touches:
             lines.append("*⬆️ UPPER BB Touches:*")
             for item in sorted(upper_touches, key=lambda x: x['symbol']):
                 lines.append(f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}")
+
         if lower_touches:
             if upper_touches:
                 lines.append("")
             lines.append("*⬇️ LOWER BB Touches:*")
             for item in sorted(lower_touches, key=lambda x: x['symbol']):
                 lines.append(f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}")
+
         messages.append(header + "\n" + "\n".join(lines))
+
     timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     messages = [m + f"\n\n_Report generated at {timestamp}_" for m in messages]
     return messages
+
 
 def split_message(text, max_length=4000):
     lines = text.split('\n')
