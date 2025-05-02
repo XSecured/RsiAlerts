@@ -274,6 +274,19 @@ def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
         logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
         return None, None
 
+def get_daily_change_percent(symbol, proxy_manager):
+    # Fetch last 2 daily candles (to calculate % change from previous day)
+    closes, timestamps = fetch_klines(symbol, '1d', proxy_manager, limit=2)
+    if closes is None or len(closes) < 2:
+        return None
+    # Calculate percentage change between previous close and last close
+    prev_close = closes[-2]
+    last_close = closes[-1]
+    if prev_close == 0:
+        return None
+    change_percent = ((last_close - prev_close) / prev_close) * 100
+    return change_percent
+
 def calculate_rsi_bb(closes):
     closes_np = np.array(closes)
     rsi = talib.RSI(closes_np, timeperiod=RSI_PERIOD)
@@ -288,6 +301,12 @@ def calculate_rsi_bb(closes):
 
 def scan_symbol(symbol, timeframes, proxy_manager):
     results = []
+
+    # Get daily change percent once per symbol
+    daily_change = get_daily_change_percent(symbol, proxy_manager)
+    if daily_change is None:
+        logging.warning(f"Could not get daily change for {symbol}")
+
     for timeframe in timeframes:
         closes, timestamps = fetch_klines(symbol, timeframe, proxy_manager)
         if closes is None or len(closes) < CANDLE_LIMIT:
@@ -309,6 +328,9 @@ def scan_symbol(symbol, timeframes, proxy_manager):
         if upper_touch or lower_touch:
             touch_type = "UPPER" if upper_touch else "LOWER"
             timestamp = datetime.utcfromtimestamp(timestamps[idx] / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
+            hot = False
+            if daily_change is not None and daily_change > 5:
+                hot = True
             results.append({
                 'symbol': symbol,
                 'timeframe': timeframe,
@@ -316,10 +338,13 @@ def scan_symbol(symbol, timeframes, proxy_manager):
                 'bb_upper': bb_upper_val,
                 'bb_lower': bb_lower_val,
                 'touch_type': touch_type,
-                'timestamp': timestamp
+                'timestamp': timestamp,
+                'hot': hot,
+                'daily_change': daily_change
             })
-            logging.info(f"Alert: {symbol} on {timeframe} timeframe touching {touch_type} BB line at {timestamp}")
+            logging.info(f"Alert: {symbol} on {timeframe} timeframe touching {touch_type} BB line at {timestamp} {'🔥' if hot else ''}")
     return results
+
 
 def scan_for_bb_touches(proxy_manager):
     symbols = get_perpetual_usdt_symbols(proxy_manager)
@@ -355,14 +380,12 @@ def format_results_by_timeframe(results):
     if not results:
         return ["*No BB touches detected at this time.*"]
 
-    # Define a custom sorting key for timeframes
     timeframe_order = {'1w': 7, '1d': 6, '4h': 5, '2h': 4, '1h': 3, '30m': 2, '15m': 1, '5m': 0, '3m': -1}
 
     grouped = {}
     for r in results:
         grouped.setdefault(r['timeframe'], []).append(r)
 
-    # Sort the timeframes based on the custom order
     sorted_timeframes = sorted(grouped.keys(), key=lambda tf: timeframe_order.get(tf, -2), reverse=True)
 
     messages = []
@@ -372,17 +395,21 @@ def format_results_by_timeframe(results):
         lower_touches = [i for i in items if i['touch_type'] == 'LOWER']
         lines = []
 
+        def format_line(item):
+            hot_emoji = " 🔥" if item.get('hot') else ""
+            return f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}{hot_emoji}"
+
         if upper_touches:
             lines.append("*⬆️ UPPER BB Touches:*")
             for item in sorted(upper_touches, key=lambda x: x['symbol']):
-                lines.append(f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}")
+                lines.append(format_line(item))
 
         if lower_touches:
             if upper_touches:
                 lines.append("")
             lines.append("*⬇️ LOWER BB Touches:*")
             for item in sorted(lower_touches, key=lambda x: x['symbol']):
-                lines.append(f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}")
+                lines.append(format_line(item))
 
         messages.append(header + "\n" + "\n".join(lines))
 
