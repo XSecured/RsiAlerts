@@ -308,17 +308,24 @@ def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
         return None, None
 
 def get_daily_change_percent(symbol, proxy_manager):
-    # Fetch last 2 daily candles (to calculate % change from previous day)
-    closes, timestamps = fetch_klines(symbol, '1d', proxy_manager, limit=2)
-    if closes is None or len(closes) < 2:
+    """
+    Fetch the single, current daily kline via proxies, and compute
+    (current_price - daily_open) / daily_open * 100.
+    """
+    params = {'symbol': symbol, 'interval': '1d', 'limit': 1}
+    try:
+        data = make_request(BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
+        if not data or len(data) < 1:
+            return None
+        k = data[-1]
+        daily_open    = float(k[1])
+        current_price = float(k[4])
+        if daily_open == 0:
+            return None
+        return (current_price - daily_open) / daily_open * 100
+    except Exception as e:
+        logging.warning(f"Could not fetch daily change for {symbol}: {e}")
         return None
-    # Calculate percentage change between previous close and last close
-    prev_close = closes[-2]
-    last_close = closes[-1]
-    if prev_close == 0:
-        return None
-    change_percent = ((last_close - prev_close) / prev_close) * 100
-    return change_percent
 
 def calculate_rsi_bb(closes):
     closes_np = np.array(closes)
