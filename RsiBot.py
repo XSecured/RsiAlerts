@@ -9,6 +9,7 @@ import threading
 import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 
 # Configure logging with more detail, keep SSL warnings visible but avoid disabling verify in requests calls
 logging.basicConfig(
@@ -16,6 +17,9 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler()]
 )
+
+CACHE_DIR = "bb_touch_cache"  # Directory to store cache files
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Constants
 BINANCE_FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -43,6 +47,35 @@ TIMEFRAMES_TOGGLE = {
     '1d': True,
     '1w': True,
 }
+
+def get_cache_file_name(timeframe):
+    return os.path.join(CACHE_DIR, f"bb_touch_cache_{timeframe}.json")
+
+def load_cache(timeframe):
+    cache_file = get_cache_file_name(timeframe)
+    if not os.path.exists(cache_file):
+        return None
+    try:
+        with open(cache_file, 'r') as f:
+            data = json.load(f)
+        cache_date = data.get('date')
+        if cache_date == datetime.utcnow().strftime('%Y-%m-%d'):
+            return data.get('results')
+    except Exception as e:
+        logging.warning(f"Failed to load {timeframe} cache: {e}")
+    return None
+
+def save_cache(timeframe, results):
+    cache_file = get_cache_file_name(timeframe)
+    data = {
+        'date': datetime.utcnow().strftime('%Y-%m-%d'),
+        'results': results
+    }
+    try:
+        with open(cache_file, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        logging.warning(f"Failed to save {timeframe} cache: {e}")
 
 def get_active_timeframes():
     return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
@@ -351,29 +384,57 @@ def scan_for_bb_touches(proxy_manager):
     results = []
     total_symbols = len(symbols)
     completed = 0
-    batch_size = 30  # Increased batch size for faster scanning
+    batch_size = 30
     active_timeframes = get_active_timeframes()
-    logging.info(f"Active timeframes: {active_timeframes}")
-    for i in range(0, total_symbols, batch_size):
-        batch = symbols[i:i+batch_size]
-        batch_results = []
-        logging.info(f"Processing batch {i//batch_size + 1}/{(total_symbols + batch_size - 1)//batch_size}")
-        with ThreadPoolExecutor(max_workers=20) as executor:  # Increased workers for faster symbol scanning
-            futures = {executor.submit(scan_symbol, symbol, active_timeframes, proxy_manager): symbol for symbol in batch}
-            for future in as_completed(futures):
-                symbol = futures[future]
-                try:
-                    symbol_results = future.result()
-                    batch_results.extend(symbol_results)
-                except Exception as e:
-                    logging.error(f"Error scanning {symbol}: {e}")
-                completed += 1
-                if completed % 10 == 0 or completed == total_symbols:
-                    logging.info(f"Completed {completed}/{total_symbols} symbols")
-        results.extend(batch_results)
-        if i + batch_size < total_symbols:
-            time.sleep(1)
-    logging.info(f"Scan completed for all {total_symbols} symbols")
+
+    # Define which timeframes to cache
+    cached_timeframes = ['1w', '1d', '4h']
+    uncached_timeframes = [tf for tf in active_timeframes if tf not in cached_timeframes]
+
+    # Load cached results
+    cached_results = {}
+    for timeframe in cached_timeframes:
+        if timeframe in active_timeframes:
+            cached_results[timeframe] = load_cache(timeframe)
+            if cached_results[timeframe] is not None:
+                logging.info(f"Loaded {timeframe} timeframe results from cache")
+            else:
+                logging.info(f"{timeframe} timeframe cache not found or outdated, scanning...")
+
+    # Scan cached timeframes only if cache is not available
+    for timeframe in cached_timeframes:
+        if timeframe in active_timeframes and cached_results.get(timeframe) is None:
+            timeframe_results = []
+            for i in range(0, total_symbols, batch_size):
+                batch = symbols[i:i+batch_size]
+                with ThreadPoolExecutor(max_workers=20) as executor:
+                    futures = {executor.submit(scan_symbol, symbol, [timeframe], proxy_manager): symbol for symbol in batch}
+                    for future in as_completed(futures):
+                        try:
+                            timeframe_results.extend(future.result())
+                        except Exception as e:
+                            logging.error(f"Error scanning {timeframe} timeframe: {e}")
+            save_cache(timeframe, timeframe_results)
+            cached_results[timeframe] = timeframe_results
+
+    # Scan uncached timeframes
+    uncached_results = []
+    if uncached_timeframes:
+        for i in range(0, total_symbols, batch_size):
+            batch = symbols[i:i+batch_size]
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                futures = {executor.submit(scan_symbol, symbol, uncached_timeframes, proxy_manager): symbol for symbol in batch}
+                for future in as_completed(futures):
+                    try:
+                        uncached_results.extend(future.result())
+                    except Exception as e:
+                        logging.error(f"Error scanning uncached timeframes: {e}")
+
+    # Combine results
+    for timeframe in cached_timeframes:
+        if timeframe in cached_results:
+            results.extend(cached_results[timeframe])
+    results.extend(uncached_results)
     return results
 
 def format_results_by_timeframe(results):
