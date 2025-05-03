@@ -10,6 +10,7 @@ import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import itertools
 
 # Configure logging with more detail, keep SSL warnings visible but avoid disabling verify in requests calls
 logging.basicConfig(
@@ -107,6 +108,7 @@ def test_proxy(proxy: str) -> bool:
             logging.debug("Proxy %s failed: %s", proxy, e)
         return False
 
+
 class ProxyManager:
     def __init__(self, proxy_sources, min_working_proxies=20):
         self.proxy_sources = proxy_sources
@@ -115,7 +117,7 @@ class ProxyManager:
         self.blacklisted = set()
         self.lock = threading.Lock()
         self.refresh_in_progress = False
-        self.selected_proxy = None
+        self.proxy_cycle = None
         self._initialize_proxies()
 
     def _initialize_proxies(self):
@@ -139,6 +141,7 @@ class ProxyManager:
                     if proxy not in new_proxy_addrs:
                         good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
                 self.proxies = sorted(good_existing, key=lambda x: (x['failures'], x['speed']))
+                self.proxy_cycle = None  # Reset cycle to refresh proxies
                 logging.info(f"Proxy pool refreshed. Now have {len(self.proxies)} working proxies")
         except Exception as e:
             logging.error(f"Error refreshing proxies: {str(e)}")
@@ -166,7 +169,7 @@ class ProxyManager:
         logging.info(f"Testing {len(test_proxies)} proxies against Binance...")
         working = []
 
-        with ThreadPoolExecutor(max_workers=30) as executor:  # Increased workers for faster proxy testing
+        with ThreadPoolExecutor(max_workers=30) as executor:
             futures = {executor.submit(self._test_proxy, proxy): proxy for proxy in test_proxies}
             for future in as_completed(futures):
                 result = future.result()
@@ -197,13 +200,12 @@ class ProxyManager:
         if proxy in self.blacklisted:
             return None, None
 
-        # Ensure proxy string includes scheme, add http:// if missing
         proxy_url = proxy if proxy.startswith("http://") or proxy.startswith("https://") else f"http://{proxy}"
         proxies = {"http": proxy_url, "https": proxy_url}
 
         try:
             start = time.time()
-            response = requests.get(PROXY_TEST_URL, proxies=proxies, timeout=15, verify=True)
+            response = requests.get("https://api.binance.com/api/v3/time", proxies=proxies, timeout=15, verify=True)
             if response.status_code != 200:
                 self.blacklisted.add(proxy)
                 return None, None
@@ -213,31 +215,37 @@ class ProxyManager:
             self.blacklisted.add(proxy)
             return None, None
 
+    def _update_proxy_cycle(self):
+        with self.lock:
+            good_proxies = [p for p in self.proxies if p['failures'] < 3]
+            if not good_proxies:
+                raise RuntimeError("No working proxies available.")
+            random.shuffle(good_proxies)
+            self.proxy_cycle = itertools.cycle(good_proxies)
+            logging.info(f"Proxy cycle updated with {len(good_proxies)} proxies")
+
     def get_proxy(self):
         with self.lock:
-            if self.selected_proxy:
-                logging.debug(f"Using selected proxy: {self.selected_proxy['proxy']}")
-                return self.selected_proxy
-
-            if not self.proxies:
-                # Do NOT ignore symbols if no proxies found, raise error to stop bot as requested
-                raise RuntimeError("No working proxies available. Cannot proceed.")
-
-            self.proxies.sort(key=lambda x: (x['failures'], x['speed']))
-            return self.proxies[0]
+            if self.proxy_cycle is None:
+                self._update_proxy_cycle()
+            try:
+                proxy_info = next(self.proxy_cycle)
+                return proxy_info
+            except StopIteration:
+                self._update_proxy_cycle()
+                return next(self.proxy_cycle)
 
     def mark_success(self, proxy_info):
         with self.lock:
-            if not self.selected_proxy:
-                self.selected_proxy = proxy_info
-                logging.info(f"Selected proxy for entire run: {proxy_info['proxy']}")
+            for p in self.proxies:
+                if p['proxy'] == proxy_info['proxy']:
+                    if p['failures'] > 0:
+                        p['failures'] = 0
+                        logging.info(f"Proxy {p['proxy']} marked success, failures reset")
+                    break
 
     def mark_failure(self, proxy_info):
         with self.lock:
-            if self.selected_proxy and proxy_info['proxy'] == self.selected_proxy['proxy']:
-                logging.warning(f"Selected proxy {proxy_info['proxy']} failed, clearing selection")
-                self.selected_proxy = None
-
             for p in self.proxies:
                 if p['proxy'] == proxy_info['proxy']:
                     p['failures'] += 1
@@ -246,35 +254,36 @@ class ProxyManager:
                         logging.warning(f"Removing failed proxy {p['proxy']}")
                         self.proxies.remove(p)
                         self.blacklisted.add(p['proxy'])
+                        self.proxy_cycle = None  # reset cycle to refresh proxies
                         if len(self.proxies) < self.min_working_proxies and not self.refresh_in_progress:
                             threading.Thread(target=self._refresh_proxies, daemon=True).start()
                     break
 
-def make_request(url, params=None, proxy_manager=None, max_attempts=7):
+
+def make_request(url, params=None, proxy_manager=None, max_attempts=4):
     for attempt in range(max_attempts):
         try:
             proxy_info = proxy_manager.get_proxy()
         except RuntimeError as e:
-            # No proxies available: refresh proxy pool and retry after delay
             logging.warning("No working proxies available, refreshing proxy pool and retrying...")
             if not proxy_manager.refresh_in_progress:
                 threading.Thread(target=proxy_manager._refresh_proxies, daemon=True).start()
-            time.sleep(5)  # wait for proxies to refresh
-            continue  # retry getting proxy
+            time.sleep(5)
+            continue
 
         proxy_str = proxy_info['proxy']
         proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
         proxies = {"http": proxy_url, "https": proxy_url}
 
         endpoint = url.split('/')[-1] if '/' in url else url
-        logging.info(f"Request to {endpoint}: using proxy {proxy_str} (attempt {attempt+1}/{max_attempts})")
+        logging.debug(f"Request to {endpoint}: using proxy {proxy_str} (attempt {attempt+1}/{max_attempts})")
 
         try:
             timeout = min(15, max(5, proxy_info['speed'] * 2))
             resp = requests.get(url, params=params, proxies=proxies, timeout=timeout, verify=True)
             resp.raise_for_status()
             proxy_manager.mark_success(proxy_info)
-            logging.info(f"Request successful: {endpoint}")
+            logging.debug(f"Request successful: {endpoint}")
             return resp.json()
         except Exception as e:
             logging.error(f"Request failed: {str(e)}")
