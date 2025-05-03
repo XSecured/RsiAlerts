@@ -416,27 +416,24 @@ def scan_for_bb_touches(proxy_manager):
     symbols = get_perpetual_usdt_symbols(proxy_manager)
     results = []
     total_symbols = len(symbols)
-    completed = 0
     batch_size = 30
     active_timeframes = get_active_timeframes()
 
-    # Define which timeframes to cache
     cached_timeframes = ['1w', '1d', '4h']
     uncached_timeframes = [tf for tf in active_timeframes if tf not in cached_timeframes]
 
-    # Load cached results
     cached_results = {}
     for timeframe in cached_timeframes:
         if timeframe in active_timeframes:
             cached_results[timeframe] = load_cache(timeframe)
             if cached_results[timeframe] is not None:
-                logging.info(f"Loaded {timeframe} timeframe results from cache")
+                logging.info(f"[CACHE] Loaded {timeframe} timeframe results from cache")
             else:
-                logging.info(f"{timeframe} timeframe cache not found or outdated, scanning...")
+                logging.info(f"[CACHE] No valid cache found for {timeframe}, will scan fresh")
 
-    # Scan cached timeframes only if cache is not available
     for timeframe in cached_timeframes:
         if timeframe in active_timeframes and cached_results.get(timeframe) is None:
+            logging.info(f"[SCAN] Scanning {timeframe} timeframe fresh data...")
             timeframe_results = []
             for i in range(0, total_symbols, batch_size):
                 batch = symbols[i:i+batch_size]
@@ -449,10 +446,11 @@ def scan_for_bb_touches(proxy_manager):
                             logging.error(f"Error scanning {timeframe} timeframe: {e}")
             save_cache(timeframe, timeframe_results)
             cached_results[timeframe] = timeframe_results
+            logging.info(f"[CACHE] Saved fresh scan results for {timeframe}")
 
-    # Scan uncached timeframes
     uncached_results = []
     if uncached_timeframes:
+        logging.info(f"[SCAN] Scanning uncached timeframes: {uncached_timeframes}")
         for i in range(0, total_symbols, batch_size):
             batch = symbols[i:i+batch_size]
             with ThreadPoolExecutor(max_workers=20) as executor:
@@ -463,14 +461,16 @@ def scan_for_bb_touches(proxy_manager):
                     except Exception as e:
                         logging.error(f"Error scanning uncached timeframes: {e}")
 
-    # Combine results
+    results = []
     for timeframe in cached_timeframes:
         if timeframe in cached_results:
             results.extend(cached_results[timeframe])
     results.extend(uncached_results)
+
+    logging.info(f"[RESULTS] Total BB touches found: {len(results)}")
     return results
 
-def format_results_by_timeframe(results):
+def format_results_by_timeframe(results, cached_timeframes_used=None):
     if not results:
         return ["*No BB touches detected at this time.*"]
 
@@ -484,7 +484,11 @@ def format_results_by_timeframe(results):
 
     messages = []
     for timeframe, items in [(tf, grouped[tf]) for tf in sorted_timeframes]:
-        header = f"*🔍 BB Touches on {timeframe} Timeframe ({len(items)} symbols)*\n"
+        header = f"*🔍 BB Touches on {timeframe} Timeframe ({len(items)} symbols)*"
+        if cached_timeframes_used and timeframe in cached_timeframes_used:
+            header += " _(from cache)_"
+        header += "\n"
+
         upper_touches = [i for i in items if i['touch_type'] == 'UPPER']
         lower_touches = [i for i in items if i['touch_type'] == 'LOWER']
         lines = []
@@ -567,7 +571,9 @@ def main():
         logging.info("Starting scan process...")
         results = scan_for_bb_touches(proxy_manager)
         logging.info(f"Scan complete, formatting {len(results)} results...")
-        messages = format_results_by_timeframe(results)
+        cached_timeframes_used = [tf for tf in ['1w', '1d', '4h'] if tf in get_active_timeframes() and load_cache(tf) is not None]
+        messages = format_results_by_timeframe(results, cached_timeframes_used=cached_timeframes_used)
+
 
         for i, msg in enumerate(messages, 1):
             logging.info(f"Sending message {i}/{len(messages)}")
