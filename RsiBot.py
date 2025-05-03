@@ -164,7 +164,7 @@ class ProxyManager:
 
         test_proxies = list(all_proxies)
         random.shuffle(test_proxies)
-        test_proxies = test_proxies[:50]
+        test_proxies = test_proxies[:200]
 
         logging.info(f"Testing {len(test_proxies)} proxies against Binance...")
         working = []
@@ -205,7 +205,7 @@ class ProxyManager:
 
         try:
             start = time.time()
-            response = requests.get("https://api.binance.com/api/v3/time", proxies=proxies, timeout=5, verify=True)
+            response = requests.get("https://api.binance.com/api/v3/time", proxies=proxies, timeout=(3, 5), verify=True)
             if response.status_code != 200:
                 self.blacklisted.add(proxy)
                 return None, None
@@ -279,8 +279,9 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=4):
         logging.debug(f"Request to {endpoint}: using proxy {proxy_str} (attempt {attempt+1}/{max_attempts})")
 
         try:
-            timeout = min(15, max(5, proxy_info['speed'] * 2))
-            resp = requests.get(url, params=params, proxies=proxies, timeout=timeout, verify=True)
+            connect_timeout = 5
+            read_timeout = max(10, int(proxy_info['speed'] * 2))
+            resp = requests.get(url, params=params, proxies=proxies, timeout=(connect_timeout, read_timeout), verify=True)
             resp.raise_for_status()
             proxy_manager.mark_success(proxy_info)
             logging.debug(f"Request successful: {endpoint}")
