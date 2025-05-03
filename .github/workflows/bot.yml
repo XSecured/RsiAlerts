@@ -38,5 +38,5 @@ jobs:
 
       - name: Run bot
         shell: bash -l {0}
-        run: python -u RsiBot.py
+        run: python RsiBot.py
 
