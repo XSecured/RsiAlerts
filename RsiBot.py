@@ -11,10 +11,11 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import itertools
+from requests.exceptions import ConnectTimeout, ReadTimeout, ProxyError, SSLError
 
 # Configure logging with more detail, keep SSL warnings visible but avoid disabling verify in requests calls
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler()]
 )
@@ -259,7 +260,6 @@ class ProxyManager:
                             threading.Thread(target=self._refresh_proxies, daemon=True).start()
                     break
 
-
 def make_request(url, params=None, proxy_manager=None, max_attempts=4):
     for attempt in range(max_attempts):
         try:
@@ -286,14 +286,24 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=4):
             proxy_manager.mark_success(proxy_info)
             logging.debug(f"Request successful: {endpoint}")
             return resp.json()
-        except Exception as e:
-            logging.error(f"Request failed: {str(e)}")
+        except (ConnectTimeout, ReadTimeout) as e:
+            logging.warning(f"Timeout error on proxy {proxy_str}: {e}")
             proxy_manager.mark_failure(proxy_info)
-            if attempt == max_attempts - 1:
-                raise RuntimeError(f"Request failed after {max_attempts} attempts")
-            wait_time = 2 * (attempt + 1)
-            logging.info(f"Retrying in {wait_time} seconds...")
-            time.sleep(wait_time)
+        except ProxyError as e:
+            logging.warning(f"Proxy error on proxy {proxy_str}: {e}")
+            proxy_manager.mark_failure(proxy_info)
+        except SSLError as e:
+            logging.warning(f"SSL error on proxy {proxy_str}: {e}")
+            proxy_manager.mark_failure(proxy_info)
+        except Exception as e:
+            logging.error(f"Request failed on proxy {proxy_str}: {e}")
+            proxy_manager.mark_failure(proxy_info)
+
+        if attempt == max_attempts - 1:
+            raise RuntimeError(f"Request failed after {max_attempts} attempts")
+        wait_time = 2 * (attempt + 1)
+        logging.info(f"Retrying in {wait_time} seconds...")
+        time.sleep(wait_time)
 
 def get_perpetual_usdt_symbols(proxy_manager, max_attempts=5, per_attempt_timeout=10):
     """
