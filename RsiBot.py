@@ -48,6 +48,19 @@ TIMEFRAMES_TOGGLE = {
     '1w': True,
 }
 
+# Which timeframes should include/display the middle BB line?
+MIDDLE_BAND_TOGGLE = {
+    '3m': False,
+    '5m': False,
+    '15m': False,
+    '30m': False,
+    '1h': False,
+    '2h': False,
+    '4h': True, 
+    '1d': True,  
+    '1w': True,  
+}
+
 def get_cache_file_name(timeframe):
     return os.path.join(CACHE_DIR, f"bb_touch_cache_{timeframe}.json")
 
@@ -356,22 +369,26 @@ def scan_symbol(symbol, timeframes, proxy_manager):
         if idx < -len(closes):
             logging.warning(f"Not enough candles for {symbol} {timeframe} to skip open candle. Skipping.")
             continue
+
         rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
         if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]):
             logging.warning(f"NaN values for {symbol} {timeframe}, skipping.")
             continue
+
         rsi_val = rsi[idx]
         bb_upper_val = bb_upper[idx]
         bb_lower_val = bb_lower[idx]
         upper_touch = rsi_val >= bb_upper_val * (1 - UPPER_TOUCH_THRESHOLD)
         lower_touch = rsi_val <= bb_lower_val * (1 + LOWER_TOUCH_THRESHOLD)
+
         if upper_touch or lower_touch:
             touch_type = "UPPER" if upper_touch else "LOWER"
             timestamp = datetime.utcfromtimestamp(timestamps[idx] / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
             hot = False
             if daily_change is not None and daily_change > 5:
                 hot = True
-            results.append({
+
+            item = {
                 'symbol': symbol,
                 'timeframe': timeframe,
                 'rsi': rsi_val,
@@ -381,10 +398,19 @@ def scan_symbol(symbol, timeframes, proxy_manager):
                 'timestamp': timestamp,
                 'hot': hot,
                 'daily_change': daily_change
-            })
-            logging.info(f"Alert: {symbol} on {timeframe} timeframe touching {touch_type} BB line at {timestamp} {'🔥' if hot else ''}")
-    return results
+            }
 
+            # Include middle band only if toggled on for this timeframe
+            if MIDDLE_BAND_TOGGLE.get(timeframe, False):
+                bb_middle_val = bb_middle[idx]
+                if not np.isnan(bb_middle_val):
+                    item['bb_middle'] = bb_middle_val
+
+            results.append(item)
+
+            logging.info(f"Alert: {symbol} on {timeframe} timeframe touching {touch_type} BB line at {timestamp} {'🔥' if hot else ''}")
+
+    return results
 
 def scan_for_bb_touches(proxy_manager):
     symbols = get_perpetual_usdt_symbols(proxy_manager)
@@ -464,8 +490,12 @@ def format_results_by_timeframe(results):
         lines = []
 
         def format_line(item):
-            hot_emoji = " 🔥" if item.get('hot') else ""
-            return f"• *{item['symbol']}* - RSI: {item['rsi']:.2f}{hot_emoji}"
+            parts = [f"*{item['symbol']}*", f"RSI: {item['rsi']:.2f}"]
+            if 'bb_middle' in item:
+                parts.append(f"MB: {item['bb_middle']:.2f}")
+            if item.get('hot'):
+                parts.append("🔥")
+            return "• " + " | ".join(parts)
 
         if upper_touches:
             lines.append("*⬆️ UPPER BB Touches:*")
@@ -484,7 +514,6 @@ def format_results_by_timeframe(results):
     timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     messages = [m + f"\n\n_Report generated at {timestamp}_" for m in messages]
     return messages
-
 
 def split_message(text, max_length=4000):
     lines = text.split('\n')
