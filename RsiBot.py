@@ -243,12 +243,12 @@ class ProxyManager:
                     logging.error("No working proxies available in _update_proxy_cycle()!")
                     raise RuntimeError("No working proxies available.")
 
-            random.shuffle(good_proxies)
-            logging.debug("Shuffled good proxies")
+                random.shuffle(good_proxies)
+                logging.debug("Shuffled good proxies")
 
-            with self.lock:
-                self.proxy_cycle = itertools.cycle(good_proxies)
-                logging.info(f"Proxy cycle updated with {len(good_proxies)} proxies")
+                #with self.lock:
+                    self.proxy_cycle = itertools.cycle(good_proxies)
+                    logging.info(f"Proxy cycle updated with {len(good_proxies)} proxies")
 
         except Exception as e:
             logging.error(f"Exception in _update_proxy_cycle: {e}")
