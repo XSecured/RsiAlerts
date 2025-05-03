@@ -217,12 +217,15 @@ class ProxyManager:
 
     def _update_proxy_cycle(self):
         with self.lock:
+            logging.debug("Updating proxy cycle...")
             good_proxies = [p for p in self.proxies if p['failures'] < 3]
             if not good_proxies:
+                logging.error("No working proxies available in _update_proxy_cycle()!")
                 raise RuntimeError("No working proxies available.")
             random.shuffle(good_proxies)
             self.proxy_cycle = itertools.cycle(good_proxies)
             logging.info(f"Proxy cycle updated with {len(good_proxies)} proxies")
+
 
     def get_proxy(self):
         with self.lock:
