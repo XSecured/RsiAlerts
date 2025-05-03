@@ -14,7 +14,7 @@ import itertools
 
 # Configure logging with more detail, keep SSL warnings visible but avoid disabling verify in requests calls
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOGGING.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler()]
 )
@@ -226,12 +226,16 @@ class ProxyManager:
 
     def get_proxy(self):
         with self.lock:
+            logging.debug("Acquired lock in get_proxy")
             if self.proxy_cycle is None:
+                logging.debug("Proxy cycle is None, updating proxy cycle")
                 self._update_proxy_cycle()
             try:
                 proxy_info = next(self.proxy_cycle)
+                logging.debug(f"Returning proxy {proxy_info['proxy']}")
                 return proxy_info
             except StopIteration:
+                logging.debug("Proxy cycle exhausted, updating proxy cycle")
                 self._update_proxy_cycle()
                 return next(self.proxy_cycle)
 
@@ -281,7 +285,10 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=4):
         try:
             connect_timeout = 5
             read_timeout = max(10, int(proxy_info['speed'] * 2))
+            logging.debug(f"Starting requests.get for {endpoint} with proxy {proxy_str}")
             resp = requests.get(url, params=params, proxies=proxies, timeout=(connect_timeout, read_timeout), verify=True)
+            logging.debug(f"Finished requests.get for {endpoint} with proxy {proxy_str}")
+
             resp.raise_for_status()
             proxy_manager.mark_success(proxy_info)
             logging.debug(f"Request successful: {endpoint}")
