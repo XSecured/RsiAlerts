@@ -110,7 +110,7 @@ def test_proxy(proxy: str) -> bool:
 
 
 class ProxyManager:
-    def __init__(self, proxy_sources, min_working_proxies=20):
+    def __init__(self, proxy_sources, min_working_proxies=3):
         self.proxy_sources = proxy_sources
         self.min_working_proxies = min_working_proxies
         self.proxies = []  # [{'proxy': proxy_str, 'failures': 0, 'speed': response_time}]
@@ -164,7 +164,7 @@ class ProxyManager:
 
         test_proxies = list(all_proxies)
         random.shuffle(test_proxies)
-        test_proxies = test_proxies[:200]
+        test_proxies = test_proxies[:50]
 
         logging.info(f"Testing {len(test_proxies)} proxies against Binance...")
         working = []
@@ -205,7 +205,7 @@ class ProxyManager:
 
         try:
             start = time.time()
-            response = requests.get("https://api.binance.com/api/v3/time", proxies=proxies, timeout=15, verify=True)
+            response = requests.get("https://api.binance.com/api/v3/time", proxies=proxies, timeout=5, verify=True)
             if response.status_code != 200:
                 self.blacklisted.add(proxy)
                 return None, None
@@ -294,18 +294,17 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=4):
             logging.info(f"Retrying in {wait_time} seconds...")
             time.sleep(wait_time)
 
-
-def get_perpetual_usdt_symbols(proxy_manager):
-    logging.info("Starting to fetch symbols list...")
-    for attempt in range(5):
+def get_perpetual_usdt_symbols(proxy_manager, max_attempts=5):
+    logging.info("Starting to fetch USDT perpetual symbols list...")
+    for attempt in range(1, max_attempts + 1):
         try:
-            logging.info(f"Fetching symbols (attempt {attempt+1}/5)...")
+            logging.info(f"Fetching symbols (attempt {attempt}/{max_attempts})...")
             data = make_request(BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
             symbols = [
-                s['symbol'] for s in data['symbols']
-                if s['contractType'] == 'PERPETUAL' and
-                s['quoteAsset'] == 'USDT' and
-                s['status'] == 'TRADING'
+                s['symbol'] for s in data.get('symbols', [])
+                if s.get('contractType') == 'PERPETUAL' and
+                   s.get('quoteAsset') == 'USDT' and
+                   s.get('status') == 'TRADING'
             ]
             logging.info(f"Successfully fetched {len(symbols)} USDT perpetual symbols")
             if len(symbols) < 10:
@@ -316,7 +315,7 @@ def get_perpetual_usdt_symbols(proxy_manager):
         except Exception as e:
             logging.error(f"Failed to fetch symbols: {str(e)}")
             time.sleep(5)
-    raise RuntimeError("Failed to fetch symbols after multiple attempts")
+    raise RuntimeError("Failed to fetch USDT perpetual symbols after multiple attempts")
 
 def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
