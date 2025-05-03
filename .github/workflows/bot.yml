@@ -2,7 +2,7 @@ name: Run BB Touch Bot
 
 on:
   schedule:
-    - cron: '0 */1 * * *'  # Every 4 hours at 1 minute past the hour
+    - cron: '1 */1 * * *'
 
 jobs:
   run-bot:
@@ -12,6 +12,14 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
       - uses: actions/checkout@v3
+
+      - name: Cache bb_touch_cache folder
+        uses: actions/cache@v3
+        with:
+          path: bb_touch_cache
+          key: bb-touch-cache-${{ runner.os }}-${{ hashFiles('RsiBot.py') }}
+          restore-keys: |
+            bb-touch-cache-${{ runner.os }}-
 
       - name: Cache conda packages
         uses: actions/cache@v3
