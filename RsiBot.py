@@ -216,9 +216,10 @@ class ProxyManager:
             return None, None
 
     def _update_proxy_cycle(self):
+        print("Entering _update_proxy_cycle()")  # Basic print statement
         logging.debug("Starting _update_proxy_cycle()")
         try:
-            with self.lock:
+            #with self.lock:
                 logging.debug("Acquired lock in _update_proxy_cycle()")
                 logging.debug(f"Current proxies list length: {len(self.proxies)}")
                 # Log proxies keys to spot missing keys or bad data
