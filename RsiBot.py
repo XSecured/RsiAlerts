@@ -220,18 +220,31 @@ class ProxyManager:
         try:
             with self.lock:
                 logging.debug("Acquired lock in _update_proxy_cycle()")
-                good_proxies = [p for p in self.proxies if p['failures'] < 3]
+                logging.debug(f"Current proxies list length: {len(self.proxies)}")
+                # Log proxies keys to spot missing keys or bad data
+                for i, p in enumerate(self.proxies):
+                    if not isinstance(p, dict):
+                        logging.warning(f"Proxy at index {i} is not a dict: {p}")
+                    elif 'failures' not in p:
+                        logging.warning(f"Proxy at index {i} missing 'failures' key: {p}")
+
+                good_proxies = []
+                for p in self.proxies:
+                    try:
+                        if p['failures'] < 3:
+                            good_proxies.append(p)
+                    except Exception as e:
+                        logging.error(f"Error checking proxy failures for {p}: {e}")
+
                 logging.debug(f"Found {len(good_proxies)} good proxies")
 
                 if not good_proxies:
                     logging.error("No working proxies available in _update_proxy_cycle()!")
                     raise RuntimeError("No working proxies available.")
 
-                # Shuffle outside the lock to reduce lock time
             random.shuffle(good_proxies)
             logging.debug("Shuffled good proxies")
 
-            # Re-acquire lock to update proxy_cycle safely
             with self.lock:
                 self.proxy_cycle = itertools.cycle(good_proxies)
                 logging.info(f"Proxy cycle updated with {len(good_proxies)} proxies")
@@ -240,8 +253,7 @@ class ProxyManager:
             logging.error(f"Exception in _update_proxy_cycle: {e}")
             raise
 
-
-
+    
     def get_proxy(self):
         with self.lock:
             logging.debug("Acquired lock in get_proxy")
