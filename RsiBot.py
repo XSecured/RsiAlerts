@@ -391,9 +391,10 @@ def scan_symbol(symbol, timeframes, proxy_manager):
         lower_touch = rsi_val <= bb_lower_val * (1 + LOWER_TOUCH_THRESHOLD)
         middle_touch = False
 
-        if not upper_touch and not lower_touch:
-            if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
-                middle_touch = True
+        if MIDDLE_BAND_DETECTION.get(timeframe, False):
+            if not upper_touch and not lower_touch:
+                if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
+                    middle_touch = True
 
         if upper_touch or lower_touch or middle_touch:
             if upper_touch:
@@ -512,11 +513,10 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
 
         def format_line(item):
             parts = [f"*{item['symbol']}*", f"RSI: {item['rsi']:.2f}"]
-            if 'bb_middle' in item:
-                parts.append(f"MB: {item['bb_middle']:.2f}")
+            # We don't include MB in the line format as per original style
             if item.get('hot'):
                 parts.append("🔥")
-            return "• " + " | ".join(parts)
+            return "• " + " - ".join(parts)
 
         if upper_touches:
             lines.append("*⬆️ UPPER BB Touches:*")
@@ -542,6 +542,7 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
     timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     messages = [m + f"\n\n_Report generated at {timestamp}_" for m in messages]
     return messages
+
 
 def split_message(text, max_length=4000):
     lines = text.split('\n')
