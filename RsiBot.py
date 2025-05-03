@@ -14,7 +14,7 @@ import itertools
 
 # Configure logging with more detail, keep SSL warnings visible but avoid disabling verify in requests calls
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler()]
 )
@@ -28,6 +28,7 @@ BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 PROXY_TEST_URL = "https://api.binance.com/api/v3/time"  # Lightweight proxy test URL
 CANDLE_LIMIT = 55
 UPPER_TOUCH_THRESHOLD = 0.02  # 2%
+MIDDLE_TOUCH_THRESHOLD = 0.015  # 1.5%, between upper and lower thresholds
 LOWER_TOUCH_THRESHOLD = 0.02  # 2%
 RSI_PERIOD = 14
 BB_LENGTH = 34
@@ -57,9 +58,9 @@ MIDDLE_BAND_TOGGLE = {
     '30m': False,
     '1h': False,
     '2h': False,
-    '4h': True, 
-    '1d': True,  
-    '1w': True,  
+    '4h': True,
+    '1d': True,
+    '1w': True,
 }
 
 def get_cache_file_name(timeframe):
@@ -96,7 +97,6 @@ def get_active_timeframes():
     return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
 
 def test_proxy(proxy: str) -> bool:
-    # Use the lightweight Binance time endpoint for proxy testing, with SSL verify=True to avoid warnings
     try:
         proxies = {"http": proxy, "https": proxy}
         response = requests.get(PROXY_TEST_URL, proxies=proxies, timeout=10, verify=True)
@@ -108,14 +108,13 @@ def test_proxy(proxy: str) -> bool:
             logging.debug("Proxy %s failed: %s", proxy, e)
         return False
 
-
 class ProxyManager:
     def __init__(self, proxy_sources, min_working_proxies=3):
         self.proxy_sources = proxy_sources
         self.min_working_proxies = min_working_proxies
         self.proxies = []  # [{'proxy': proxy_str, 'failures': 0, 'speed': response_time}]
         self.blacklisted = set()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # Changed to RLock to avoid deadlock
         self.refresh_in_progress = False
         self.proxy_cycle = None
         self._initialize_proxies()
@@ -216,57 +215,22 @@ class ProxyManager:
             return None, None
 
     def _update_proxy_cycle(self):
-        print("Entering _update_proxy_cycle()")  # Basic print statement
-        logging.debug("Starting _update_proxy_cycle()")
-        try:
-            #with self.lock:
-                logging.debug("Acquired lock in _update_proxy_cycle()")
-                logging.debug(f"Current proxies list length: {len(self.proxies)}")
-                # Log proxies keys to spot missing keys or bad data
-                for i, p in enumerate(self.proxies):
-                    if not isinstance(p, dict):
-                        logging.warning(f"Proxy at index {i} is not a dict: {p}")
-                    elif 'failures' not in p:
-                        logging.warning(f"Proxy at index {i} missing 'failures' key: {p}")
+        with self.lock:
+            good_proxies = [p for p in self.proxies if p['failures'] < 3]
+            if not good_proxies:
+                raise RuntimeError("No working proxies available.")
+            random.shuffle(good_proxies)
+            self.proxy_cycle = itertools.cycle(good_proxies)
+            logging.info(f"Proxy cycle updated with {len(good_proxies)} proxies")
 
-                good_proxies = []
-                for p in self.proxies:
-                    try:
-                        if p['failures'] < 3:
-                            good_proxies.append(p)
-                    except Exception as e:
-                        logging.error(f"Error checking proxy failures for {p}: {e}")
-
-                logging.debug(f"Found {len(good_proxies)} good proxies")
-
-                if not good_proxies:
-                    logging.error("No working proxies available in _update_proxy_cycle()!")
-                    raise RuntimeError("No working proxies available.")
-
-                random.shuffle(good_proxies)
-                logging.debug("Shuffled good proxies")
-
-                #with self.lock:
-                self.proxy_cycle = itertools.cycle(good_proxies)
-                logging.info(f"Proxy cycle updated with {len(good_proxies)} proxies")
-
-        except Exception as e:
-            logging.error(f"Exception in _update_proxy_cycle: {e}")
-            raise
-
-    
     def get_proxy(self):
         with self.lock:
-            logging.debug("Acquired lock in get_proxy")
             if self.proxy_cycle is None:
-                logging.debug("Proxy cycle is None, updating proxy cycle")
                 self._update_proxy_cycle()
             try:
                 proxy_info = next(self.proxy_cycle)
-                logging.debug(f"Returning proxy {proxy_info['proxy']}")
                 return proxy_info
             except StopIteration:
-                logging.debug("Proxy cycle exhausted, updating proxy cycle")
                 self._update_proxy_cycle()
                 return next(self.proxy_cycle)
 
@@ -294,7 +258,6 @@ class ProxyManager:
                             threading.Thread(target=self._refresh_proxies, daemon=True).start()
                     break
 
-
 def make_request(url, params=None, proxy_manager=None, max_attempts=4):
     for attempt in range(max_attempts):
         try:
@@ -316,10 +279,7 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=4):
         try:
             connect_timeout = 5
             read_timeout = max(10, int(proxy_info['speed'] * 2))
-            logging.debug(f"Starting requests.get for {endpoint} with proxy {proxy_str}")
             resp = requests.get(url, params=params, proxies=proxies, timeout=(connect_timeout, read_timeout), verify=True)
-            logging.debug(f"Finished requests.get for {endpoint} with proxy {proxy_str}")
-
             resp.raise_for_status()
             proxy_manager.mark_success(proxy_info)
             logging.debug(f"Request successful: {endpoint}")
@@ -334,21 +294,15 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=4):
             time.sleep(wait_time)
 
 def get_perpetual_usdt_symbols(proxy_manager, max_attempts=5, per_attempt_timeout=10):
-    """
-    Fetch USDT perpetual symbols using proxies only.
-    Retries max_attempts times with delays.
-    Raises RuntimeError if unable to fetch.
-    """
     logging.info("Starting to fetch USDT perpetual symbols list via proxies only...")
 
     for attempt in range(1, max_attempts + 1):
         try:
             logging.info(f"Fetching symbols via proxy (attempt {attempt}/{max_attempts})...")
-            # Use make_request with proxy_manager and a short timeout per request
             data = make_request(
                 BINANCE_FUTURES_EXCHANGE_INFO,
                 proxy_manager=proxy_manager,
-                max_attempts=2  # retries inside make_request
+                max_attempts=2
             )
             symbols = [
                 s['symbol'] for s in data.get('symbols', [])
@@ -362,10 +316,9 @@ def get_perpetual_usdt_symbols(proxy_manager, max_attempts=5, per_attempt_timeou
             logging.warning(f"Too few symbols ({len(symbols)}) via proxy, retrying...")
         except Exception as e:
             logging.warning(f"Proxy attempt {attempt} failed: {e}")
-        time.sleep(3)  # backoff before retry
+        time.sleep(3)
 
     raise RuntimeError("Failed to fetch USDT perpetual symbols via proxies after multiple attempts")
-
 
 def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
@@ -380,17 +333,13 @@ def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
         return None, None
 
 def get_daily_change_percent(symbol, proxy_manager):
-    """
-    Fetch the single, current daily kline via proxies, and compute
-    (current_price - daily_open) / daily_open * 100.
-    """
     params = {'symbol': symbol, 'interval': '1d', 'limit': 1}
     try:
         data = make_request(BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
         if not data or len(data) < 1:
             return None
         k = data[-1]
-        daily_open    = float(k[1])
+        daily_open = float(k[1])
         current_price = float(k[4])
         if daily_open == 0:
             return None
@@ -414,7 +363,6 @@ def calculate_rsi_bb(closes):
 def scan_symbol(symbol, timeframes, proxy_manager):
     results = []
 
-    # Get daily change percent once per symbol
     daily_change = get_daily_change_percent(symbol, proxy_manager)
     if daily_change is None:
         logging.warning(f"Could not get daily change for {symbol}")
@@ -430,18 +378,31 @@ def scan_symbol(symbol, timeframes, proxy_manager):
             continue
 
         rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
-        if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]):
+        if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]) or np.isnan(bb_middle[idx]):
             logging.warning(f"NaN values for {symbol} {timeframe}, skipping.")
             continue
 
         rsi_val = rsi[idx]
         bb_upper_val = bb_upper[idx]
+        bb_middle_val = bb_middle[idx]
         bb_lower_val = bb_lower[idx]
+
         upper_touch = rsi_val >= bb_upper_val * (1 - UPPER_TOUCH_THRESHOLD)
         lower_touch = rsi_val <= bb_lower_val * (1 + LOWER_TOUCH_THRESHOLD)
+        middle_touch = False
 
-        if upper_touch or lower_touch:
-            touch_type = "UPPER" if upper_touch else "LOWER"
+        if not upper_touch and not lower_touch:
+            if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
+                middle_touch = True
+
+        if upper_touch or lower_touch or middle_touch:
+            if upper_touch:
+                touch_type = "UPPER"
+            elif lower_touch:
+                touch_type = "LOWER"
+            else:
+                touch_type = "MIDDLE"
+
             timestamp = datetime.utcfromtimestamp(timestamps[idx] / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
             hot = False
             if daily_change is not None and daily_change > 5:
@@ -452,18 +413,13 @@ def scan_symbol(symbol, timeframes, proxy_manager):
                 'timeframe': timeframe,
                 'rsi': rsi_val,
                 'bb_upper': bb_upper_val,
+                'bb_middle': bb_middle_val,
                 'bb_lower': bb_lower_val,
                 'touch_type': touch_type,
                 'timestamp': timestamp,
                 'hot': hot,
                 'daily_change': daily_change
             }
-
-            # Include middle band only if toggled on for this timeframe
-            if MIDDLE_BAND_TOGGLE.get(timeframe, False):
-                bb_middle_val = bb_middle[idx]
-                if not np.isnan(bb_middle_val):
-                    item['bb_middle'] = bb_middle_val
 
             results.append(item)
 
@@ -549,7 +505,9 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
         header += "\n"
 
         upper_touches = [i for i in items if i['touch_type'] == 'UPPER']
+        middle_touches = [i for i in items if i['touch_type'] == 'MIDDLE']
         lower_touches = [i for i in items if i['touch_type'] == 'LOWER']
+
         lines = []
 
         def format_line(item):
@@ -565,9 +523,16 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
             for item in sorted(upper_touches, key=lambda x: x['symbol']):
                 lines.append(format_line(item))
 
-        if lower_touches:
+        if middle_touches:
             if upper_touches:
-                lines.append("")
+                lines.append("")  # blank line separator
+            lines.append("*➖ MIDDLE BB Touches:*")
+            for item in sorted(middle_touches, key=lambda x: x['symbol']):
+                lines.append(format_line(item))
+
+        if lower_touches:
+            if upper_touches or middle_touches:
+                lines.append("")  # blank line separator
             lines.append("*⬇️ LOWER BB Touches:*")
             for item in sorted(lower_touches, key=lambda x: x['symbol']):
                 lines.append(format_line(item))
@@ -632,7 +597,6 @@ def main():
         logging.info(f"Scan complete, formatting {len(results)} results...")
         cached_timeframes_used = [tf for tf in ['1w', '1d', '4h'] if tf in get_active_timeframes() and load_cache(tf) is not None]
         messages = format_results_by_timeframe(results, cached_timeframes_used=cached_timeframes_used)
-
 
         for i, msg in enumerate(messages, 1):
             logging.info(f"Sending message {i}/{len(messages)}")
