@@ -87,6 +87,7 @@ def save_cache(timeframe, results):
     try:
         with open(cache_file, 'w') as f:
             json.dump(data, f)
+        logging.info(f"Cache saved successfully for {timeframe} at {cache_file}")
     except Exception as e:
         logging.warning(f"Failed to save {timeframe} cache: {e}")
 
