@@ -14,7 +14,7 @@ import itertools
 
 # Configure logging with more detail, keep SSL warnings visible but avoid disabling verify in requests calls
 logging.basicConfig(
-    level=LOGGING.DEBUG,
+    level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler()]
 )
