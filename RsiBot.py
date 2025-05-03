@@ -247,8 +247,8 @@ class ProxyManager:
                 logging.debug("Shuffled good proxies")
 
                 #with self.lock:
-                    self.proxy_cycle = itertools.cycle(good_proxies)
-                    logging.info(f"Proxy cycle updated with {len(good_proxies)} proxies")
+                self.proxy_cycle = itertools.cycle(good_proxies)
+                logging.info(f"Proxy cycle updated with {len(good_proxies)} proxies")
 
         except Exception as e:
             logging.error(f"Exception in _update_proxy_cycle: {e}")
