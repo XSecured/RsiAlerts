@@ -391,7 +391,7 @@ def scan_symbol(symbol, timeframes, proxy_manager):
         lower_touch = rsi_val <= bb_lower_val * (1 + LOWER_TOUCH_THRESHOLD)
         middle_touch = False
 
-        if MIDDLE_BAND_DETECTION.get(timeframe, False):
+        if MIDDLE_BAND_TOGGLE.get(timeframe, False):
             if not upper_touch and not lower_touch:
                 if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
                     middle_touch = True
