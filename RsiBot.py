@@ -294,28 +294,39 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=4):
             logging.info(f"Retrying in {wait_time} seconds...")
             time.sleep(wait_time)
 
-def get_perpetual_usdt_symbols(proxy_manager, max_attempts=5):
-    logging.info("Starting to fetch USDT perpetual symbols list...")
+def get_perpetual_usdt_symbols(proxy_manager, max_attempts=5, per_attempt_timeout=10):
+    """
+    Fetch USDT perpetual symbols using proxies only.
+    Retries max_attempts times with delays.
+    Raises RuntimeError if unable to fetch.
+    """
+    logging.info("Starting to fetch USDT perpetual symbols list via proxies only...")
+
     for attempt in range(1, max_attempts + 1):
         try:
-            logging.info(f"Fetching symbols (attempt {attempt}/{max_attempts})...")
-            data = make_request(BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
+            logging.info(f"Fetching symbols via proxy (attempt {attempt}/{max_attempts})...")
+            # Use make_request with proxy_manager and a short timeout per request
+            data = make_request(
+                BINANCE_FUTURES_EXCHANGE_INFO,
+                proxy_manager=proxy_manager,
+                max_attempts=2  # retries inside make_request
+            )
             symbols = [
                 s['symbol'] for s in data.get('symbols', [])
-                if s.get('contractType') == 'PERPETUAL' and
-                   s.get('quoteAsset') == 'USDT' and
-                   s.get('status') == 'TRADING'
+                if s.get('contractType') == 'PERPETUAL'
+                   and s.get('quoteAsset') == 'USDT'
+                   and s.get('status') == 'TRADING'
             ]
-            logging.info(f"Successfully fetched {len(symbols)} USDT perpetual symbols")
-            if len(symbols) < 10:
-                logging.warning(f"Too few symbols found ({len(symbols)}), retrying...")
-                time.sleep(3)
-                continue
-            return symbols
+            logging.info(f"Fetched {len(symbols)} symbols via proxy")
+            if len(symbols) >= 10:
+                return symbols
+            logging.warning(f"Too few symbols ({len(symbols)}) via proxy, retrying...")
         except Exception as e:
-            logging.error(f"Failed to fetch symbols: {str(e)}")
-            time.sleep(5)
-    raise RuntimeError("Failed to fetch USDT perpetual symbols after multiple attempts")
+            logging.warning(f"Proxy attempt {attempt} failed: {e}")
+        time.sleep(3)  # backoff before retry
+
+    raise RuntimeError("Failed to fetch USDT perpetual symbols via proxies after multiple attempts")
+
 
 def fetch_klines(symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
