@@ -7,29 +7,32 @@ import time
 import os
 import threading
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import itertools
 
-# Configure logging with more detail, keep SSL warnings visible but avoid disabling verify in requests calls
+# === CONFIG & CONSTANTS ===
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler()]
 )
 
-CACHE_DIR = "bb_touch_cache"  # Directory to store cache files
+CACHE_DIR = "bb_touch_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Constants
 BINANCE_FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
-PROXY_TEST_URL = "https://api.binance.com/api/v3/time"  # Lightweight proxy test URL
+PROXY_TEST_URL = "https://api.binance.com/api/v3/time"
+
 CANDLE_LIMIT = 55
+
 UPPER_TOUCH_THRESHOLD = 0.02  # 2%
-MIDDLE_TOUCH_THRESHOLD = 0.015  # 1.5%, between upper and lower thresholds
+MIDDLE_TOUCH_THRESHOLD = 0.015  # 1.5%
 LOWER_TOUCH_THRESHOLD = 0.02  # 2%
+
 RSI_PERIOD = 14
 BB_LENGTH = 34
 BB_STDDEV = 2
@@ -50,7 +53,6 @@ TIMEFRAMES_TOGGLE = {
     '1w': True,
 }
 
-# Which timeframes should include/display the middle BB line?
 MIDDLE_BAND_TOGGLE = {
     '3m': False,
     '5m': False,
@@ -63,27 +65,72 @@ MIDDLE_BAND_TOGGLE = {
     '1w': True,
 }
 
+# Map timeframe string to minutes for candle open calculation
+TIMEFRAME_MINUTES_MAP = {
+    '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
+    '1h': 60, '2h': 120, '4h': 240, '6h': 360, '8h': 480,
+    '12h': 720, '1d': 1440, '1w': 10080
+}
+
+# === CACHE UTILITIES ===
+
+def get_latest_candle_open(timeframe: str, now=None):
+    """
+    Calculate the latest candle open time (UTC) for the given timeframe.
+    """
+    if now is None:
+        now = datetime.utcnow()
+
+    if timeframe not in TIMEFRAME_MINUTES_MAP:
+        raise ValueError(f"Unknown timeframe: {timeframe}")
+
+    interval_minutes = TIMEFRAME_MINUTES_MAP[timeframe]
+
+    # Minutes since midnight UTC
+    total_minutes = now.hour * 60 + now.minute
+    intervals_passed = total_minutes // interval_minutes
+    candle_open_minutes = intervals_passed * interval_minutes
+
+    candle_open = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=candle_open_minutes)
+    return candle_open
+
 def get_cache_file_name(timeframe):
-    return os.path.join(CACHE_DIR, f"bb_touch_cache_{timeframe}.json")
+    """
+    Compose cache filename with candle open timestamp for timeframe.
+    """
+    candle_open = get_latest_candle_open(timeframe)
+    filename = f"bb_touch_cache_{timeframe}_{candle_open.strftime('%Y%m%dT%H%M')}.json"
+    return os.path.join(CACHE_DIR, filename)
 
 def load_cache(timeframe):
+    """
+    Load cache for the latest candle open time of the timeframe.
+    Return None if cache missing or outdated.
+    """
     cache_file = get_cache_file_name(timeframe)
     if not os.path.exists(cache_file):
         return None
     try:
         with open(cache_file, 'r') as f:
             data = json.load(f)
-        cache_date = data.get('date')
-        if cache_date == datetime.utcnow().strftime('%Y-%m-%d'):
+        cached_candle_open = datetime.fromisoformat(data.get('candle_open'))
+        latest_candle_open = get_latest_candle_open(timeframe)
+        if cached_candle_open == latest_candle_open:
             return data.get('results')
+        else:
+            logging.info(f"Cache outdated for {timeframe}, cache candle open: {cached_candle_open}, latest: {latest_candle_open}")
     except Exception as e:
         logging.warning(f"Failed to load {timeframe} cache: {e}")
     return None
 
 def save_cache(timeframe, results):
+    """
+    Save results cache with candle open timestamp.
+    """
     cache_file = get_cache_file_name(timeframe)
+    candle_open = get_latest_candle_open(timeframe)
     data = {
-        'date': datetime.utcnow().strftime('%Y-%m-%d'),
+        'candle_open': candle_open.isoformat(),
         'results': results
     }
     try:
@@ -93,28 +140,15 @@ def save_cache(timeframe, results):
     except Exception as e:
         logging.warning(f"Failed to save {timeframe} cache: {e}")
 
-def get_active_timeframes():
-    return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
-
-def test_proxy(proxy: str) -> bool:
-    try:
-        proxies = {"http": proxy, "https": proxy}
-        response = requests.get(PROXY_TEST_URL, proxies=proxies, timeout=10, verify=True)
-        return response.status_code in range(200, 300)
-    except Exception as e:
-        if "Connection reset" in str(e):
-            logging.debug("Proxy %s failed with connection reset", proxy)
-        else:
-            logging.debug("Proxy %s failed: %s", proxy, e)
-        return False
+# === PROXY MANAGER ===
 
 class ProxyManager:
     def __init__(self, proxy_sources, min_working_proxies=3):
         self.proxy_sources = proxy_sources
         self.min_working_proxies = min_working_proxies
-        self.proxies = []  # [{'proxy': proxy_str, 'failures': 0, 'speed': response_time}]
+        self.proxies = []
         self.blacklisted = set()
-        self.lock = threading.RLock()  # Changed to RLock to avoid deadlock
+        self.lock = threading.RLock()
         self.refresh_in_progress = False
         self.proxy_cycle = None
         self._initialize_proxies()
@@ -140,7 +174,7 @@ class ProxyManager:
                     if proxy not in new_proxy_addrs:
                         good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
                 self.proxies = sorted(good_existing, key=lambda x: (x['failures'], x['speed']))
-                self.proxy_cycle = None  # Reset cycle to refresh proxies
+                self.proxy_cycle = None
                 logging.info(f"Proxy pool refreshed. Now have {len(self.proxies)} working proxies")
         except Exception as e:
             logging.error(f"Error refreshing proxies: {str(e)}")
@@ -204,7 +238,7 @@ class ProxyManager:
 
         try:
             start = time.time()
-            response = requests.get("https://api.binance.com/api/v3/time", proxies=proxies, timeout=(3, 5), verify=True)
+            response = requests.get(PROXY_TEST_URL, proxies=proxies, timeout=(3, 5), verify=True)
             if response.status_code != 200:
                 self.blacklisted.add(proxy)
                 return None, None
@@ -253,10 +287,12 @@ class ProxyManager:
                         logging.warning(f"Removing failed proxy {p['proxy']}")
                         self.proxies.remove(p)
                         self.blacklisted.add(p['proxy'])
-                        self.proxy_cycle = None  # reset cycle to refresh proxies
+                        self.proxy_cycle = None
                         if len(self.proxies) < self.min_working_proxies and not self.refresh_in_progress:
                             threading.Thread(target=self._refresh_proxies, daemon=True).start()
                     break
+
+# === REQUESTS & DATA FETCHING ===
 
 def make_request(url, params=None, proxy_manager=None, max_attempts=4):
     for attempt in range(max_attempts):
@@ -293,7 +329,7 @@ def make_request(url, params=None, proxy_manager=None, max_attempts=4):
             logging.info(f"Retrying in {wait_time} seconds...")
             time.sleep(wait_time)
 
-def get_perpetual_usdt_symbols(proxy_manager, max_attempts=5, per_attempt_timeout=10):
+def get_perpetual_usdt_symbols(proxy_manager, max_attempts=5):
     logging.info("Starting to fetch USDT perpetual symbols list via proxies only...")
 
     for attempt in range(1, max_attempts + 1):
@@ -359,6 +395,8 @@ def calculate_rsi_bb(closes):
         matype=0
     )
     return rsi, bb_upper, bb_middle, bb_lower
+
+# === SCANNING ===
 
 def scan_symbol(symbol, timeframes, proxy_manager):
     results = []
@@ -512,7 +550,7 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
         lines = []
 
         def format_line(item):
-            parts = [f"*{item['symbol']}*", f"RSI: {item['rsi']:.2f}"]
+            base = f"*{item['symbol']}* - RSI: {item['rsi']:.2f}"
             if item.get('hot'):
                 base += " 🔥"
             return "• " + base
@@ -541,7 +579,6 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
     timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     messages = [m + f"\n\n_Report generated at {timestamp}_" for m in messages]
     return messages
-
 
 def split_message(text, max_length=4000):
     lines = text.split('\n')
