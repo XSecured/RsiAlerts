@@ -2,7 +2,7 @@ name: Run BB Touch Bot
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '*/3 * * * *'
 
 jobs:
   run-bot:
