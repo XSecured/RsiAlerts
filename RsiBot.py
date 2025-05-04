@@ -238,6 +238,10 @@ class ProxyManager:
         try:
             start = time.time()
             async with session.get(PROXY_TEST_URL, proxy=proxy_url, timeout=8, ssl=True) as resp:
+                if resp.status == 451:
+                    logging.warning(f"Proxy {proxy} blocked with HTTP 451, blacklisting.")
+                    self.blacklisted.add(proxy)
+                    return None, None
                 if resp.status != 200:
                     self.blacklisted.add(proxy)
                     return None, None
