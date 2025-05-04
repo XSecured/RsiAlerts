@@ -155,9 +155,9 @@ class ProxyManager:
         self.refresh_in_progress = False
         self.proxy_cycle = None
 
-    def _initialize_proxies(self):
+    async def _initialize_proxies(self):
         logging.info("Initializing proxies...")
-        asyncio.run(self._refresh_proxies_async())
+        await self._refresh_proxies_async()
         logging.info(f"Proxy initialization complete. Found {len(self.proxies)} working proxies")
 
     async def _refresh_proxies_async(self):
@@ -566,7 +566,7 @@ async def main_async():
 
     try:
         proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=3)
-        proxy_manager._initialize_proxies()  # Initialize proxies before scanning
+        await proxy_manager._initialize_proxies()  # Await the async initializer properly
         results = await scan_for_bb_touches_async(proxy_manager)
         cached_timeframes_used = [tf for tf in ['1w', '1d', '4h'] if tf in get_active_timeframes() and load_cache(tf) is not None]
         messages = format_results_by_timeframe(results, cached_timeframes_used=cached_timeframes_used)
