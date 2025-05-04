@@ -324,7 +324,7 @@ async def get_perpetual_usdt_symbols_async(proxy_manager, max_attempts=5):
     for attempt in range(1, max_attempts + 1):
         try:
             async with aiohttp.ClientSession() as session:
-                data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO)
+                data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
                 symbols = [
                     s['symbol'] for s in data.get('symbols', [])
                     if s.get('contractType') == 'PERPETUAL' and s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING'
@@ -343,7 +343,7 @@ async def fetch_klines_async(session, symbol, interval, proxy_manager, limit=CAN
         proxy_info = proxy_manager.get_proxy()
         proxy_str = proxy_info['proxy']
         proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
-        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy=proxy_url)
+        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
         proxy_manager.mark_success(proxy_info)
         closes = [float(k[4]) for k in data]
         timestamps = [k[0] for k in data]
@@ -359,7 +359,7 @@ async def get_daily_change_percent_async(session, symbol, proxy_manager):
         proxy_info = proxy_manager.get_proxy()
         proxy_str = proxy_info['proxy']
         proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
-        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy=proxy_url)
+        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
         proxy_manager.mark_success(proxy_info)
         if not data or len(data) < 1:
             return None
