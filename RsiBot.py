@@ -28,7 +28,7 @@ BINANCE_FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 PROXY_TEST_URL = "https://api.binance.com/api/v3/time"
 
-CANDLE_LIMIT = 55
+CANDLE_LIMIT = 60
 
 UPPER_TOUCH_THRESHOLD = 0.02  # 2%
 MIDDLE_TOUCH_THRESHOLD = 0.015  # 1.5%
@@ -74,6 +74,9 @@ TIMEFRAME_MINUTES_MAP = {
 }
 
 # === CACHE UTILITIES ===
+def get_active_timeframes():
+    """Return list of enabled timeframes from TIMEFRAMES_TOGGLE."""
+    return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
 
 def get_latest_candle_open(timeframe: str, now=None):
     """
