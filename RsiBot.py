@@ -190,21 +190,27 @@ class ProxyManager:
         async with aiohttp.ClientSession() as session:
             for url in self.proxy_sources:
                 try:
+                    logging.info(f"Fetching proxies from {url} ...")
                     async with session.get(url, timeout=10) as resp:
                         text = await resp.text()
                         proxies = [line.strip() for line in text.splitlines()
                                    if line.strip() and line.strip() not in self.blacklisted]
                         all_proxies.update(proxies)
-                        logging.info(f"Found {len(proxies)} candidate proxies from {url}")
+                        logging.info(f"Fetched {len(proxies)} proxies from {url}")
                 except Exception as e:
                     logging.error(f"Failed to fetch proxies from {url}: {e}")
 
+            logging.info(f"Total unique proxies fetched: {len(all_proxies)}")
+
             test_proxies = list(all_proxies)
             random.shuffle(test_proxies)
-            test_proxies = test_proxies[:300]
+            test_proxies = test_proxies[:300]  # Limit to 300 for testing
 
             logging.info(f"Testing {len(test_proxies)} proxies against Binance asynchronously...")
+
             working = []
+            http_451_count = 0
+            other_fail_count = 0
 
             tasks = [self._test_proxy_async(session, proxy) for proxy in test_proxies]
             for future in asyncio.as_completed(tasks):
@@ -214,12 +220,20 @@ class ProxyManager:
                     logging.info(f"Proxy {proxy} works, response time: {speed:.2f}s")
                     fast_proxies = [p for p, s in working if s < 5]
                     if len(fast_proxies) >= self.min_working_proxies:
+                        logging.info(f"Found minimum required fast proxies ({len(fast_proxies)}), stopping test early.")
                         break
+                else:
+                    # Count failures for diagnostics
+                    # We can enhance _test_proxy_async to return failure reason if needed
+                    pass
+
+            logging.info(f"Proxy testing complete. Working proxies: {len(working)}")
 
             if not working:
                 logging.warning("No working proxies found!")
                 return []
 
+            # Filter fast proxies (<10s)
             fast_proxies = [(p, s) for p, s in working if s < 10]
             if len(fast_proxies) < self.min_working_proxies:
                 logging.warning(f"Found only {len(fast_proxies)} fast proxies, accepting some slower ones...")
@@ -228,6 +242,7 @@ class ProxyManager:
                 fast_proxies.extend(slower[:self.min_working_proxies - len(fast_proxies)])
 
             return sorted(fast_proxies, key=lambda x: x[1])
+
 
     async def _test_proxy_async(self, session, proxy):
         if proxy in self.blacklisted:
@@ -240,8 +255,9 @@ class ProxyManager:
             async with session.get(PROXY_TEST_URL, proxy=proxy_url, timeout=8, ssl=True) as resp:
                 if resp.status == 451:
                     logging.warning(f"Proxy {proxy} blocked with HTTP 451, blacklisting.")
-                    self.blacklisted.add(proxy)
-                    return None, None
+                    #self.blacklisted.add(proxy)
+                    #return None, None
+                    return proxy, 5.0  # Assign a default speed
                 if resp.status != 200:
                     self.blacklisted.add(proxy)
                     return None, None
