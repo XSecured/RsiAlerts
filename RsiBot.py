@@ -10,7 +10,6 @@ import os
 import threading
 import random
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import itertools
 import glob
@@ -18,7 +17,7 @@ import glob
 # === CONFIG & CONSTANTS ===
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler()]
 )
@@ -157,31 +156,28 @@ class ProxyManager:
         self.proxy_cycle = None
 
     def _initialize_proxies(self):
-        logging.info("Starting proxy initialization...")
+        logging.info("Initializing proxies...")
         asyncio.run(self._refresh_proxies_async())
         logging.info(f"Proxy initialization complete. Found {len(self.proxies)} working proxies")
 
     async def _refresh_proxies_async(self):
         with self.lock:
             if self.refresh_in_progress:
-                logging.debug("Proxy refresh already in progress, skipping...")
                 return
             self.refresh_in_progress = True
         try:
-            logging.info("Refreshing proxy pool asynchronously...")
             new_proxies = await self._fetch_and_test_proxies_async()
-            logging.info(f"Number of new working proxies found: {len(new_proxies)}")
             with self.lock:
                 good_existing = [p for p in self.proxies if p['failures'] < 2]
-                new_proxy_addrs = [p['proxy'] for p in good_existing]
+                existing_addrs = {p['proxy'] for p in good_existing}
                 for proxy, speed in new_proxies:
-                    if proxy not in new_proxy_addrs:
+                    if proxy not in existing_addrs:
                         good_existing.append({'proxy': proxy, 'failures': 0, 'speed': speed})
                 self.proxies = sorted(good_existing, key=lambda x: (x['failures'], x['speed']))
                 self.proxy_cycle = None
                 logging.info(f"Proxy pool refreshed. Now have {len(self.proxies)} working proxies")
         except Exception as e:
-            logging.error(f"Error refreshing proxies: {str(e)}")
+            logging.error(f"Error refreshing proxies: {e}")
         finally:
             with self.lock:
                 self.refresh_in_progress = False
@@ -191,23 +187,17 @@ class ProxyManager:
         async with aiohttp.ClientSession() as session:
             for url in self.proxy_sources:
                 try:
-                    logging.info(f"Fetching proxies from {url} ...")
                     async with session.get(url, timeout=10) as resp:
                         text = await resp.text()
                         proxies = [line.strip() for line in text.splitlines()
                                    if line.strip() and line.strip() not in self.blacklisted]
                         all_proxies.update(proxies)
-                        logging.info(f"Fetched {len(proxies)} proxies from {url}")
                 except Exception as e:
-                    logging.error(f"Failed to fetch proxies from {url}: {e}")
-
-            logging.info(f"Total unique proxies fetched: {len(all_proxies)}")
+                    logging.warning(f"Failed to fetch proxies from {url}: {e}")
 
             test_proxies = list(all_proxies)
             random.shuffle(test_proxies)
-            test_proxies = test_proxies[:300]
-
-            logging.info(f"Testing {len(test_proxies)} proxies against Binance asynchronously...")
+            test_proxies = test_proxies[:200]
 
             working = []
             tasks = [self._test_proxy_async(session, proxy) for proxy in test_proxies]
@@ -216,13 +206,9 @@ class ProxyManager:
                 proxy, speed = await future
                 if proxy:
                     working.append((proxy, speed))
-                    logging.info(f"Proxy {proxy} works, response time: {speed:.2f}s")
                     fast_proxies = [p for p, s in working if s < 5]
                     if len(fast_proxies) >= self.min_working_proxies:
-                        logging.info(f"Found minimum required fast proxies ({len(fast_proxies)}), stopping test early.")
                         break
-
-            logging.info(f"Proxy testing complete. Working proxies: {len(working)}")
 
             if not working:
                 logging.warning("No working proxies found!")
@@ -230,7 +216,6 @@ class ProxyManager:
 
             fast_proxies = [(p, s) for p, s in working if s < 10]
             if len(fast_proxies) < self.min_working_proxies:
-                logging.warning(f"Found only {len(fast_proxies)} fast proxies, accepting some slower ones...")
                 slower = [(p, s) for p, s in working if 10 <= s <= 20]
                 slower.sort(key=lambda x: x[1])
                 fast_proxies.extend(slower[:self.min_working_proxies - len(fast_proxies)])
@@ -239,26 +224,19 @@ class ProxyManager:
 
     async def _test_proxy_async(self, session, proxy):
         if proxy in self.blacklisted:
-            logging.debug(f"Proxy {proxy} is blacklisted, skipping test.")
             return None, None
 
-        proxy_url = proxy if proxy.startswith("http://") or proxy.startswith("https://") else f"http://{proxy}"
+        proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
 
         try:
             start = time.time()
             async with session.get(PROXY_TEST_URL, proxy=proxy_url, timeout=8, ssl=True) as resp:
-                if resp.status == 451:
-                    logging.warning(f"Proxy {proxy} blocked with HTTP 451, blacklisting.")
-                    self.blacklisted.add(proxy)
-                    return None, None
                 if resp.status != 200:
-                    logging.warning(f"Proxy {proxy} returned status {resp.status}, blacklisting.")
                     self.blacklisted.add(proxy)
                     return None, None
                 elapsed = time.time() - start
                 return proxy, elapsed
-        except Exception as e:
-            logging.warning(f"Proxy {proxy} test failed with exception: {e}")
+        except Exception:
             self.blacklisted.add(proxy)
             return None, None
 
@@ -269,21 +247,16 @@ class ProxyManager:
                 raise RuntimeError("No working proxies available.")
             random.shuffle(good_proxies)
             self.proxy_cycle = itertools.cycle(good_proxies)
-            logging.info(f"Proxy cycle updated with {len(good_proxies)} proxies")
 
     def get_proxy(self):
         with self.lock:
             if self.proxy_cycle is None:
                 self._update_proxy_cycle()
             try:
-                proxy_info = next(self.proxy_cycle)
-                logging.debug(f"Selected proxy {proxy_info['proxy']} from cycle")
-                return proxy_info
+                return next(self.proxy_cycle)
             except StopIteration:
                 self._update_proxy_cycle()
-                proxy_info = next(self.proxy_cycle)
-                logging.debug(f"Selected proxy {proxy_info['proxy']} from cycle after reset")
-                return proxy_info
+                return next(self.proxy_cycle)
 
     def mark_success(self, proxy_info):
         with self.lock:
@@ -291,7 +264,6 @@ class ProxyManager:
                 if p['proxy'] == proxy_info['proxy']:
                     if p['failures'] > 0:
                         p['failures'] = 0
-                        logging.info(f"Proxy {p['proxy']} marked success, failures reset")
                     break
 
     def mark_failure(self, proxy_info):
@@ -299,9 +271,7 @@ class ProxyManager:
             for p in self.proxies:
                 if p['proxy'] == proxy_info['proxy']:
                     p['failures'] += 1
-                    logging.warning(f"Proxy {p['proxy']} failure count now {p['failures']}")
                     if p['failures'] >= 3:
-                        logging.warning(f"Removing failed proxy {p['proxy']}")
                         self.proxies.remove(p)
                         self.blacklisted.add(p['proxy'])
                         self.proxy_cycle = None
@@ -325,7 +295,7 @@ async def make_request_async(session, url, params=None, proxy_manager=None, max_
             continue
 
         proxy_str = proxy_info['proxy']
-        proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
+        proxy_url = proxy_str if proxy_str.startswith(("http://", "https://")) else f"http://{proxy_str}"
 
         try:
             async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
@@ -354,7 +324,7 @@ async def get_perpetual_usdt_symbols_async(proxy_manager, max_attempts=5):
     for attempt in range(1, max_attempts + 1):
         try:
             async with aiohttp.ClientSession() as session:
-                data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
+                data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO)
                 symbols = [
                     s['symbol'] for s in data.get('symbols', [])
                     if s.get('contractType') == 'PERPETUAL' and s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING'
@@ -373,7 +343,7 @@ async def fetch_klines_async(session, symbol, interval, proxy_manager, limit=CAN
         proxy_info = proxy_manager.get_proxy()
         proxy_str = proxy_info['proxy']
         proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
-        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
+        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy=proxy_url)
         proxy_manager.mark_success(proxy_info)
         closes = [float(k[4]) for k in data]
         timestamps = [k[0] for k in data]
@@ -389,7 +359,7 @@ async def get_daily_change_percent_async(session, symbol, proxy_manager):
         proxy_info = proxy_manager.get_proxy()
         proxy_str = proxy_info['proxy']
         proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
-        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
+        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy=proxy_url)
         proxy_manager.mark_success(proxy_info)
         if not data or len(data) < 1:
             return None
@@ -596,9 +566,7 @@ async def main_async():
 
     try:
         proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=3)
-        logging.info("Initializing proxies...")
-        await proxy_manager._refresh_proxies_async()  # Explicitly refresh proxies before scanning
-        logging.info("Proxies initialized.")
+        proxy_manager._initialize_proxies()  # Initialize proxies before scanning
         results = await scan_for_bb_touches_async(proxy_manager)
         cached_timeframes_used = [tf for tf in ['1w', '1d', '4h'] if tf in get_active_timeframes() and load_cache(tf) is not None]
         messages = format_results_by_timeframe(results, cached_timeframes_used=cached_timeframes_used)
