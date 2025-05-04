@@ -302,6 +302,7 @@ async def make_request_async(session, url, params=None, proxy_manager=None, max_
         raise ValueError("proxy_manager argument is required")
     attempt = 0
     while attempt < max_attempts:
+        proxy_info = None
         try:
             proxy_info = proxy_manager.get_proxy()
         except RuntimeError:
@@ -326,14 +327,14 @@ async def make_request_async(session, url, params=None, proxy_manager=None, max_
 
         except Exception as e:
             logging.error(f"Request failed with proxy {proxy_str}: {e}")
-            proxy_manager.mark_failure(proxy_info)
+            if proxy_info:
+                proxy_manager.mark_failure(proxy_info)
             attempt += 1
             wait_time = 2 * attempt
             logging.info(f"Retrying in {wait_time} seconds (attempt {attempt}/{max_attempts})...")
             await asyncio.sleep(wait_time)
 
     raise RuntimeError(f"Request failed after {max_attempts} attempts")
-
 
 async def get_perpetual_usdt_symbols_async(proxy_manager, max_attempts=5):
     for attempt in range(1, max_attempts + 1):
