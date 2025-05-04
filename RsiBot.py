@@ -373,6 +373,20 @@ async def get_daily_change_percent_async(session, symbol, proxy_manager):
         logging.warning(f"Could not fetch daily change for {symbol}: {e}")
         proxy_manager.mark_failure(proxy_info)
         return None
+        
+def calculate_rsi_bb(closes):
+    closes_np = np.array(closes)
+    rsi = talib.RSI(closes_np, timeperiod=RSI_PERIOD)
+    bb_upper, bb_middle, bb_lower = talib.BBANDS(
+        rsi,
+        timeperiod=BB_LENGTH,
+        nbdevup=BB_STDDEV,
+        nbdevdn=BB_STDDEV,
+        matype=0
+    )
+    return rsi, bb_upper, bb_middle, bb_lower
+
+# === SCANNING ===
 
 async def scan_symbol_async(symbol, timeframes, proxy_manager):
     results = []
