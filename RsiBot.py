@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import itertools
+import glob
 
 # === CONFIG & CONSTANTS ===
 
@@ -139,6 +140,28 @@ def save_cache(timeframe, results):
         logging.info(f"Cache saved successfully for {timeframe} at {cache_file}")
     except Exception as e:
         logging.warning(f"Failed to save {timeframe} cache: {e}")
+
+def cleanup_old_caches(max_age_days=7):
+    """
+    Delete cache files older than max_age_days from CACHE_DIR.
+    """
+    now = time.time()
+    max_age_seconds = max_age_days * 86400  # days to seconds
+    pattern = os.path.join(CACHE_DIR, "bb_touch_cache_*.json")
+    files = glob.glob(pattern)
+
+    deleted_files = 0
+    for file_path in files:
+        try:
+            file_age = now - os.path.getmtime(file_path)
+            if file_age > max_age_seconds:
+                os.remove(file_path)
+                deleted_files += 1
+        except Exception as e:
+            logging.warning(f"Failed to delete old cache file {file_path}: {e}")
+
+    if deleted_files > 0:
+        logging.info(f"Cleaned up {deleted_files} old cache files older than {max_age_days} days.")
 
 # === PROXY MANAGER ===
 
@@ -625,6 +648,9 @@ def main():
         raise ValueError("Telegram bot token or chat ID not set in environment variables.")
 
     logging.info("Starting BB touch scanner bot...")
+
+    # Clean up old caches older than 7 days
+    cleanup_old_caches(max_age_days=7)
 
     try:
         logging.info("Initializing proxy manager...")
