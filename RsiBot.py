@@ -298,13 +298,13 @@ class ProxyManager:
 # === ASYNC REQUESTS & SCANNING ===
 
 async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=4):
+    if proxy_manager is None:
+        raise ValueError("proxy_manager argument is required")
     attempt = 0
     while attempt < max_attempts:
-        proxy_info = None
         try:
             proxy_info = proxy_manager.get_proxy()
         except RuntimeError:
-            # No proxies available, wait and retry later
             logging.warning("No working proxies available, waiting before retry...")
             await asyncio.sleep(5)
             continue
@@ -315,11 +315,10 @@ async def make_request_async(session, url, params=None, proxy_manager=None, max_
         try:
             async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
                 if resp.status == 451:
-                    # Blacklist proxy immediately and retry with next proxy without incrementing attempt
                     logging.warning(f"Proxy {proxy_str} returned HTTP 451, blacklisting and retrying with different proxy")
                     proxy_manager.blacklisted.add(proxy_str)
                     proxy_manager.mark_failure(proxy_info)
-                    continue  # retry immediately with new proxy, same attempt count
+                    continue  # retry immediately without incrementing attempt
 
                 resp.raise_for_status()
                 proxy_manager.mark_success(proxy_info)
@@ -327,8 +326,7 @@ async def make_request_async(session, url, params=None, proxy_manager=None, max_
 
         except Exception as e:
             logging.error(f"Request failed with proxy {proxy_str}: {e}")
-            if proxy_info:
-                proxy_manager.mark_failure(proxy_info)
+            proxy_manager.mark_failure(proxy_info)
             attempt += 1
             wait_time = 2 * attempt
             logging.info(f"Retrying in {wait_time} seconds (attempt {attempt}/{max_attempts})...")
@@ -336,11 +334,12 @@ async def make_request_async(session, url, params=None, proxy_manager=None, max_
 
     raise RuntimeError(f"Request failed after {max_attempts} attempts")
 
+
 async def get_perpetual_usdt_symbols_async(proxy_manager, max_attempts=5):
     for attempt in range(1, max_attempts + 1):
         try:
             async with aiohttp.ClientSession() as session:
-                data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO)
+                data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
                 symbols = [
                     s['symbol'] for s in data.get('symbols', [])
                     if s.get('contractType') == 'PERPETUAL' and s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING'
@@ -359,7 +358,7 @@ async def fetch_klines_async(session, symbol, interval, proxy_manager, limit=CAN
         proxy_info = proxy_manager.get_proxy()
         proxy_str = proxy_info['proxy']
         proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
-        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy=proxy_url)
+        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
         proxy_manager.mark_success(proxy_info)
         closes = [float(k[4]) for k in data]
         timestamps = [k[0] for k in data]
@@ -375,7 +374,7 @@ async def get_daily_change_percent_async(session, symbol, proxy_manager):
         proxy_info = proxy_manager.get_proxy()
         proxy_str = proxy_info['proxy']
         proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
-        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy=proxy_url)
+        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
         proxy_manager.mark_success(proxy_info)
         if not data or len(data) < 1:
             return None
