@@ -146,7 +146,7 @@ def cleanup_old_caches(max_age_days=7):
 # === PROXY MANAGER ===
 
 class ProxyManager:
-    def __init__(self, proxy_sources, min_working_proxies=3):
+    def __init__(self, proxy_sources, min_working_proxies=5):
         self.proxy_sources = proxy_sources
         self.min_working_proxies = min_working_proxies
         self.proxies = []
@@ -197,7 +197,7 @@ class ProxyManager:
 
             test_proxies = list(all_proxies)
             random.shuffle(test_proxies)
-            test_proxies = test_proxies[:200]
+            test_proxies = test_proxies[:500]
 
             working = []
             tasks = [self._test_proxy_async(session, proxy) for proxy in test_proxies]
@@ -639,7 +639,7 @@ async def main_async():
     cleanup_old_caches(max_age_days=7)
 
     try:
-        proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=3)
+        proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=5)
         await proxy_manager._initialize_proxies()  # Await the async initializer properly
 
         results = await scan_for_bb_touches_async(proxy_manager)
