@@ -201,7 +201,7 @@ class ProxyManager:
 
             test_proxies = list(all_proxies)
             random.shuffle(test_proxies)
-            test_proxies = test_proxies[:200]
+            test_proxies = test_proxies[:500]
 
             logging.info(f"Testing {len(test_proxies)} proxies against Binance asynchronously...")
             working = []
@@ -297,33 +297,44 @@ class ProxyManager:
 
 # === ASYNC REQUESTS & SCANNING ===
 
-async def make_request_async(session, url, params=None, proxy=None, timeout=15):
-    proxy_url = None
-    if proxy:
-        proxy_url = proxy if proxy.startswith("http://") or proxy.startswith("https://") else f"http://{proxy}"
-    try:
-        async with session.get(url, params=params, proxy=proxy_url, timeout=timeout, ssl=True) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-    except Exception as e:
-        raise RuntimeError(f"Request failed: {e}")
-
-async def get_perpetual_usdt_symbols_async(proxy_manager, max_attempts=5):
-    for attempt in range(1, max_attempts + 1):
+async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=4):
+    attempt = 0
+    while attempt < max_attempts:
+        proxy_info = None
         try:
-            async with aiohttp.ClientSession() as session:
-                data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO)
-                symbols = [
-                    s['symbol'] for s in data.get('symbols', [])
-                    if s.get('contractType') == 'PERPETUAL' and s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING'
-                ]
-                if len(symbols) >= 10:
-                    return symbols
-                logging.warning(f"Too few symbols ({len(symbols)}) via proxy, retrying...")
+            proxy_info = proxy_manager.get_proxy()
+        except RuntimeError:
+            # No proxies available, wait and retry later
+            logging.warning("No working proxies available, waiting before retry...")
+            await asyncio.sleep(5)
+            continue
+
+        proxy_str = proxy_info['proxy']
+        proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
+
+        try:
+            async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
+                if resp.status == 451:
+                    # Blacklist proxy immediately and retry with next proxy without incrementing attempt
+                    logging.warning(f"Proxy {proxy_str} returned HTTP 451, blacklisting and retrying with different proxy")
+                    proxy_manager.blacklisted.add(proxy_str)
+                    proxy_manager.mark_failure(proxy_info)
+                    continue  # retry immediately with new proxy, same attempt count
+
+                resp.raise_for_status()
+                proxy_manager.mark_success(proxy_info)
+                return await resp.json()
+
         except Exception as e:
-            logging.warning(f"Proxy attempt {attempt} failed: {e}")
-        await asyncio.sleep(3)
-    raise RuntimeError("Failed to fetch USDT perpetual symbols via proxies after multiple attempts")
+            logging.error(f"Request failed with proxy {proxy_str}: {e}")
+            if proxy_info:
+                proxy_manager.mark_failure(proxy_info)
+            attempt += 1
+            wait_time = 2 * attempt
+            logging.info(f"Retrying in {wait_time} seconds (attempt {attempt}/{max_attempts})...")
+            await asyncio.sleep(wait_time)
+
+    raise RuntimeError(f"Request failed after {max_attempts} attempts")
 
 async def fetch_klines_async(session, symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
