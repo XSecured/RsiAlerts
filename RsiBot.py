@@ -513,10 +513,9 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
 
         def format_line(item):
             parts = [f"*{item['symbol']}*", f"RSI: {item['rsi']:.2f}"]
-            # We don't include MB in the line format as per original style
             if item.get('hot'):
-                parts.append("🔥")
-            return "• " + " - ".join(parts)
+                base += " 🔥"
+            return "• " + base
 
         if upper_touches:
             lines.append("*⬆️ UPPER BB Touches:*")
