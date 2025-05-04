@@ -275,8 +275,14 @@ class ProxyManager:
                         self.proxies.remove(p)
                         self.blacklisted.add(p['proxy'])
                         self.proxy_cycle = None
+                        # Use asyncio task to refresh proxies asynchronously
                         if len(self.proxies) < self.min_working_proxies and not self.refresh_in_progress:
-                            threading.Thread(target=self._refresh_proxies_async, daemon=True).start()
+                            try:
+                                loop = asyncio.get_running_loop()
+                                loop.create_task(self._refresh_proxies_async())
+                            except RuntimeError:
+                                # No running loop, fallback to thread (rare)
+                                threading.Thread(target=lambda: asyncio.run(self._refresh_proxies_async()), daemon=True).start()
                     break
 
 # === ASYNC REQUESTS & SCANNING ===
@@ -296,6 +302,9 @@ async def make_request_async(session, url, params=None, proxy_manager=None, max_
 
         proxy_str = proxy_info['proxy']
         proxy_url = proxy_str if proxy_str.startswith(("http://", "https://")) else f"http://{proxy_str}"
+
+        endpoint = url.split('/')[-1] if '/' in url else url
+        logging.debug(f"Request to {endpoint}: using proxy {proxy_str} (attempt {attempt+1}/{max_attempts})")
 
         try:
             async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
@@ -339,10 +348,11 @@ async def get_perpetual_usdt_symbols_async(proxy_manager, max_attempts=5):
 
 async def fetch_klines_async(session, symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+    proxy_info = None
     try:
         proxy_info = proxy_manager.get_proxy()
         proxy_str = proxy_info['proxy']
-        proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
+        proxy_url = proxy_str if proxy_str.startswith(("http://", "https://")) else f"http://{proxy_str}"
         data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
         proxy_manager.mark_success(proxy_info)
         closes = [float(k[4]) for k in data]
@@ -350,15 +360,17 @@ async def fetch_klines_async(session, symbol, interval, proxy_manager, limit=CAN
         return closes, timestamps
     except Exception as e:
         logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
-        proxy_manager.mark_failure(proxy_info)
+        if proxy_info:
+            proxy_manager.mark_failure(proxy_info)
         return None, None
 
 async def get_daily_change_percent_async(session, symbol, proxy_manager):
     params = {'symbol': symbol, 'interval': '1d', 'limit': 1}
+    proxy_info = None
     try:
         proxy_info = proxy_manager.get_proxy()
         proxy_str = proxy_info['proxy']
-        proxy_url = proxy_str if proxy_str.startswith("http://") or proxy_str.startswith("https://") else f"http://{proxy_str}"
+        proxy_url = proxy_str if proxy_str.startswith(("http://", "https://")) else f"http://{proxy_str}"
         data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
         proxy_manager.mark_success(proxy_info)
         if not data or len(data) < 1:
@@ -371,9 +383,10 @@ async def get_daily_change_percent_async(session, symbol, proxy_manager):
         return (current_price - daily_open) / daily_open * 100
     except Exception as e:
         logging.warning(f"Could not fetch daily change for {symbol}: {e}")
-        proxy_manager.mark_failure(proxy_info)
+        if proxy_info:
+            proxy_manager.mark_failure(proxy_info)
         return None
-        
+
 def calculate_rsi_bb(closes):
     closes_np = np.array(closes)
     rsi = talib.RSI(closes_np, timeperiod=RSI_PERIOD)
@@ -460,12 +473,59 @@ async def scan_for_bb_touches_async(proxy_manager):
     batch_size = 30
     active_timeframes = get_active_timeframes()
 
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i+batch_size]
-        tasks = [scan_symbol_async(symbol, active_timeframes, proxy_manager) for symbol in batch]
-        batch_results = await asyncio.gather(*tasks)
-        for res in batch_results:
-            results.extend(res)
+    # Cache handling for these timeframes
+    cached_timeframes = ['1w', '1d', '4h']
+    cached_results = {}
+    uncached_timeframes = [tf for tf in active_timeframes if tf not in cached_timeframes]
+
+    # Load cache for cached timeframes
+    for timeframe in cached_timeframes:
+        if timeframe in active_timeframes:
+            cached_results[timeframe] = load_cache(timeframe)
+            if cached_results[timeframe] is not None:
+                logging.info(f"[CACHE] Loaded {timeframe} timeframe results from cache")
+            else:
+                logging.info(f"[CACHE] No valid cache found for {timeframe}, will scan fresh")
+
+    total_symbols = len(symbols)
+
+    # Scan cached timeframes that have no valid cache
+    for timeframe in cached_timeframes:
+        if timeframe in active_timeframes and cached_results.get(timeframe) is None:
+            logging.info(f"[SCAN] Scanning {timeframe} timeframe fresh data...")
+            timeframe_results = []
+            for i in range(0, total_symbols, batch_size):
+                batch = symbols[i:i+batch_size]
+                tasks = [scan_symbol_async(symbol, [timeframe], proxy_manager) for symbol in batch]
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for res in batch_results:
+                    if isinstance(res, Exception):
+                        logging.error(f"Error scanning {timeframe} timeframe: {res}")
+                    else:
+                        timeframe_results.extend(res)
+            save_cache(timeframe, timeframe_results)
+            cached_results[timeframe] = timeframe_results
+            logging.info(f"[CACHE] Saved fresh scan results for {timeframe}")
+
+    # Scan uncached timeframes all at once
+    uncached_results = []
+    if uncached_timeframes:
+        logging.info(f"[SCAN] Scanning uncached timeframes: {uncached_timeframes}")
+        for i in range(0, total_symbols, batch_size):
+            batch = symbols[i:i+batch_size]
+            tasks = [scan_symbol_async(symbol, uncached_timeframes, proxy_manager) for symbol in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in batch_results:
+                if isinstance(res, Exception):
+                    logging.error(f"Error scanning uncached timeframes: {res}")
+                else:
+                    uncached_results.extend(res)
+
+    # Combine results
+    for timeframe in cached_timeframes:
+        if timeframe in cached_results:
+            results.extend(cached_results[timeframe])
+    results.extend(uncached_results)
 
     logging.info(f"[RESULTS] Total BB touches found: {len(results)}")
     return results
@@ -581,7 +641,9 @@ async def main_async():
     try:
         proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=3)
         await proxy_manager._initialize_proxies()  # Await the async initializer properly
+
         results = await scan_for_bb_touches_async(proxy_manager)
+
         cached_timeframes_used = [tf for tf in ['1w', '1d', '4h'] if tf in get_active_timeframes() and load_cache(tf) is not None]
         messages = format_results_by_timeframe(results, cached_timeframes_used=cached_timeframes_used)
 
