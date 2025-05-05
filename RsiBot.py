@@ -190,17 +190,27 @@ class ProxyManager:
                     async with session.get(url, timeout=10) as resp:
                         text = await resp.text()
                         proxies = [line.strip() for line in text.splitlines()
-                                   if line.strip() and line.strip() not in self.blacklisted]
+                               if line.strip() and line.strip() not in self.blacklisted]
                         all_proxies.update(proxies)
                 except Exception as e:
                     logging.warning(f"Failed to fetch proxies from {url}: {e}")
 
             test_proxies = list(all_proxies)
             random.shuffle(test_proxies)
-            test_proxies = test_proxies[:500]
+            test_proxies = test_proxies[:200]
+
+            semaphore = asyncio.Semaphore(50)  # Limit concurrency to 50
 
             working = []
-            tasks = [self._test_proxy_async(session, proxy) for proxy in test_proxies]
+            tasks = []
+
+            # Helper to test proxy with semaphore
+            async def sem_test(proxy):
+                async with semaphore:
+                    return await self._test_proxy_async(session, proxy)
+
+            for proxy in test_proxies:
+                tasks.append(asyncio.create_task(sem_test(proxy)))
 
             for future in asyncio.as_completed(tasks):
                 proxy, speed = await future
@@ -208,6 +218,10 @@ class ProxyManager:
                     working.append((proxy, speed))
                     fast_proxies = [p for p, s in working if s < 5]
                     if len(fast_proxies) >= self.min_working_proxies:
+                        # Cancel remaining tasks
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
                         break
 
             if not working:
@@ -221,6 +235,7 @@ class ProxyManager:
                 fast_proxies.extend(slower[:self.min_working_proxies - len(fast_proxies)])
 
             return sorted(fast_proxies, key=lambda x: x[1])
+
 
     async def _test_proxy_async(self, session, proxy):
         if proxy in self.blacklisted:
