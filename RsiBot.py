@@ -680,10 +680,10 @@ async def main_async():
     cleanup_old_caches(max_age_days=7)
 
     try:
-        proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=5)
-        await proxy_manager._initialize_proxies()
+        proxy_pool = AsyncProxyPool(PROXY_SOURCES, min_working_proxies=10)
+        await proxy_pool._initialize_proxies()
 
-        results = await scan_for_bb_touches_async(proxy_manager)
+        results = await scan_for_bb_touches_async(proxy_pool)
 
         cached_timeframes_used = [
             tf for tf in ['1w', '1d', '4h']
