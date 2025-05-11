@@ -514,9 +514,11 @@ async def scan_for_bb_touches_async(proxy_manager):
     batch_size = 30
     active_timeframes = get_active_timeframes()
 
-    # Cache handling for these timeframes
+    # Timeframes that use caching
     cached_timeframes = ['1w', '1d', '4h']
     cached_results = {}
+
+    # Timeframes that do not use caching
     uncached_timeframes = [tf for tf in active_timeframes if tf not in cached_timeframes]
 
     # Load cache for cached timeframes
@@ -529,14 +531,15 @@ async def scan_for_bb_touches_async(proxy_manager):
                 logging.info(f"[CACHE] No valid cache found for {timeframe}, will scan fresh")
 
     total_symbols = len(symbols)
+    fresh_timeframes = set()
 
-    # Scan cached timeframes that have no valid cache
+    # Scan cached timeframes that have no valid cache (fresh scan)
     for timeframe in cached_timeframes:
         if timeframe in active_timeframes and cached_results.get(timeframe) is None:
             logging.info(f"[SCAN] Scanning {timeframe} timeframe fresh data...")
             timeframe_results = []
             for i in range(0, total_symbols, batch_size):
-                batch = symbols[i:i+batch_size]
+                batch = symbols[i:i + batch_size]
                 tasks = [scan_symbol_async(symbol, [timeframe], proxy_manager) for symbol in batch]
                 batch_results = await asyncio.gather(*tasks, return_exceptions=True)
                 for res in batch_results:
@@ -546,14 +549,15 @@ async def scan_for_bb_touches_async(proxy_manager):
                         timeframe_results.extend(res)
             save_cache(timeframe, timeframe_results)
             cached_results[timeframe] = timeframe_results
+            fresh_timeframes.add(timeframe)
             logging.info(f"[CACHE] Saved fresh scan results for {timeframe}")
 
-    # Scan uncached timeframes all at once
+    # Scan uncached timeframes all at once (always fresh)
     uncached_results = []
     if uncached_timeframes:
         logging.info(f"[SCAN] Scanning uncached timeframes: {uncached_timeframes}")
         for i in range(0, total_symbols, batch_size):
-            batch = symbols[i:i+batch_size]
+            batch = symbols[i:i + batch_size]
             tasks = [scan_symbol_async(symbol, uncached_timeframes, proxy_manager) for symbol in batch]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             for res in batch_results:
@@ -561,15 +565,17 @@ async def scan_for_bb_touches_async(proxy_manager):
                     logging.error(f"Error scanning uncached timeframes: {res}")
                 else:
                     uncached_results.extend(res)
+        fresh_timeframes.update(uncached_timeframes)
 
-    # Combine results
+    # Combine all results
     for timeframe in cached_timeframes:
         if timeframe in cached_results:
             results.extend(cached_results[timeframe])
     results.extend(uncached_results)
 
     logging.info(f"[RESULTS] Total BB touches found: {len(results)}")
-    return results
+
+    return results, fresh_timeframes
 
 # === Formatting and Telegram sending ===
 
@@ -689,16 +695,22 @@ async def main_async():
         )
         await proxy_pool.initialize()
 
-        results = await scan_for_bb_touches_async(proxy_pool)
+        results, fresh_timeframes = await scan_for_bb_touches_async(proxy_pool)
 
         cached_timeframes_used = [
-            tf for tf in ['1w', '1d', '4h']
+            tf for tf in ['1w','1d','4h']
             if tf in get_active_timeframes() and load_cache(tf) is not None
         ]
 
-        messages = format_results_by_timeframe(results, cached_timeframes_used=cached_timeframes_used)
-        fresh_messages = [msg for msg in messages if "(from cache)" not in msg]
+        messages = format_results_by_timeframe(results,
+              cached_timeframes_used=cached_timeframes_used)
 
+        def msg_timeframe(msg):
+            m = re.search(r"BB Touches on ([^\s]+) Timeframe", msg)
+            return m.group(1) if m else None
+            
+        fresh_messages = [m for m in messages
+                  if msg_timeframe(m) in fresh_timeframes]
         if not fresh_messages:
             logging.info("No fresh BB touch alerts to send (all messages from cache).")
 
