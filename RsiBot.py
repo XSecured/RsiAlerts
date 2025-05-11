@@ -680,22 +680,24 @@ async def main_async():
     cleanup_old_caches(max_age_days=7)
 
     try:
-        proxy_pool = AsyncProxyPool(
-            sources=PROXY_SOURCES,
-            max_pool_size=25,
-            min_working=5,
-            check_interval=600,
-            max_failures=3
-        )
-        await proxy_pool.initialize()
+        proxy_manager = ProxyManager(PROXY_SOURCES, min_working_proxies=5)
+        await proxy_manager._initialize_proxies()
 
-        results = await scan_for_bb_touches_async(proxy_pool)
+        results = await scan_for_bb_touches_async(proxy_manager)
 
-        cached_timeframes_used = [tf for tf in ['1w', '1d', '4h'] if tf in get_active_timeframes() and load_cache(tf) is not None]
+        cached_timeframes_used = [
+            tf for tf in ['1w', '1d', '4h']
+            if tf in get_active_timeframes() and load_cache(tf) is not None
+        ]
+
         messages = format_results_by_timeframe(results, cached_timeframes_used=cached_timeframes_used)
+        fresh_messages = [msg for msg in messages if "(from cache)" not in msg]
 
-        for i, msg in enumerate(messages, 1):
-            logging.info(f"Sending message {i}/{len(messages)}")
+        if not fresh_messages:
+            logging.info("No fresh BB touch alerts to send (all messages from cache).")
+
+        for i, msg in enumerate(fresh_messages, 1):
+            logging.info(f"Sending fresh message {i}/{len(fresh_messages)}")
             chunks = split_message(msg)
             for idx, chunk in enumerate(chunks, 1):
                 if len(chunks) > 1:
@@ -707,14 +709,12 @@ async def main_async():
         elapsed = time.time() - start_time
         logging.info(f"Bot run completed successfully in {elapsed:.2f} seconds")
 
-        await proxy_pool.shutdown()
-
     except Exception as e:
         elapsed = time.time() - start_time
         logging.error(f"Fatal error after {elapsed:.2f}s: {e}")
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            error_msg = f"*⚠️ Scanner Error*\n\nThe bot encountered an error after running for {elapsed:.2f}s:\n`{str(e)}`"
+            error_msg = (
+                f"*⚠️ Scanner Error*\n\n"
+                f"The bot encountered an error after running for {elapsed:.2f}s:\n`{str(e)}`"
+            )
             send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, error_msg)
-
-if __name__ == "__main__":
-    asyncio.run(main_async())
