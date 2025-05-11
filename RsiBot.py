@@ -230,7 +230,7 @@ class AsyncProxyPool:
         self,
         sources: List[str] = PROXY_SOURCES,
         max_pool_size: int = 25,
-        min_working: int = 10,
+        min_working: int = 5,
         check_interval: int = 600,
         max_failures: int = 3
     ):
@@ -680,8 +680,14 @@ async def main_async():
     cleanup_old_caches(max_age_days=7)
 
     try:
-        proxy_pool = AsyncProxyPool(PROXY_SOURCES, min_working_proxies=10)
-        await proxy_pool._initialize_proxies()
+        proxy_pool = AsyncProxyPool(
+            sources=PROXY_SOURCES,
+            max_pool_size=25,
+            min_working=5,
+            check_interval=600,
+            max_failures=3
+        )
+        await proxy_pool.initialize()
 
         results = await scan_for_bb_touches_async(proxy_pool)
 
