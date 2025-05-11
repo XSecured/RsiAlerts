@@ -718,3 +718,6 @@ async def main_async():
                 f"The bot encountered an error after running for {elapsed:.2f}s:\n`{str(e)}`"
             )
             send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, error_msg)
+
+if __name__ == "__main__":
+    asyncio.run(main_async())
