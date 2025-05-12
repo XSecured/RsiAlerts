@@ -676,57 +676,63 @@ def send_telegram_alert(bot_token, chat_id, message):
 
 async def main_async():
     start_time = time.time()
-    TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-    TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+    TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+    TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise ValueError("Telegram bot token or chat ID not set in environment variables.")
-
-    logging.info("Starting BB touch scanner bot...")
-
+    logging.info("Starting BB touch scanner bot…")
     cleanup_old_caches(max_age_days=7)
 
-    try:
-        proxy_pool = AsyncProxyPool(
-            sources=PROXY_SOURCES,
-            max_pool_size=25,
-            min_working=5,
-            check_interval=600,
-            max_failures=3
-        )
-        await proxy_pool.initialize()
+    # === STEP 1: snapshot which TFs already have a valid cache on disk ===
+    active = set(get_active_timeframes())
+    cached_timeframes = ['1w','1d','4h']
+    initial_cached = [
+        tf for tf in cached_timeframes
+        if tf in active and load_cache(tf) is not None
+    ]
+    if initial_cached:
+        logging.info(f"Will mark these timeframes as loaded from cache: {initial_cached}")
 
-        results, fresh_timeframes = await scan_for_bb_touches_async(proxy_pool)
+    # === STEP 2: run the scan and learn which TFs were scanned fresh ===
+    proxy_pool = AsyncProxyPool(
+        sources=PROXY_SOURCES,
+        max_pool_size=25,
+        min_working=5,
+        check_interval=600,
+        max_failures=3
+    )
+    await proxy_pool.initialize()
 
-        cached_timeframes_used = [
-            tf for tf in ['1w','1d','4h']
-            if tf in get_active_timeframes() and load_cache(tf) is not None
-        ]
+    results, fresh_timeframes = await scan_for_bb_touches_async(proxy_pool)
+    logging.info(f"Freshly scanned timeframes this run: {sorted(fresh_timeframes)}")
 
-        messages = format_results_by_timeframe(results,
-              cached_timeframes_used=cached_timeframes_used)
+    # === STEP 3: format ALL results, badging only TFs in initial_cached ===
+    messages = format_results_by_timeframe(results,
+                  cached_timeframes_used=initial_cached)
 
-        def msg_timeframe(msg):
-            m = re.search(r"BB Touches on ([^\s]+) Timeframe", msg)
-            return m.group(1) if m else None
-            
-        fresh_messages = [m for m in messages
-                  if msg_timeframe(m) in fresh_timeframes]
-        if not fresh_messages:
-            logging.info("No fresh BB touch alerts to send (all messages from cache).")
+    # === STEP 4: extract the TF from each message header ===
+    def msg_timeframe(msg: str) -> str:
+        m = re.search(r"BB Touches on (\S+) Timeframe", msg)
+        return m.group(1) if m else None
 
+    # === STEP 5: keep only those messages whose TF was freshly scanned ===
+    fresh_messages = [
+        m for m in messages
+        if msg_timeframe(m) in fresh_timeframes
+    ]
+
+    if not fresh_messages:
+        logging.info("No fresh BB-touch alerts to send (everything was cached).")
+    else:
+        # === STEP 6: send them ===
         for i, msg in enumerate(fresh_messages, 1):
             logging.info(f"Sending fresh message {i}/{len(fresh_messages)}")
-            chunks = split_message(msg)
-            for idx, chunk in enumerate(chunks, 1):
-                if len(chunks) > 1:
-                    chunk = f"{chunk}\n\n_Part {idx} of {len(chunks)}_"
-                success = send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, chunk)
-                if not success:
-                    logging.error(f"Failed to send part {idx} of message {i}")
+            for idx, chunk in enumerate(split_message(msg), 1):
+                if len(fresh_messages) > 1:
+                    chunk += f"\n\n_Part {idx} of {len(fresh_messages)}_"
+                send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, chunk)
 
-        elapsed = time.time() - start_time
-        logging.info(f"Bot run completed successfully in {elapsed:.2f} seconds")
+    elapsed = time.time() - start_time
+    logging.info(f"Bot run completed in {elapsed:.1f}s")
 
     except Exception as e:
         elapsed = time.time() - start_time
