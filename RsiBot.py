@@ -505,7 +505,7 @@ async def scan_symbol_async(symbol, timeframes, proxy_manager):
 
                 results.append(item)
 
-                logging.info(f"Alert: {symbol} on {timeframe} timeframe touching {touch_type} BB line at {timestamp} {'🔥' if hot else ''}")
+                #logging.info(f"Alert: {symbol} on {timeframe} timeframe touching {touch_type} BB line at {timestamp} {'🔥' if hot else ''}")
 
     return results
 
