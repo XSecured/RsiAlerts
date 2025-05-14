@@ -689,8 +689,8 @@ async def main_async():
         cleanup_old_caches(max_age_days=7)
 
         # Define cached and uncached timeframes
-        CACHED_TFS = {'4h', '1d', '1w'}
         active_timeframes = set(get_active_timeframes())
+        CACHED_TFS = {'4h', '1d', '1w'}
         UNCACHED_TFS = active_timeframes - CACHED_TFS
 
         # === STEP 1: snapshot which cached TFs already have valid cache on disk ===
