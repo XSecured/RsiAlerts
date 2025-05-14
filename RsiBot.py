@@ -41,6 +41,11 @@ RSI_PERIOD = 14
 BB_LENGTH = 34
 BB_STDDEV = 2
 
+CACHED_TFS   = {'4h','1d','1w'}
+# uncached = everything else that you have enabled
+UNCACHED_TFS = set(get_active_timeframes()) - CACHED_TFS
+
+
 PROXY_SOURCES = [
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 ]
@@ -230,8 +235,8 @@ class AsyncProxyPool:
     def __init__(
         self,
         sources: List[str] = PROXY_SOURCES,
-        max_pool_size: int = 25,
-        min_working: int = 5,
+        max_pool_size: int = 50,
+        min_working: int = 10,
         check_interval: int = 600,
         max_failures: int = 3
     ):
@@ -683,21 +688,24 @@ async def main_async():
         logging.info("Starting BB touch scanner bot…")
         cleanup_old_caches(max_age_days=7)
 
-        # === STEP 1: snapshot which TFs already have a valid cache on disk ===
-        active = set(get_active_timeframes())
-        cached_timeframes = ['1w','1d','4h']
+        # Define cached and uncached timeframes
+        CACHED_TFS = {'4h', '1d', '1w'}
+        active_timeframes = set(get_active_timeframes())
+        UNCACHED_TFS = active_timeframes - CACHED_TFS
+
+        # === STEP 1: snapshot which cached TFs already have valid cache on disk ===
         initial_cached = [
-            tf for tf in cached_timeframes
-            if tf in active and load_cache(tf) is not None
+            tf for tf in CACHED_TFS
+            if tf in active_timeframes and load_cache(tf) is not None
         ]
         if initial_cached:
-            logging.info(f"Will mark these timeframes as loaded from cache: {initial_cached}")
+            logging.info(f"Will mark these cached timeframes as loaded from cache: {initial_cached}")
 
         # === STEP 2: run the scan and learn which TFs were scanned fresh ===
         proxy_pool = AsyncProxyPool(
             sources=PROXY_SOURCES,
-            max_pool_size=25,
-            min_working=5,
+            max_pool_size=50,
+            min_working=10,
             check_interval=600,
             max_failures=3
         )
@@ -707,29 +715,29 @@ async def main_async():
         logging.info(f"Freshly scanned timeframes this run: {sorted(fresh_timeframes)}")
 
         # === STEP 3: format ALL results, badging only TFs in initial_cached ===
-        messages = format_results_by_timeframe(results,
-                      cached_timeframes_used=initial_cached)
+        messages = format_results_by_timeframe(results, cached_timeframes_used=initial_cached)
 
-        # === STEP 4: extract the TF from each message header ===
+        # === STEP 4: helper to extract timeframe from message header ===
         def msg_timeframe(msg: str) -> str:
             m = re.search(r"BB Touches on (\S+) Timeframe", msg)
-            return m.group(1) if m else None
+            return m.group(1) if m else ""
 
-        # === STEP 5: keep only those messages whose TF was freshly scanned ===
-        fresh_messages = [
-            m for m in messages
-            if msg_timeframe(m) in fresh_timeframes
-        ]
+        # === STEP 5: build set of timeframes allowed to send this run ===
+        allowed_timeframes = UNCACHED_TFS.union(fresh_timeframes.intersection(CACHED_TFS))
+        logging.info(f"Will send alerts for these timeframes this run: {sorted(allowed_timeframes)}")
 
-        if not fresh_messages:
-            logging.info("No fresh BB-touch alerts to send (everything was cached).")
+        # === STEP 6: filter messages to only those timeframes allowed ===
+        to_send = [m for m in messages if msg_timeframe(m) in allowed_timeframes]
+
+        if not to_send:
+            logging.info("No BB-touch alerts to send this run.")
         else:
-            # === STEP 6: send them ===
-            for i, msg in enumerate(fresh_messages, 1):
-                logging.info(f"Sending fresh message {i}/{len(fresh_messages)}")
+            # === STEP 7: send messages ===
+            for i, msg in enumerate(to_send, 1):
+                logging.info(f"Sending message {i}/{len(to_send)}")
                 for idx, chunk in enumerate(split_message(msg), 1):
-                    if len(fresh_messages) > 1:
-                        chunk += f"\n\n_Part {idx} of {len(fresh_messages)}_"
+                    if len(to_send) > 1:
+                        chunk += f"\n\n_Part {idx} of {len(to_send)}_"
                     send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, chunk)
 
         elapsed = time.time() - start_time
