@@ -41,11 +41,6 @@ RSI_PERIOD = 14
 BB_LENGTH = 34
 BB_STDDEV = 2
 
-CACHED_TFS   = {'4h','1d','1w'}
-# uncached = everything else that you have enabled
-UNCACHED_TFS = set(get_active_timeframes()) - CACHED_TFS
-
-
 PROXY_SOURCES = [
     "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 ]
@@ -84,6 +79,10 @@ TIMEFRAME_MINUTES_MAP = {
 
 def get_active_timeframes():
     return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
+
+CACHED_TFS   = {'4h','1d','1w'}
+# uncached = everything else that you have enabled
+UNCACHED_TFS = set(get_active_timeframes()) - CACHED_TFS
 
 def get_latest_candle_open(timeframe: str, now=None):
     if now is None:
