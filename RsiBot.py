@@ -234,8 +234,8 @@ class AsyncProxyPool:
     def __init__(
         self,
         sources: List[str] = PROXY_SOURCES,
-        max_pool_size: int = 50,
-        min_working: int = 10,
+        max_pool_size: int = 20,
+        min_working: int = 5,
         check_interval: int = 600,
         max_failures: int = 3
     ):
@@ -516,7 +516,7 @@ async def scan_symbol_async(symbol, timeframes, proxy_manager):
 async def scan_for_bb_touches_async(proxy_manager):
     symbols = await get_perpetual_usdt_symbols_async(proxy_manager)
     results = []
-    batch_size = 30
+    batch_size = 70
     active_timeframes = get_active_timeframes()
 
     # Timeframes that use caching
@@ -703,8 +703,8 @@ async def main_async():
         # === STEP 2: run the scan and learn which TFs were scanned fresh ===
         proxy_pool = AsyncProxyPool(
             sources=PROXY_SOURCES,
-            max_pool_size=50,
-            min_working=10,
+            max_pool_size=20,
+            min_working=5,
             check_interval=600,
             max_failures=3
         )
