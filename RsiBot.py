@@ -27,6 +27,8 @@ logging.basicConfig(
 CACHE_DIR = "bb_touch_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+SENT_STATE_FILE = os.path.join(CACHE_DIR, "sent_state.json")
+
 BINANCE_FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 PROXY_TEST_URL = "https://api.binance.com/api/v3/time"
@@ -101,36 +103,26 @@ def get_cache_file_name(timeframe):
     filename = f"bb_touch_cache_{timeframe}_{candle_open.strftime('%Y%m%dT%H%M')}.json"
     return os.path.join(CACHE_DIR, filename)
 
-def load_cache(timeframe):
-    cache_file = get_cache_file_name(timeframe)
-    if not os.path.exists(cache_file):
-        return None
+def load_sent_state() -> dict:
+    """
+    Load the last candle‐open times we sent alerts for cached TFs.
+    Returns a dict: { timeframe_str: isoformat_str }
+    """
     try:
-        with open(cache_file, 'r') as f:
-            data = json.load(f)
-        cached_candle_open = datetime.fromisoformat(data.get('candle_open'))
-        latest_candle_open = get_latest_candle_open(timeframe)
-        if cached_candle_open == latest_candle_open:
-            return data.get('results')
-        else:
-            logging.info(f"Cache outdated for {timeframe}, cache candle open: {cached_candle_open}, latest: {latest_candle_open}")
-    except Exception as e:
-        logging.warning(f"Failed to load {timeframe} cache: {e}")
-    return None
+        with open(SENT_STATE_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-def save_cache(timeframe, results):
-    cache_file = get_cache_file_name(timeframe)
-    candle_open = get_latest_candle_open(timeframe)
-    data = {
-        'candle_open': candle_open.isoformat(),
-        'results': results
-    }
+def save_sent_state(state: dict):
+    """
+    Persist the last candle‐open times for cached TFs.
+    """
     try:
-        with open(cache_file, 'w') as f:
-            json.dump(data, f)
-        logging.info(f"Cache saved successfully for {timeframe} at {cache_file}")
+        with open(SENT_STATE_FILE, 'w') as f:
+            json.dump(state, f)
     except Exception as e:
-        logging.warning(f"Failed to save {timeframe} cache: {e}")
+        logging.warning(f"Failed to save sent_state: {e}")
 
 def cleanup_old_caches(max_age_days=7):
     now = time.time()
@@ -353,27 +345,29 @@ class AsyncProxyPool:
 # === ASYNC REQUESTS & SCANNING ===
 
 async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=4):
+    """
+    Asynchronous HTTP GET with proxy rotation.  If get_next_proxy()
+    returns None, we immediately repopulate the pool and retry.
+    """
     if proxy_manager is None:
         raise ValueError("proxy_manager argument is required")
+
     attempt = 0
     while attempt < max_attempts:
         proxy = proxy_manager.get_next_proxy()
         if proxy is None:
-            logging.warning("No working proxies available, waiting before retry...")
-            await asyncio.sleep(5)
+            logging.warning("No working proxies available → refreshing pool…")
+            # force a repopulate of your proxy pool
+            await proxy_manager.populate_to_max()
             continue
 
-        proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
-
-        endpoint = url.split('/')[-1] if '/' in url else url
-        logging.debug(f"Request to {endpoint}: using proxy {proxy} (attempt {attempt+1}/{max_attempts})")
-
+        proxy_url = proxy if proxy.startswith(("http://","https://")) else f"http://{proxy}"
         try:
             async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
                 if resp.status == 451:
-                    logging.warning(f"Proxy {proxy} returned HTTP 451, blacklisting and retrying with different proxy")
+                    logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure")
                     proxy_manager.mark_proxy_failure(proxy)
-                    continue  # retry immediately without incrementing attempt
+                    continue
 
                 resp.raise_for_status()
                 proxy_manager.reset_proxy_failures(proxy)
@@ -383,11 +377,9 @@ async def make_request_async(session, url, params=None, proxy_manager=None, max_
             logging.error(f"Request failed with proxy {proxy}: {e}")
             proxy_manager.mark_proxy_failure(proxy)
             attempt += 1
-            wait_time = 2 * attempt
-            logging.info(f"Retrying in {wait_time} seconds (attempt {attempt}/{max_attempts})...")
-            await asyncio.sleep(wait_time)
+            await asyncio.sleep(2 * attempt)
 
-    raise RuntimeError(f"Request failed after {max_attempts} attempts")
+    raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts")
 
 async def get_perpetual_usdt_symbols_async(proxy_manager, max_attempts=5):
     for attempt in range(1, max_attempts + 1):
@@ -680,30 +672,34 @@ def send_telegram_alert(bot_token, chat_id, message):
 
 async def main_async():
     start_time = time.time()
-    TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-    TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+    BOT = os.environ["TELEGRAM_BOT_TOKEN"]
+    CHAT = os.environ["TELEGRAM_CHAT_ID"]
 
     try:
         logging.info("Starting BB touch scanner bot…")
         cleanup_old_caches(max_age_days=7)
 
-        # Define cached and uncached timeframes
-        active_timeframes = set(get_active_timeframes())
-        CACHED_TFS = {'4h', '1d', '1w'}
-        UNCACHED_TFS = active_timeframes - CACHED_TFS
+        # 1) Define which TFs are cache‐gated vs always‐fresh
+        CACHED_TFS   = {'4h','1d','1w'}
+        active       = set(get_active_timeframes())
+        UNCACHED_TFS = active - CACHED_TFS
 
-        # === STEP 1: snapshot which cached TFs already have valid cache on disk ===
-        initial_cached = [
-            tf for tf in CACHED_TFS
-            if tf in active_timeframes and load_cache(tf) is not None
-        ]
-        if initial_cached:
-            logging.info(f"Will mark these cached timeframes as loaded from cache: {initial_cached}")
+        # 2) Load last‐sent state and compute which cached TFs rolled to a new candle
+        sent_state = load_sent_state()
+        now_opens  = {
+            tf: get_latest_candle_open(tf).isoformat()
+            for tf in CACHED_TFS if tf in active
+        }
+        # cached TFs to send this run = those whose candle‐open changed
+        to_send_cached = { tf for tf, iso in now_opens.items() if sent_state.get(tf) != iso }
 
-        # === STEP 2: run the scan and learn which TFs were scanned fresh ===
+        logging.info(f"Always-fresh TFs (every run): {sorted(UNCACHED_TFS)}")
+        logging.info(f"Cached TFs sending only now: {sorted(to_send_cached)}")
+
+        # 3) Run the scan
         proxy_pool = AsyncProxyPool(
             sources=PROXY_SOURCES,
-            max_pool_size=20,
+            max_pool_size=25,
             min_working=5,
             check_interval=600,
             max_failures=3
@@ -711,46 +707,50 @@ async def main_async():
         await proxy_pool.initialize()
 
         results, fresh_timeframes = await scan_for_bb_touches_async(proxy_pool)
-        logging.info(f"Freshly scanned timeframes this run: {sorted(fresh_timeframes)}")
 
-        # === STEP 3: format ALL results, badging only TFs in initial_cached ===
-        messages = format_results_by_timeframe(results, cached_timeframes_used=initial_cached)
+        # 4) Format all results (badge initial cache‐loads if you like)
+        initial_cached = [
+            tf for tf in CACHED_TFS
+            if tf in active and load_cache(tf) is not None
+        ]
+        messages = format_results_by_timeframe(
+            results,
+            cached_timeframes_used=initial_cached
+        )
 
-        # === STEP 4: helper to extract timeframe from message header ===
+        # 5) Build the set of TFs we actually want to send this run:
+        #    • all uncached   (always fresh)
+        #    • cached TFs ONLY if their candle rolled (to_send_cached)
+        allowed_tfs = UNCACHED_TFS.union(to_send_cached)
+
         def msg_timeframe(msg: str) -> str:
             m = re.search(r"BB Touches on (\S+) Timeframe", msg)
             return m.group(1) if m else ""
 
-        # === STEP 5: build set of timeframes allowed to send this run ===
-        allowed_timeframes = UNCACHED_TFS.union(fresh_timeframes.intersection(CACHED_TFS))
-        logging.info(f"Will send alerts for these timeframes this run: {sorted(allowed_timeframes)}")
+        to_send = [m for m in messages if msg_timeframe(m) in allowed_tfs]
 
-        # === STEP 6: filter messages to only those timeframes allowed ===
-        to_send = [m for m in messages if msg_timeframe(m) in allowed_timeframes]
-
+        # 6) Dispatch
         if not to_send:
             logging.info("No BB-touch alerts to send this run.")
         else:
-            # === STEP 7: send messages ===
             for i, msg in enumerate(to_send, 1):
                 logging.info(f"Sending message {i}/{len(to_send)}")
-                for idx, chunk in enumerate(split_message(msg), 1):
-                    if len(to_send) > 1:
-                        chunk += f"\n\n_Part {idx} of {len(to_send)}_"
-                    send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, chunk)
+                for chunk in split_message(msg):
+                    send_telegram_alert(BOT, CHAT, chunk)
 
-        elapsed = time.time() - start_time
-        logging.info(f"Bot run completed in {elapsed:.1f}s")
+        # 7) Persist the new sent‐state for cached TFs
+        for tf in to_send_cached:
+            sent_state[tf] = now_opens[tf]
+        save_sent_state(sent_state)
+
+        logging.info(f"Bot run completed in {time.time()-start_time:.1f}s")
 
     except Exception as e:
         elapsed = time.time() - start_time
-        logging.error(f"Fatal error after {elapsed:.2f}s: {e}")
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            error_msg = (
-                f"*⚠️ Scanner Error*\n\n"
-                f"The bot encountered an error after running for {elapsed:.2f}s:\n`{str(e)}`"
-            )
-            send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, error_msg)
+        logging.error(f"Fatal error after {elapsed:.1f}s: {e}")
+        if BOT and CHAT:
+            error_msg = f"*⚠️ Scanner Error*\n`{e}` after {elapsed:.1f}s"
+            send_telegram_alert(BOT, CHAT, error_msg)
 
 if __name__ == "__main__":
     asyncio.run(main_async())
