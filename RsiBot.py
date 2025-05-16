@@ -103,6 +103,37 @@ def get_cache_file_name(timeframe):
     filename = f"bb_touch_cache_{timeframe}_{candle_open.strftime('%Y%m%dT%H%M')}.json"
     return os.path.join(CACHE_DIR, filename)
 
+def load_cache(timeframe):
+    cache_file = get_cache_file_name(timeframe)
+    if not os.path.exists(cache_file):
+        return None
+    try:
+        with open(cache_file, 'r') as f:
+            data = json.load(f)
+        cached_candle_open = datetime.fromisoformat(data.get('candle_open'))
+        latest_candle_open = get_latest_candle_open(timeframe)
+        if cached_candle_open == latest_candle_open:
+            return data.get('results')
+        else:
+            logging.info(f"Cache outdated for {timeframe}, cache candle open: {cached_candle_open}, latest: {latest_candle_open}")
+    except Exception as e:
+        logging.warning(f"Failed to load {timeframe} cache: {e}")
+    return None
+
+def save_cache(timeframe, results):
+    cache_file = get_cache_file_name(timeframe)
+    candle_open = get_latest_candle_open(timeframe)
+    data = {
+        'candle_open': candle_open.isoformat(),
+        'results': results
+    }
+    try:
+        with open(cache_file, 'w') as f:
+            json.dump(data, f)
+        logging.info(f"Cache saved successfully for {timeframe} at {cache_file}")
+    except Exception as e:
+        logging.warning(f"Failed to save {timeframe} cache: {e}")
+
 def load_sent_state() -> dict:
     """
     Load the last candle‐open times we sent alerts for cached TFs.
