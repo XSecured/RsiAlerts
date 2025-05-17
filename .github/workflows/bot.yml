@@ -17,9 +17,10 @@ jobs:
         uses: actions/cache@v3
         with:
           path: bb_touch_cache
-          key: bb-touch-cache-${{ runner.os }}-${{ hashFiles('RsiBot.py') }}
+          key: bb-touch-cache-${{ runner.os }}
           restore-keys: |
             bb-touch-cache-${{ runner.os }}-
+
 
       - name: Cache conda packages
         uses: actions/cache@v3
