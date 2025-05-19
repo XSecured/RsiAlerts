@@ -16,12 +16,12 @@ jobs:
       - name: Cache bb_touch_cache folder
         uses: actions/cache@v3
         with:
-          # a simple, stable key.  Only bumps if you change "v1" to "v2"
+          path: bb_touch_cache
+          # ← a key that stays the same every run until you bump v1→v2
           key: bb-touch-cache-${{ runner.os }}-v1
-          # fallback to any earlier OS‐specific cache if v1 isn’t found
           restore-keys: |
             bb-touch-cache-${{ runner.os }}-
-          path: bb_touch_cache
+
 
       - name: Cache conda packages
         uses: actions/cache@v3
