@@ -9,4 +9,4 @@ dependencies:
   - requests
   - ta-lib
   - aiohttp
-  - aioredis
+  - redis>=4.2.0
