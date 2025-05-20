@@ -9,4 +9,6 @@ dependencies:
   - requests
   - ta-lib
   - aiohttp
-  - redis>=4.2.0
+  - pip
+  - pip:
+    - redis>=4.2.0
