@@ -366,6 +366,101 @@ class AsyncProxyPool:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         
+# === ASYNC REQUESTS & SCANNING ===
+
+async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=4):
+    """
+    Asynchronous HTTP GET with proxy rotation.  If get_next_proxy()
+    returns None, we immediately repopulate the pool and retry.
+    """
+    if proxy_manager is None:
+        raise ValueError("proxy_manager argument is required")
+
+    attempt = 0
+    while attempt < max_attempts:
+        proxy = proxy_manager.get_next_proxy()
+        if proxy is None:
+            logging.warning("No working proxies available → refreshing pool…")
+            # force a repopulate of your proxy pool
+            await proxy_manager.populate_to_max()
+            continue
+
+        proxy_url = proxy if proxy.startswith(("http://","https://")) else f"http://{proxy}"
+        try:
+            async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
+                if resp.status == 451:
+                    logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure")
+                    proxy_manager.mark_proxy_failure(proxy)
+                    continue
+
+                resp.raise_for_status()
+                proxy_manager.reset_proxy_failures(proxy)
+                return await resp.json()
+
+        except Exception as e:
+            logging.error(f"Request failed with proxy {proxy}: {e}")
+            proxy_manager.mark_proxy_failure(proxy)
+            attempt += 1
+            await asyncio.sleep(2 * attempt)
+
+    raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts")
+
+async def get_perpetual_usdt_symbols_async(proxy_manager, max_attempts=5):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
+                symbols = [
+                    s['symbol'] for s in data.get('symbols', [])
+                    if s.get('contractType') == 'PERPETUAL' and s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING'
+                ]
+                if len(symbols) >= 10:
+                    return symbols
+                logging.warning(f"Too few symbols ({len(symbols)}) via proxy, retrying...")
+        except Exception as e:
+            logging.warning(f"Proxy attempt {attempt} failed: {e}")
+        await asyncio.sleep(3)
+    raise RuntimeError("Failed to fetch USDT perpetual symbols via proxies after multiple attempts")
+
+async def fetch_klines_async(session, symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
+    params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+    try:
+        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
+        closes = [float(k[4]) for k in data]
+        timestamps = [k[0] for k in data]
+        return closes, timestamps
+    except Exception as e:
+        logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
+        return None, None
+
+async def get_daily_change_percent_async(session, symbol, proxy_manager):
+    params = {'symbol': symbol, 'interval': '1d', 'limit': 1}
+    try:
+        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
+        if not data or len(data) < 1:
+            return None
+        k = data[-1]
+        daily_open = float(k[1])
+        current_price = float(k[4])
+        if daily_open == 0:
+            return None
+        return (current_price - daily_open) / daily_open * 100
+    except Exception as e:
+        logging.warning(f"Could not fetch daily change for {symbol}: {e}")
+        return None
+
+def calculate_rsi_bb(closes):
+    closes_np = np.array(closes)
+    rsi = talib.RSI(closes_np, timeperiod=RSI_PERIOD)
+    bb_upper, bb_middle, bb_lower = talib.BBANDS(
+        rsi,
+        timeperiod=BB_LENGTH,
+        nbdevup=BB_STDDEV,
+        nbdevdn=BB_STDDEV,
+        matype=0
+    )
+    return rsi, bb_upper, bb_middle, bb_lower
+
 # === SCANNING FUNCTIONS ===
 
 async def load_cache_async(cache_manager: CacheManager, timeframe: str):
