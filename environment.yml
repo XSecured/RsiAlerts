@@ -9,3 +9,4 @@ dependencies:
   - requests
   - ta-lib
   - aiohttp
+  - aioredis
