@@ -14,7 +14,7 @@ import itertools
 import glob
 import re
 from typing import List, Optional
-import aioredis
+import redis.asyncio as aioredis
 
 # === CONFIG & CONSTANTS ===
 
@@ -93,7 +93,11 @@ class CacheManager:
 
     async def initialize(self):
         if self.redis is None:
-            self.redis = await aioredis.from_url(self.redis_url, encoding="utf-8", decode_responses=True)
+            self.redis = await aioredis.from_url(
+                self.redis_url,
+                encoding="utf-8",
+                decode_responses=True
+            )
             logging.info(f"Connected to Redis at {self.redis_url}")
 
     async def close(self):
