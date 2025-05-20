@@ -2,8 +2,9 @@ name: Run BB Touch Bot
 
 on:
   schedule:
-    - cron: '0 * * * *'  # runs every hour at minute 0
-
+    - cron: '0 * * * *'
+  workflow_dispatch:
+  
 jobs:
   run-bot:
     runs-on: ubuntu-latest
