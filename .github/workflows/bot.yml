@@ -2,56 +2,30 @@ name: Run BB Touch Bot
 
 on:
   schedule:
-    - cron: '0 * * * *'  # every hour at minute 0
+    - cron: '0 * * * *'  # runs every hour at minute 0
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     env:
+      REDIS_URL: redis://localhost:6379
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
     steps:
       - uses: actions/checkout@v3
-
-      - name: Set cache key based on 4h, 1d, 1w candle opens
-        id: cache_key
-        run: |
-          # Get current UTC date and hour
-          now=$(date -u +'%Y-%m-%d %H:%M:%S')
-
-          # Function to get candle open time for a timeframe in minutes
-          get_candle_open() {
-            local timeframe_minutes=$1
-            local date_str=$(date -u +'%Y-%m-%d')
-            local hour=$(date -u +'%H')
-            local minute=$(date -u +'%M')
-            local total_minutes=$((10#$hour * 60 + 10#$minute))
-            local intervals_passed=$((total_minutes / timeframe_minutes))
-            local candle_open_minutes=$((intervals_passed * timeframe_minutes))
-            local candle_hour=$((candle_open_minutes / 60))
-            local candle_minute=$((candle_open_minutes % 60))
-            printf "%sT%02d%02d" "$(date -u +'%Y%m%d')" "$candle_hour" "$candle_minute"
-          }
-
-          candle_4h=$(get_candle_open 240)
-          candle_1d=$(date -u +'%Y%m%dT0000')  # daily candle always at midnight UTC
-          # For 1w, get Monday 00:00 UTC of current week
-          candle_1w=$(date -u -d "last-monday 00:00" +'%Y%m%dT%H%M')
-          # If today is Monday before 00:00 UTC, use this Monday, else last Monday
-          # The above command handles that correctly in GNU date
-
-          echo "candle_4h=$candle_4h" >> $GITHUB_OUTPUT
-          echo "candle_1d=$candle_1d" >> $GITHUB_OUTPUT
-          echo "candle_1w=$candle_1w" >> $GITHUB_OUTPUT
-
-          combined_key="${candle_4h}_${candle_1d}_${candle_1w}"
-          echo "combined_key=$combined_key" >> $GITHUB_OUTPUT
-
-      - name: Cache bb_touch_cache folder
-        uses: actions/cache@v3
-        with:
-          path: bb_touch_cache
-          key: bb-touch-cache-${{ runner.os }}-${{ steps.cache_key.outputs.combined_key }}
 
       - name: Cache conda packages
         uses: actions/cache@v3
@@ -67,6 +41,17 @@ jobs:
           environment-file: environment.yml
           activate-environment: bb-touch-bot
           auto-update-conda: true
+
+      - name: Wait for Redis to be ready
+        run: |
+          for i in {1..30}; do
+            if redis-cli -h localhost ping | grep -q PONG; then
+              echo "Redis is ready"
+              break
+            fi
+            echo "Waiting for Redis..."
+            sleep 2
+          done
 
       - name: Run bot
         shell: bash -l {0}
