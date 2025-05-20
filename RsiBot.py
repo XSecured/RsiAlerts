@@ -7,14 +7,14 @@ import talib
 import logging
 import time
 import os
-import threading
 import random
 from datetime import datetime, timedelta
 import json
 import itertools
 import glob
 import re
-from typing import List
+from typing import List, Optional
+import aioredis
 
 # === CONFIG & CONSTANTS ===
 
@@ -26,8 +26,6 @@ logging.basicConfig(
 
 CACHE_DIR = "bb_touch_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
-
-SENT_STATE_FILE = os.path.join(CACHE_DIR, "sent_state.json")
 
 BINANCE_FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
@@ -77,23 +75,83 @@ TIMEFRAME_MINUTES_MAP = {
     '12h': 720, '1d': 1440, '1w': 10080
 }
 
-# === CACHE UTILITIES ===
+# TTL for cached timeframes in seconds (candle duration + buffer)
+CACHE_TTL_SECONDS = {
+    '4h': 4 * 3600 + 600,    # 4h + 10min buffer
+    '1d': 24 * 3600 + 1800,  # 1d + 30min buffer
+    '1w': 7 * 24 * 3600 + 3600,  # 1w + 1h buffer
+}
+
+CACHED_TFS = {'4h', '1d', '1w'}
+
+# === Cache Manager using Redis ===
+
+class CacheManager:
+    def __init__(self, redis_url="redis://localhost:6379"):
+        self.redis_url = redis_url
+        self.redis = None
+
+    async def initialize(self):
+        if self.redis is None:
+            self.redis = await aioredis.from_url(self.redis_url, encoding="utf-8", decode_responses=True)
+            logging.info(f"Connected to Redis at {self.redis_url}")
+
+    async def close(self):
+        if self.redis:
+            await self.redis.close()
+            self.redis = None
+            logging.info("Redis connection closed")
+
+    def _scan_key(self, timeframe: str, candle_open_iso: str) -> str:
+        return f"bb_touch:scan:{timeframe}:{candle_open_iso}"
+
+    def _sent_state_key(self) -> str:
+        return "bb_touch:sent_state"
+
+    async def get_scan_results(self, timeframe: str, candle_open_iso: str) -> Optional[list]:
+        key = self._scan_key(timeframe, candle_open_iso)
+        data = await self.redis.get(key)
+        if data:
+            try:
+                return json.loads(data)
+            except Exception as e:
+                logging.warning(f"Failed to decode cache data for {key}: {e}")
+        return None
+
+    async def set_scan_results(self, timeframe: str, candle_open_iso: str, results: list, ttl_seconds: int):
+        key = self._scan_key(timeframe, candle_open_iso)
+        try:
+            await self.redis.set(key, json.dumps(results), ex=ttl_seconds)
+            logging.info(f"Cache set for {key} with TTL {ttl_seconds}s")
+        except Exception as e:
+            logging.warning(f"Failed to set cache for {key}: {e}")
+
+    async def get_sent_state(self) -> dict:
+        key = self._sent_state_key()
+        data = await self.redis.get(key)
+        if data:
+            try:
+                return json.loads(data)
+            except Exception as e:
+                logging.warning(f"Failed to decode sent state: {e}")
+        return {}
+
+    async def set_sent_state(self, state: dict):
+        key = self._sent_state_key()
+        try:
+            await self.redis.set(key, json.dumps(state))
+            logging.info("Sent state updated")
+        except Exception as e:
+            logging.warning(f"Failed to update sent state: {e}")
+
+# === UTILITY FUNCTIONS ===
 
 def get_active_timeframes():
     return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
 
-CACHED_TFS   = {'4h','1d','1w'}
-# uncached = everything else that you have enabled
-UNCACHED_TFS = set(get_active_timeframes()) - CACHED_TFS
-
 def get_latest_candle_open(timeframe: str, now=None):
     if now is None:
         now = datetime.utcnow()
-    TIMEFRAME_MINUTES_MAP = {
-        '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
-        '1h': 60, '2h': 120, '4h': 240, '6h': 360, '8h': 480,
-        '12h': 720, '1d': 1440, '1w': 10080
-    }
     if timeframe not in TIMEFRAME_MINUTES_MAP:
         raise ValueError(f"Unknown timeframe: {timeframe}")
     interval_minutes = TIMEFRAME_MINUTES_MAP[timeframe]
@@ -102,93 +160,8 @@ def get_latest_candle_open(timeframe: str, now=None):
     candle_open_minutes = intervals_passed * interval_minutes
     candle_open = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=candle_open_minutes)
     return candle_open
-    
-def get_cache_file_name(timeframe):
-    candle_open = get_latest_candle_open(timeframe)
-    filename = f"bb_touch_cache_{timeframe}_{candle_open.strftime('%Y%m%dT%H%M')}.json"
-    return os.path.join(CACHE_DIR, filename)
 
-def load_cache(timeframe):
-    cache_file = get_cache_file_name(timeframe)
-    if not os.path.exists(cache_file):
-        return None
-    try:
-        with open(cache_file, 'r') as f:
-            data = json.load(f)
-        cached_candle_open = datetime.fromisoformat(data.get('candle_open'))
-        latest_candle_open = get_latest_candle_open(timeframe)
-        if cached_candle_open == latest_candle_open:
-            return data.get('results')
-        else:
-            logging.info(f"Cache outdated for {timeframe}, cache candle open: {cached_candle_open}, latest: {latest_candle_open}")
-    except Exception as e:
-        logging.warning(f"Failed to load {timeframe} cache: {e}")
-    return None
-
-SENT_STATE_FILE = os.path.join(CACHE_DIR, "sent_state.json")
-
-def save_cache(timeframe, results):
-    cache_file = get_cache_file_name(timeframe)
-    candle_open = get_latest_candle_open(timeframe)
-    data = {
-        'candle_open': candle_open.isoformat(),
-        'results': results
-    }
-    try:
-        with open(cache_file, 'w') as f:
-            json.dump(data, f)
-        logging.info(f"Cache saved successfully for {timeframe} at {cache_file}")
-    except Exception as e:
-        logging.warning(f"Failed to save {timeframe} cache: {e}")
-
-def load_sent_state() -> dict:
-    """
-    Load the last candle‐open times we sent alerts for cached TFs.
-    Returns a dict: { timeframe_str: isoformat_str }
-    """
-    if not os.path.exists(SENT_STATE_FILE):
-        return {}
-    try:
-        with open(SENT_STATE_FILE, 'r') as f:
-            data = json.load(f)
-        # Validate keys and isoformat strings
-        for tf in CACHED_TFS:
-            if tf in data:
-                datetime.fromisoformat(data[tf])  # will raise if invalid
-        return data
-    except Exception as e:
-        logging.warning(f"Failed to load sent_state.json: {e}")
-        return {}
-
-def save_sent_state(state: dict):
-    """
-    Persist the last candle‐open times for cached TFs.
-    """
-    try:
-        with open(SENT_STATE_FILE, 'w') as f:
-            json.dump(state, f)
-        logging.info(f"Sent state saved to {SENT_STATE_FILE}")
-    except Exception as e:
-        logging.warning(f"Failed to save sent_state.json: {e}")
-
-def cleanup_old_caches(max_age_days=7):
-    now = time.time()
-    max_age_seconds = max_age_days * 86400
-    pattern = os.path.join(CACHE_DIR, "bb_touch_cache_*.json")
-    files = glob.glob(pattern)
-    deleted_files = 0
-    for file_path in files:
-        try:
-            file_age = now - os.path.getmtime(file_path)
-            if file_age > max_age_seconds:
-                os.remove(file_path)
-                deleted_files += 1
-        except Exception as e:
-            logging.warning(f"Failed to delete old cache file {file_path}: {e}")
-    if deleted_files > 0:
-        logging.info(f"Cleaned up {deleted_files} old cache files older than {max_age_days} days.")
-
-# === ASYNC PROXY POOL ===
+# === ASYNC PROXY POOL & REQUESTS ===
 
 async def fetch_proxies_from_url_async(url: str, default_scheme: str = "http") -> List[str]:
     proxies = []
@@ -388,103 +361,23 @@ class AsyncProxyPool:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        
+# === SCANNING FUNCTIONS ===
 
-# === ASYNC REQUESTS & SCANNING ===
+async def load_cache_async(cache_manager: CacheManager, timeframe: str):
+    candle_open = get_latest_candle_open(timeframe).isoformat()
+    return await cache_manager.get_scan_results(timeframe, candle_open)
 
-async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=4):
-    """
-    Asynchronous HTTP GET with proxy rotation.  If get_next_proxy()
-    returns None, we immediately repopulate the pool and retry.
-    """
-    if proxy_manager is None:
-        raise ValueError("proxy_manager argument is required")
+async def save_cache_async(cache_manager: CacheManager, timeframe: str, results: list):
+    candle_open = get_latest_candle_open(timeframe).isoformat()
+    ttl = CACHE_TTL_SECONDS.get(timeframe, 3600)
+    await cache_manager.set_scan_results(timeframe, candle_open, results, ttl)
 
-    attempt = 0
-    while attempt < max_attempts:
-        proxy = proxy_manager.get_next_proxy()
-        if proxy is None:
-            logging.warning("No working proxies available → refreshing pool…")
-            # force a repopulate of your proxy pool
-            await proxy_manager.populate_to_max()
-            continue
+async def load_sent_state_async(cache_manager: CacheManager):
+    return await cache_manager.get_sent_state()
 
-        proxy_url = proxy if proxy.startswith(("http://","https://")) else f"http://{proxy}"
-        try:
-            async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
-                if resp.status == 451:
-                    logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure")
-                    proxy_manager.mark_proxy_failure(proxy)
-                    continue
-
-                resp.raise_for_status()
-                proxy_manager.reset_proxy_failures(proxy)
-                return await resp.json()
-
-        except Exception as e:
-            logging.error(f"Request failed with proxy {proxy}: {e}")
-            proxy_manager.mark_proxy_failure(proxy)
-            attempt += 1
-            await asyncio.sleep(2 * attempt)
-
-    raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts")
-
-async def get_perpetual_usdt_symbols_async(proxy_manager, max_attempts=5):
-    for attempt in range(1, max_attempts + 1):
-        try:
-            async with aiohttp.ClientSession() as session:
-                data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
-                symbols = [
-                    s['symbol'] for s in data.get('symbols', [])
-                    if s.get('contractType') == 'PERPETUAL' and s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING'
-                ]
-                if len(symbols) >= 10:
-                    return symbols
-                logging.warning(f"Too few symbols ({len(symbols)}) via proxy, retrying...")
-        except Exception as e:
-            logging.warning(f"Proxy attempt {attempt} failed: {e}")
-        await asyncio.sleep(3)
-    raise RuntimeError("Failed to fetch USDT perpetual symbols via proxies after multiple attempts")
-
-async def fetch_klines_async(session, symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
-    params = {'symbol': symbol, 'interval': interval, 'limit': limit}
-    try:
-        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
-        closes = [float(k[4]) for k in data]
-        timestamps = [k[0] for k in data]
-        return closes, timestamps
-    except Exception as e:
-        logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
-        return None, None
-
-async def get_daily_change_percent_async(session, symbol, proxy_manager):
-    params = {'symbol': symbol, 'interval': '1d', 'limit': 1}
-    try:
-        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
-        if not data or len(data) < 1:
-            return None
-        k = data[-1]
-        daily_open = float(k[1])
-        current_price = float(k[4])
-        if daily_open == 0:
-            return None
-        return (current_price - daily_open) / daily_open * 100
-    except Exception as e:
-        logging.warning(f"Could not fetch daily change for {symbol}: {e}")
-        return None
-
-def calculate_rsi_bb(closes):
-    closes_np = np.array(closes)
-    rsi = talib.RSI(closes_np, timeperiod=RSI_PERIOD)
-    bb_upper, bb_middle, bb_lower = talib.BBANDS(
-        rsi,
-        timeperiod=BB_LENGTH,
-        nbdevup=BB_STDDEV,
-        nbdevdn=BB_STDDEV,
-        matype=0
-    )
-    return rsi, bb_upper, bb_middle, bb_lower
-
-# === SCANNING ===
+async def save_sent_state_async(cache_manager: CacheManager, state: dict):
+    await cache_manager.set_sent_state(state)
 
 async def scan_symbol_async(symbol, timeframes, proxy_manager):
     results = []
@@ -548,38 +441,33 @@ async def scan_symbol_async(symbol, timeframes, proxy_manager):
 
                 results.append(item)
 
-                #logging.info(f"Alert: {symbol} on {timeframe} timeframe touching {touch_type} BB line at {timestamp} {'🔥' if hot else ''}")
-
     return results
 
-async def scan_for_bb_touches_async(proxy_manager):
+async def scan_for_bb_touches_async(proxy_manager, cache_manager):
     symbols = await get_perpetual_usdt_symbols_async(proxy_manager)
     results = []
     batch_size = 70
     active_timeframes = get_active_timeframes()
 
-    # Timeframes that use caching
-    cached_timeframes = ['1w', '1d', '4h']
-    cached_results = {}
-
-    # Timeframes that do not use caching
+    cached_timeframes = [tf for tf in CACHED_TFS if tf in active_timeframes]
     uncached_timeframes = [tf for tf in active_timeframes if tf not in cached_timeframes]
 
-    # Load cache for cached timeframes
+    cached_results = {}
+
+    # Load cached results
     for timeframe in cached_timeframes:
-        if timeframe in active_timeframes:
-            cached_results[timeframe] = load_cache(timeframe)
-            if cached_results[timeframe] is not None:
-                logging.info(f"[CACHE] Loaded {timeframe} timeframe results from cache")
-            else:
-                logging.info(f"[CACHE] No valid cache found for {timeframe}, will scan fresh")
+        cached_results[timeframe] = await load_cache_async(cache_manager, timeframe)
+        if cached_results[timeframe] is not None:
+            logging.info(f"[CACHE] Loaded {timeframe} timeframe results from cache")
+        else:
+            logging.info(f"[CACHE] No valid cache found for {timeframe}, will scan fresh")
 
     total_symbols = len(symbols)
     fresh_timeframes = set()
 
-    # Scan cached timeframes that have no valid cache (fresh scan)
+    # Scan cached timeframes missing cache
     for timeframe in cached_timeframes:
-        if timeframe in active_timeframes and cached_results.get(timeframe) is None:
+        if cached_results.get(timeframe) is None:
             logging.info(f"[SCAN] Scanning {timeframe} timeframe fresh data...")
             timeframe_results = []
             for i in range(0, total_symbols, batch_size):
@@ -591,12 +479,12 @@ async def scan_for_bb_touches_async(proxy_manager):
                         logging.error(f"Error scanning {timeframe} timeframe: {res}")
                     else:
                         timeframe_results.extend(res)
-            save_cache(timeframe, timeframe_results)
+            await save_cache_async(cache_manager, timeframe, timeframe_results)
             cached_results[timeframe] = timeframe_results
             fresh_timeframes.add(timeframe)
             logging.info(f"[CACHE] Saved fresh scan results for {timeframe}")
 
-    # Scan uncached timeframes all at once (always fresh)
+    # Scan uncached timeframes fresh every run
     uncached_results = []
     if uncached_timeframes:
         logging.info(f"[SCAN] Scanning uncached timeframes: {uncached_timeframes}")
@@ -621,7 +509,7 @@ async def scan_for_bb_touches_async(proxy_manager):
 
     return results, fresh_timeframes
 
-# === Formatting and Telegram sending ===
+# === FORMATTING & TELEGRAM SENDING ===
 
 def format_results_by_timeframe(results, cached_timeframes_used=None):
     if not results:
@@ -715,35 +603,31 @@ def send_telegram_alert(bot_token, chat_id, message):
         logging.error(f"Exception sending Telegram alert: {e}")
         return False
 
-# === Async main entry point ===
+# === MAIN ASYNC ENTRY POINT ===
 
 async def main_async():
     start_time = time.time()
-    BOT = os.environ["TELEGRAM_BOT_TOKEN"]
-    CHAT = os.environ["TELEGRAM_CHAT_ID"]
+    BOT = os.environ.get("TELEGRAM_BOT_TOKEN")
+    CHAT = os.environ.get("TELEGRAM_CHAT_ID")
+    REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+
+    cache_manager = CacheManager(redis_url=REDIS_URL)
+    await cache_manager.initialize()
 
     try:
         logging.info("Starting BB touch scanner bot…")
-        cleanup_old_caches(max_age_days=7)
 
-        # 1) Define which TFs are cache‐gated vs always‐fresh
-        CACHED_TFS   = {'4h','1d','1w'}
-        active       = set(get_active_timeframes())
-        UNCACHED_TFS = active - CACHED_TFS
+        # Load last sent state and compute candle opens
+        sent_state = await load_sent_state_async(cache_manager)
 
-        # 2) Load last‐sent state and compute which cached TFs rolled to a new candle
-        sent_state = load_sent_state()
-        now_opens  = {
-            tf: get_latest_candle_open(tf).isoformat()
-            for tf in CACHED_TFS if tf in active
-        }
-        # cached TFs to send this run = those whose candle‐open changed
-        to_send_cached = { tf for tf, iso in now_opens.items() if sent_state.get(tf) != iso }
+        active = set(get_active_timeframes())
+        now_opens = {tf: get_latest_candle_open(tf).isoformat() for tf in CACHED_TFS if tf in active}
+        to_send_cached = {tf for tf, iso in now_opens.items() if sent_state.get(tf) != iso}
 
-        logging.info(f"Always-fresh TFs (every run): {sorted(UNCACHED_TFS)}")
+        logging.info(f"Always-fresh TFs (every run): {sorted(active - CACHED_TFS)}")
         logging.info(f"Cached TFs sending only now: {sorted(to_send_cached)}")
 
-        # 3) Run the scan
+        # Initialize proxy pool (your existing code)
         proxy_pool = AsyncProxyPool(
             sources=PROXY_SOURCES,
             max_pool_size=25,
@@ -753,22 +637,15 @@ async def main_async():
         )
         await proxy_pool.initialize()
 
-        results, fresh_timeframes = await scan_for_bb_touches_async(proxy_pool)
+        # Scan for BB touches
+        results, fresh_timeframes = await scan_for_bb_touches_async(proxy_pool, cache_manager)
 
-        # 4) Format all results (badge initial cache‐loads if you like)
-        initial_cached = [
-            tf for tf in CACHED_TFS
-            if tf in active and load_cache(tf) is not None
-        ]
-        messages = format_results_by_timeframe(
-            results,
-            cached_timeframes_used=initial_cached
-        )
+        # Format messages
+        initial_cached = [tf for tf in CACHED_TFS if tf in active and await load_cache_async(cache_manager, tf) is not None]
+        messages = format_results_by_timeframe(results, cached_timeframes_used=initial_cached)
 
-        # 5) Build the set of TFs we actually want to send this run:
-        #    • all uncached   (always fresh)
-        #    • cached TFs ONLY if their candle rolled (to_send_cached)
-        allowed_tfs = UNCACHED_TFS.union(to_send_cached)
+        # Filter messages to send
+        allowed_tfs = (active - CACHED_TFS).union(to_send_cached)
 
         def msg_timeframe(msg: str) -> str:
             m = re.search(r"BB Touches on (\S+) Timeframe", msg)
@@ -776,7 +653,7 @@ async def main_async():
 
         to_send = [m for m in messages if msg_timeframe(m) in allowed_tfs]
 
-        # 6) Dispatch
+        # Dispatch alerts
         if not to_send:
             logging.info("No BB-touch alerts to send this run.")
         else:
@@ -785,10 +662,10 @@ async def main_async():
                 for chunk in split_message(msg):
                     send_telegram_alert(BOT, CHAT, chunk)
 
-        # 7) Persist the new sent‐state for cached TFs
+        # Update sent state for cached TFs sent
         for tf in to_send_cached:
             sent_state[tf] = now_opens[tf]
-        save_sent_state(sent_state)
+        await save_sent_state_async(cache_manager, sent_state)
 
         logging.info(f"Bot run completed in {time.time()-start_time:.1f}s")
 
@@ -798,6 +675,9 @@ async def main_async():
         if BOT and CHAT:
             error_msg = f"*⚠️ Scanner Error*\n`{e}` after {elapsed:.1f}s"
             send_telegram_alert(BOT, CHAT, error_msg)
+
+    finally:
+        await cache_manager.close()
 
 if __name__ == "__main__":
     asyncio.run(main_async())
