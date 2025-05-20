@@ -89,6 +89,11 @@ UNCACHED_TFS = set(get_active_timeframes()) - CACHED_TFS
 def get_latest_candle_open(timeframe: str, now=None):
     if now is None:
         now = datetime.utcnow()
+    TIMEFRAME_MINUTES_MAP = {
+        '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
+        '1h': 60, '2h': 120, '4h': 240, '6h': 360, '8h': 480,
+        '12h': 720, '1d': 1440, '1w': 10080
+    }
     if timeframe not in TIMEFRAME_MINUTES_MAP:
         raise ValueError(f"Unknown timeframe: {timeframe}")
     interval_minutes = TIMEFRAME_MINUTES_MAP[timeframe]
@@ -97,7 +102,7 @@ def get_latest_candle_open(timeframe: str, now=None):
     candle_open_minutes = intervals_passed * interval_minutes
     candle_open = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=candle_open_minutes)
     return candle_open
-
+    
 def get_cache_file_name(timeframe):
     candle_open = get_latest_candle_open(timeframe)
     filename = f"bb_touch_cache_{timeframe}_{candle_open.strftime('%Y%m%dT%H%M')}.json"
@@ -120,6 +125,8 @@ def load_cache(timeframe):
         logging.warning(f"Failed to load {timeframe} cache: {e}")
     return None
 
+SENT_STATE_FILE = os.path.join(CACHE_DIR, "sent_state.json")
+
 def save_cache(timeframe, results):
     cache_file = get_cache_file_name(timeframe)
     candle_open = get_latest_candle_open(timeframe)
@@ -139,10 +146,18 @@ def load_sent_state() -> dict:
     Load the last candle‐open times we sent alerts for cached TFs.
     Returns a dict: { timeframe_str: isoformat_str }
     """
+    if not os.path.exists(SENT_STATE_FILE):
+        return {}
     try:
         with open(SENT_STATE_FILE, 'r') as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+        # Validate keys and isoformat strings
+        for tf in CACHED_TFS:
+            if tf in data:
+                datetime.fromisoformat(data[tf])  # will raise if invalid
+        return data
+    except Exception as e:
+        logging.warning(f"Failed to load sent_state.json: {e}")
         return {}
 
 def save_sent_state(state: dict):
@@ -152,8 +167,9 @@ def save_sent_state(state: dict):
     try:
         with open(SENT_STATE_FILE, 'w') as f:
             json.dump(state, f)
+        logging.info(f"Sent state saved to {SENT_STATE_FILE}")
     except Exception as e:
-        logging.warning(f"Failed to save sent_state: {e}")
+        logging.warning(f"Failed to save sent_state.json: {e}")
 
 def cleanup_old_caches(max_age_days=7):
     now = time.time()
