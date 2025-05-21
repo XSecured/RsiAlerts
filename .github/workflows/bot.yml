@@ -9,19 +9,8 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
 
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     env:
-      REDIS_URL: redis://localhost:6379
+      REDIS_URL: ${{ secrets.REDIS_URL }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
@@ -42,17 +31,6 @@ jobs:
           environment-file: environment.yml
           activate-environment: bb-touch-bot
           auto-update-conda: true
-
-      - name: Wait for Redis to be ready
-        run: |
-          for i in {1..30}; do
-            if redis-cli -h localhost ping | grep -q PONG; then
-              echo "Redis is ready"
-              break
-            fi
-            echo "Waiting for Redis..."
-            sleep 2
-          done
 
       - name: Run bot
         shell: bash -l {0}
