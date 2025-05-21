@@ -87,8 +87,8 @@ CACHED_TFS = {'4h', '1d', '1w'}
 # === Cache Manager using Redis ===
 
 class CacheManager:
-    def __init__(self, redis_url="redis://localhost:6379"):
-        self.redis_url = redis_url
+    def __init__(self, redis_url=None):
+        self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379")
         self.redis = None
 
     async def initialize(self):
