@@ -287,37 +287,37 @@ class AsyncProxyPool:
             await self.update_fastest_proxy()
 
     async def populate_to_max(self):
-    """Faster, more aggressive proxy replenishment"""
-    async with self._proxy_lock:
-        needed = self.max_pool_size - len(self.proxies)
-        if needed <= 0:
-            return
+        """Faster, more aggressive proxy replenishment"""
+        async with self._proxy_lock:
+            needed = self.max_pool_size - len(self.proxies)
+            if needed <= 0:
+                return
             
-        # Clear blacklist if we're running low on proxies
-        if len(self.proxies) < self.min_working:
-            logging.warning("Running low on proxies, clearing blacklist")
-            self.blacklisted.clear()
-            self.failed.clear()
-            self.failures.clear()
+            # Clear blacklist if we're running low on proxies
+            if len(self.proxies) < self.min_working:
+                logging.warning("Running low on proxies, clearing blacklist")
+                self.blacklisted.clear()
+                self.failed.clear()
+                self.failures.clear()
         
-        new_list = []
-        for src in self.sources:
-            fetched = await fetch_proxies_from_url_async(src)
-            # Filter out already blacklisted proxies
-            fetched = [p for p in fetched if p not in self.blacklisted]
-            new_list.extend(fetched)
-            if len(new_list) >= needed * 2:
-                break
+            new_list = []
+            for src in self.sources:
+                fetched = await fetch_proxies_from_url_async(src)
+                # Filter out already blacklisted proxies
+                fetched = [p for p in fetched if p not in self.blacklisted]
+                new_list.extend(fetched)
+                if len(new_list) >= needed * 2:
+                    break
                 
-        working = await test_proxies_concurrently_async(
-            new_list, 
-            max_workers=100,  # Increase workers for faster testing
-            max_working=needed
-        )
+            working = await test_proxies_concurrently_async(
+                new_list, 
+                max_workers=100,  # Increase workers for faster testing
+                max_working=needed
+            )
         
-        self.proxies.extend(working)
-        self._rebuild_cycle()
-        logging.info(f"Pool populated: {len(self.proxies)}/{self.max_pool_size}")
+            self.proxies.extend(working)
+            self._rebuild_cycle()
+            logging.info(f"Pool populated: {len(self.proxies)}/{self.max_pool_size}")
 
     def _rebuild_cycle(self):
         self.cycle = itertools.cycle(self.proxies)
