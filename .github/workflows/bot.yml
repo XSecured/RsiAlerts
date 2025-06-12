@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
-  
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -17,25 +17,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Cache conda environment and packages
       - name: Cache conda environment
         uses: actions/cache@v4
         with:
           path: |
             ~/miniconda3/envs/bb-touch-bot
             ~/miniconda3/pkgs
-          key: ${{ runner.os }}-conda-env-${{ hashFiles('environment.yml') }}
+          key: ${{ runner.os }}-conda-${{ hashFiles('environment.yml') }}
           restore-keys: |
-            ${{ runner.os }}-conda-env-
+            ${{ runner.os }}-conda-
 
-      # Use newer version to fix deprecation warning
       - name: Set up Miniconda and create environment
-        uses: conda-incubator/setup-miniconda@v3
+        uses: conda-incubator/setup-miniconda@v2
         with:
           environment-file: environment.yml
           activate-environment: bb-touch-bot
-          auto-update-conda: false  # Disable auto-update for faster runs
-          use-mamba: true          # Use mamba for faster package resolution
+          python-version: '3.10'
+          auto-update-conda: false
+          use-mamba: true
 
       - name: Run bot
         shell: bash -l {0}
