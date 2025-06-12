@@ -260,6 +260,8 @@ class AsyncProxyPool:
         self.min_working = min_working
         self.check_interval = check_interval
         self.max_failures = max_failures
+        self.blacklisted = set()           # Add immediate blacklist
+        self._proxy_lock = asyncio.Lock()  # Add lock for thread safety
 
         self.proxies: List[str] = []
         self.failures = {}          # proxy -> count
@@ -285,16 +287,34 @@ class AsyncProxyPool:
             await self.update_fastest_proxy()
 
     async def populate_to_max(self):
+    """Faster, more aggressive proxy replenishment"""
+    async with self._proxy_lock:
         needed = self.max_pool_size - len(self.proxies)
         if needed <= 0:
             return
+            
+        # Clear blacklist if we're running low on proxies
+        if len(self.proxies) < self.min_working:
+            logging.warning("Running low on proxies, clearing blacklist")
+            self.blacklisted.clear()
+            self.failed.clear()
+            self.failures.clear()
+        
         new_list = []
         for src in self.sources:
             fetched = await fetch_proxies_from_url_async(src)
+            # Filter out already blacklisted proxies
+            fetched = [p for p in fetched if p not in self.blacklisted]
             new_list.extend(fetched)
             if len(new_list) >= needed * 2:
                 break
-        working = await test_proxies_concurrently_async(new_list, max_workers=50, max_working=needed)
+                
+        working = await test_proxies_concurrently_async(
+            new_list, 
+            max_workers=100,  # Increase workers for faster testing
+            max_working=needed
+        )
+        
         self.proxies.extend(working)
         self._rebuild_cycle()
         logging.info(f"Pool populated: {len(self.proxies)}/{self.max_pool_size}")
@@ -302,34 +322,55 @@ class AsyncProxyPool:
     def _rebuild_cycle(self):
         self.cycle = itertools.cycle(self.proxies)
 
-    def get_next_proxy(self) -> str:
-        if not self.proxies:
-            return None
-        for _ in range(len(self.proxies)):
-            p = next(self.cycle)
-            if p not in self.failed:
-                return p
-        return None
-
-    def mark_proxy_failure(self, proxy: str):
-        c = self.failures.get(proxy, 0) + 1
-        self.failures[proxy] = c
-        logging.warning(f"Proxy {proxy} failure {c}/{self.max_failures}")
-        if c >= self.max_failures:
-            self.failed.add(proxy)
-            if proxy in self.proxies:
-                self.proxies.remove(proxy)
-                logging.warning(f"Removed {proxy} from pool")
+    async def get_next_proxy(self) -> str:
+        """Thread-safe proxy selection with immediate blacklisting"""
+        async with self._proxy_lock:
+            if not self.proxies:
+                return None
+                
+            # Remove blacklisted proxies from active pool immediately
+            self.proxies = [p for p in self.proxies if p not in self.blacklisted]
+            if not self.proxies:
+                return None
+                
             self._rebuild_cycle()
+            
+            for _ in range(len(self.proxies)):
+                proxy = next(self.cycle)
+                if proxy not in self.blacklisted and proxy not in self.failed:
+                    return proxy
+            return None
 
-    def reset_proxy_failures(self, proxy: str):
-        if proxy in self.failures:
-            self.failures[proxy] = 0
-        if proxy in self.failed:
-            self.failed.remove(proxy)
-            if proxy not in self.proxies:
-                self.proxies.append(proxy)
-                self._rebuild_cycle()
+    async def mark_proxy_failure(self, proxy: str):
+        """Immediately blacklist problematic proxies"""
+        async with self._proxy_lock:
+            c = self.failures.get(proxy, 0) + 1
+            self.failures[proxy] = c
+            
+            logging.warning(f"Proxy {proxy} failure {c}/{self.max_failures}")
+            
+            if c >= self.max_failures:
+                # Immediate blacklisting
+                self.blacklisted.add(proxy)
+                self.failed.add(proxy)
+                
+                if proxy in self.proxies:
+                    self.proxies.remove(proxy)
+                    logging.warning(f"Removed {proxy} from pool")
+                    self._rebuild_cycle()
+
+    async def reset_proxy_failures(self, proxy: str):
+        """Reset failures and remove from blacklist"""
+        async with self._proxy_lock:
+            if proxy in self.failures:
+                self.failures[proxy] = 0
+            if proxy in self.failed:
+                self.failed.remove(proxy)
+            if proxy in self.blacklisted:
+                self.blacklisted.remove(proxy)
+                if proxy not in self.proxies:
+                    self.proxies.append(proxy)
+                    self._rebuild_cycle()
 
     async def check_proxies(self):
         if not self.proxies:
@@ -369,39 +410,51 @@ class AsyncProxyPool:
 # === ASYNC REQUESTS & SCANNING ===
 
 async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=4):
-    """
-    Asynchronous HTTP GET with proxy rotation.  If get_next_proxy()
-    returns None, we immediately repopulate the pool and retry.
-    """
-    if proxy_manager is None:
-        raise ValueError("proxy_manager argument is required")
-
+    """Fixed request function with proper proxy handling"""
+    
     attempt = 0
+    used_proxies = set()  # Track proxies used in this request
+    
     while attempt < max_attempts:
-        proxy = proxy_manager.get_next_proxy()
+        proxy = await proxy_manager.get_next_proxy()  # Make it async
+        
         if proxy is None:
             logging.warning("No working proxies available → refreshing pool…")
-            # force a repopulate of your proxy pool
             await proxy_manager.populate_to_max()
+            proxy = await proxy_manager.get_next_proxy()
+            
+            if proxy is None:
+                logging.error("Still no proxies after repopulation")
+                break
+                
+        # Skip if we already tried this proxy in this request
+        if proxy in used_proxies:
+            attempt += 1
             continue
-
+            
+        used_proxies.add(proxy)
         proxy_url = proxy if proxy.startswith(("http://","https://")) else f"http://{proxy}"
+        
         try:
             async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
                 if resp.status == 451:
                     logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure")
-                    proxy_manager.mark_proxy_failure(proxy)
+                    await proxy_manager.mark_proxy_failure(proxy)  # Make it async
+                    attempt += 1
                     continue
 
                 resp.raise_for_status()
-                proxy_manager.reset_proxy_failures(proxy)
+                await proxy_manager.reset_proxy_failures(proxy)  # Make it async
                 return await resp.json()
 
         except Exception as e:
             logging.error(f"Request failed with proxy {proxy}: {e}")
-            proxy_manager.mark_proxy_failure(proxy)
+            await proxy_manager.mark_proxy_failure(proxy)  # Make it async
             attempt += 1
-            await asyncio.sleep(2 * attempt)
+            
+            # Only sleep if we're going to retry
+            if attempt < max_attempts:
+                await asyncio.sleep(min(2 * attempt, 10))  # Cap the sleep time
 
     raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts")
 
