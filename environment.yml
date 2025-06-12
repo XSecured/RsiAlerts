@@ -3,12 +3,10 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.11
+  - python=3.10
   - pandas
-  - numpy
+  - numpy  
   - requests
   - ta-lib
   - aiohttp
-  - pip
-  - pip:
-    - redis>=4.2.0
+  - redis-py>=4.2.0  # Use conda version instead of pip
