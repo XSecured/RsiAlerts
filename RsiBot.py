@@ -102,7 +102,7 @@ class CacheManager:
 
     async def close(self):
         if self.redis:
-            await self.redis.close()
+            await self.redis.aclose()
             self.redis = None
             logging.info("Redis connection closed")
 
