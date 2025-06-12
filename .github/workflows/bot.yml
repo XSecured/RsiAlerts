@@ -17,13 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache conda environment
+      # Cache only the conda packages (recommended approach)
+      - name: Cache conda packages
         uses: actions/cache@v4
+        env:
+          CACHE_NUMBER: 0  # Increment to reset cache
         with:
-          path: |
-            ~/miniconda3/envs/bb-touch-bot
-            ~/miniconda3/pkgs
-          key: ${{ runner.os }}-conda-${{ hashFiles('environment.yml') }}
+          path: ~/conda_pkgs_dir
+          key: ${{ runner.os }}-conda-${{ env.CACHE_NUMBER }}-${{ hashFiles('environment.yml') }}
           restore-keys: |
             ${{ runner.os }}-conda-
 
@@ -35,6 +36,7 @@ jobs:
           python-version: '3.10'
           auto-update-conda: false
           use-mamba: true
+          use-only-tar-bz2: true  # IMPORTANT: Required for package caching!
 
       - name: Run bot
         shell: bash -l {0}
