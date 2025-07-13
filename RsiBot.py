@@ -563,8 +563,7 @@ async def scan_symbol_async(symbol, timeframes, proxy_manager):
             upper_touch = rsi_val >= bb_upper_val * (1 - UPPER_TOUCH_THRESHOLD)
             lower_touch = rsi_val <= bb_lower_val * (1 + LOWER_TOUCH_THRESHOLD)
             middle_touch = False
-
-              direction = None
+            direction = None
               
               if MIDDLE_BAND_TOGGLE.get(timeframe, False):
                   if not upper_touch and not lower_touch:
