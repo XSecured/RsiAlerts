@@ -566,23 +566,21 @@ async def scan_symbol_async(symbol, timeframes, proxy_manager):
             direction = None
               
             if MIDDLE_BAND_TOGGLE.get(timeframe, False):
-                if not upper_touch and not lower_touch:
-                    if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
-                        middle_touch = True
+                if not upper_touch and not lower_touch \
+                   and abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
+                    middle_touch = True
             
-                        # 1) Look for an actual cross
-                        prev_rsi       = rsi[idx-1]
-                        prev_bb_middle = bb_middle[idx-1]
-                        curr_side      = rsi_val  - bb_middle_val  
-                        prev_side      = prev_rsi - prev_bb_middle
+                    prev_rsi       = rsi[idx-1]
+                    prev_bb_middle = bb_middle[idx-1]          # ← previous candle’s band
+                    prev_side      = prev_rsi - prev_bb_middle  # + above, – below
+                    curr_side      = rsi_val - bb_middle_val
             
-                        if prev_side > 0 and curr_side <= 0:
-                            direction = "from above"   
-                        elif prev_side < 0 and curr_side >= 0:
-                            direction = "from below"   
-                        else:
-                            # 2) No cross – derive from current side
-                            direction = "from above" if curr_side > 0 else "from below"
+                    if prev_side > 0 and curr_side <= 0:            # crossed down
+                        direction = "from above"
+                    elif prev_side < 0 and curr_side >= 0:          # crossed up
+                        direction = "from below"
+                    else:
+                        direction = "from above" if curr_side > 0 else "from below"
 
             if upper_touch or lower_touch or middle_touch:
                 if upper_touch:
@@ -711,7 +709,7 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
         def format_line(item):
             base = f"*{item['symbol']}* - RSI: {item['rsi']:.2f}"
             if item['touch_type'] == 'MIDDLE':
-                side = item.get('direction')                # ← safe getter
+                side  = item.get('direction', 'from below')
                 arrow = "↓" if side == "from above" else "↑"
                 base += f" ({arrow})"
         
