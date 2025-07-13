@@ -565,17 +565,17 @@ async def scan_symbol_async(symbol, timeframes, proxy_manager):
             middle_touch = False
             direction = None
               
-              if MIDDLE_BAND_TOGGLE.get(timeframe, False):
-                  if not upper_touch and not lower_touch:
-                      if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
-                          middle_touch = True
+            if MIDDLE_BAND_TOGGLE.get(timeframe, False):
+                if not upper_touch and not lower_touch:
+                    if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
+                        middle_touch = True
               
-                          prev_rsi = rsi[idx-1] if idx-1 >= -len(rsi) else np.nan
-                          if not np.isnan(prev_rsi):
-                              if prev_rsi > bb_middle_val and rsi_val <= bb_middle_val:
-                                  direction = "from above"
-                              elif prev_rsi < bb_middle_val and rsi_val >= bb_middle_val:
-                                  direction = "from below"
+                        prev_rsi = rsi[idx-1] if idx-1 >= -len(rsi) else np.nan
+                        if not np.isnan(prev_rsi):
+                            if prev_rsi > bb_middle_val and rsi_val <= bb_middle_val:
+                                direction = "from above"
+                            elif prev_rsi < bb_middle_val and rsi_val >= bb_middle_val:
+                                direction = "from below"
 
             if upper_touch or lower_touch or middle_touch:
                 if upper_touch:
