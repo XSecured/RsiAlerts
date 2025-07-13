@@ -49,7 +49,7 @@ TIMEFRAMES_TOGGLE = {
     '3m': False,
     '5m': True,
     '15m': True,
-    '30m': True,
+    '30m': False,
     '1h': True,
     '2h': True,
     '4h': True,
