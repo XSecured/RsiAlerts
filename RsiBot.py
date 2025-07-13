@@ -569,16 +569,20 @@ async def scan_symbol_async(symbol, timeframes, proxy_manager):
                 if not upper_touch and not lower_touch:
                     if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
                         middle_touch = True
-              
-                        prev_rsi        = rsi[idx-1]
-                        prev_bb_middle  = bb_middle[idx-1]   # <— use the band from the previous bar
-                        curr_side       = rsi_val  - bb_middle_val      # + above, – below
-                        prev_side       = prev_rsi - prev_bb_middle
-
+            
+                        # 1) Look for an actual cross
+                        prev_rsi       = rsi[idx-1]
+                        prev_bb_middle = bb_middle[idx-1]
+                        curr_side      = rsi_val  - bb_middle_val  
+                        prev_side      = prev_rsi - prev_bb_middle
+            
                         if prev_side > 0 and curr_side <= 0:
-                            direction = "from above"   # crosses down ⇒ ↓
+                            direction = "from above"   
                         elif prev_side < 0 and curr_side >= 0:
-                            direction = "from below"   # crosses up   ⇒ ↑
+                            direction = "from below"   
+                        else:
+                            # 2) No cross – derive from current side
+                            direction = "from above" if curr_side > 0 else "from below"
 
             if upper_touch or lower_touch or middle_touch:
                 if upper_touch:
@@ -706,7 +710,7 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
 
         def format_line(item):
             base = f"*{item['symbol']}* - RSI: {item['rsi']:.2f}"
-            if item['touch_type'] == 'MIDDLE' and item.get('direction'):
+            if item['touch_type'] == 'MIDDLE':
                 arrow = "↓" if item['direction'] == "from above" else "↑"
                 base += f" ({arrow})"
             if item.get('hot'):
