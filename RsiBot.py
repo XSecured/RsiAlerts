@@ -564,10 +564,19 @@ async def scan_symbol_async(symbol, timeframes, proxy_manager):
             lower_touch = rsi_val <= bb_lower_val * (1 + LOWER_TOUCH_THRESHOLD)
             middle_touch = False
 
-            if MIDDLE_BAND_TOGGLE.get(timeframe, False):
-                if not upper_touch and not lower_touch:
-                    if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
-                        middle_touch = True
+              direction = None
+              
+              if MIDDLE_BAND_TOGGLE.get(timeframe, False):
+                  if not upper_touch and not lower_touch:
+                      if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
+                          middle_touch = True
+              
+                          prev_rsi = rsi[idx-1] if idx-1 >= -len(rsi) else np.nan
+                          if not np.isnan(prev_rsi):
+                              if prev_rsi > bb_middle_val and rsi_val <= bb_middle_val:
+                                  direction = "from above"
+                              elif prev_rsi < bb_middle_val and rsi_val >= bb_middle_val:
+                                  direction = "from below"
 
             if upper_touch or lower_touch or middle_touch:
                 if upper_touch:
@@ -592,7 +601,8 @@ async def scan_symbol_async(symbol, timeframes, proxy_manager):
                     'touch_type': touch_type,
                     'timestamp': timestamp,
                     'hot': hot,
-                    'daily_change': daily_change
+                    'daily_change': daily_change,
+                    'direction': direction
                 }
 
                 results.append(item)
@@ -694,6 +704,9 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
 
         def format_line(item):
             base = f"*{item['symbol']}* - RSI: {item['rsi']:.2f}"
+            if item['touch_type'] == 'MIDDLE' and item.get('direction'):
+                arrow = "↓" if item['direction'] == "from above" else "↑"
+                base += f" ({arrow})"
             if item.get('hot'):
                 base += " 🔥"
             return "• " + base
