@@ -711,8 +711,10 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
         def format_line(item):
             base = f"*{item['symbol']}* - RSI: {item['rsi']:.2f}"
             if item['touch_type'] == 'MIDDLE':
-                arrow = "↓" if item['direction'] == "from above" else "↑"
+                side = item.get('direction')                # ← safe getter
+                arrow = "↓" if side == "from above" else "↑"
                 base += f" ({arrow})"
+        
             if item.get('hot'):
                 base += " 🔥"
             return "• " + base
