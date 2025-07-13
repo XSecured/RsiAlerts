@@ -570,12 +570,15 @@ async def scan_symbol_async(symbol, timeframes, proxy_manager):
                     if abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
                         middle_touch = True
               
-                        prev_rsi = rsi[idx-1] if idx-1 >= -len(rsi) else np.nan
-                        if not np.isnan(prev_rsi):
-                            if prev_rsi > bb_middle_val and rsi_val <= bb_middle_val:
-                                direction = "from above"
-                            elif prev_rsi < bb_middle_val and rsi_val >= bb_middle_val:
-                                direction = "from below"
+                        prev_rsi        = rsi[idx-1]
+                        prev_bb_middle  = bb_middle[idx-1]   # <— use the band from the previous bar
+                        curr_side       = rsi_val  - bb_middle_val      # + above, – below
+                        prev_side       = prev_rsi - prev_bb_middle
+
+                        if prev_side > 0 and curr_side <= 0:
+                            direction = "from above"   # crosses down ⇒ ↓
+                        elif prev_side < 0 and curr_side >= 0:
+                            direction = "from below"   # crosses up   ⇒ ↑
 
             if upper_touch or lower_touch or middle_touch:
                 if upper_touch:
