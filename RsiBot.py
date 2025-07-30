@@ -59,9 +59,9 @@ TIMEFRAMES_TOGGLE = {
 
 MIDDLE_BAND_TOGGLE = {
     '3m': False,
-    '5m': False,
-    '15m': False,
-    '30m': True,
+    '5m': True,
+    '15m': True,
+    '30m': False,
     '1h': True,
     '2h': True,
     '4h': True,
