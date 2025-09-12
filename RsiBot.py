@@ -710,7 +710,7 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
             base = f"*{item['symbol']}* - RSI: {item['rsi']:.2f}"
             if item['touch_type'] == 'MIDDLE':
                 side  = item.get('direction', 'from below')
-                arrow = "↓" if side == "from above" else "↑"
+                arrow = "🔻" if side == "from above" else "↑"
                 base += f" ({arrow})"
         
             if item.get('hot'):
@@ -725,7 +725,7 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
         if middle_touches:
             if upper_touches:
                 lines.append("")  # blank line separator
-            lines.append("*➖ MIDDLE BB Touches:*")
+            lines.append("*🔶 MIDDLE BB Touches:*")
             for item in sorted(middle_touches, key=lambda x: x['symbol']):
                 lines.append(format_line(item))
 
