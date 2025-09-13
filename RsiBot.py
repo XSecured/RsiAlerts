@@ -33,7 +33,7 @@ BINANCE_SPOT_EXCHANGE_INFO = "https://api.binance.com/api/v3/exchangeInfo" # Spo
 BINANCE_SPOT_KLINES = "https://api.binance.com/api/v3/klines" # Spot API
 PROXY_TEST_URL = "https://api.binance.com/api/v3/time"
 
-# RSI and BB parameters - MOVED BEFORE MIN_CANDLES_FOR_TALIB
+# RSI and BB parameters
 RSI_PERIOD = 14
 BB_LENGTH = 34
 BB_STDDEV = 2
@@ -42,7 +42,7 @@ CANDLE_LIMIT = 60 # Default candle limit for most timeframes
 # For high timeframes, we relax the *minimum* candle requirement for calculation,
 # but still fetch up to CANDLE_LIMIT to ensure enough data for talib.
 HIGH_TIMEFRAMES_RELAX_CANDLE_LIMIT = {'1d', '1w'}
-MIN_CANDLES_FOR_TALIB = max(RSI_PERIOD, BB_LENGTH) + 2 # A safe minimum for RSI and BB - NOW AFTER RSI_PERIOD and BB_LENGTH
+MIN_CANDLES_FOR_TALIB = max(RSI_PERIOD, BB_LENGTH) + 2 # A safe minimum for RSI and BB
 
 UPPER_TOUCH_THRESHOLD = 0.02  # 2%
 MIDDLE_TOUCH_THRESHOLD = 0.015  # 1.5%
