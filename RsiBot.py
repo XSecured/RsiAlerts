@@ -362,7 +362,7 @@ class AsyncProxyPool:
                 return None
 
             # Remove blacklisted proxies from active pool immediately
-            self.proxies = [p for p p in self.proxies if p not in self.blacklisted]
+            self.proxies = [p for p in self.proxies if p not in self.blacklisted]
             if not self.proxies:
                 return None
 
