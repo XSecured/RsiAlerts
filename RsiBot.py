@@ -13,7 +13,7 @@ import json
 import itertools
 import glob
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 import redis.asyncio as aioredis
 
 # === CONFIG & CONSTANTS ===
@@ -29,9 +29,15 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 BINANCE_FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"
+BINANCE_SPOT_EXCHANGE_INFO = "https://api.binance.com/api/v3/exchangeInfo" # Spot API
+BINANCE_SPOT_KLINES = "https://api.binance.com/api/v3/klines" # Spot API
 PROXY_TEST_URL = "https://api.binance.com/api/v3/time"
 
-CANDLE_LIMIT = 60
+CANDLE_LIMIT = 60 # Default candle limit for most timeframes
+# For high timeframes, we relax the *minimum* candle requirement for calculation,
+# but still fetch up to CANDLE_LIMIT to ensure enough data for talib.
+HIGH_TIMEFRAMES_RELAX_CANDLE_LIMIT = {'1d', '1w'}
+MIN_CANDLES_FOR_TALIB = max(RSI_PERIOD, BB_LENGTH) + 2 # A safe minimum for RSI and BB
 
 UPPER_TOUCH_THRESHOLD = 0.02  # 2%
 MIDDLE_TOUCH_THRESHOLD = 0.015  # 1.5%
@@ -87,36 +93,50 @@ CACHED_TFS = {'4h', '1d', '1w'}
 # === Cache Manager using Redis ===
 
 class CacheManager:
-    def __init__(self, redis_url=None):
+    """Manages caching of scan results and bot state using Redis."""
+    def __init__(self, redis_url: Optional[str] = None):
         self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379")
-        self.redis = None
+        self.redis: Optional[aioredis.Redis] = None
 
     async def initialize(self):
+        """Initializes the Redis connection."""
         if self.redis is None:
-            self.redis = await aioredis.from_url(
-                self.redis_url,
-                encoding="utf-8",
-                decode_responses=True
-            )
-            logging.info(f"Connected to Redis at {self.redis_url}")
+            try:
+                self.redis = await aioredis.from_url(
+                    self.redis_url,
+                    encoding="utf-8",
+                    decode_responses=True
+                )
+                await self.redis.ping() # Test connection
+                logging.info(f"Connected to Redis at {self.redis_url}")
+            except Exception as e:
+                logging.error(f"Failed to connect to Redis at {self.redis_url}: {e}")
+                self.redis = None # Ensure redis is None if connection fails
 
     async def close(self):
+        """Closes the Redis connection."""
         if self.redis:
-            # Try the new method first, fall back to old method
-            if hasattr(self.redis, 'aclose'):
-                await self.redis.aclose()
-            else:
-                await self.redis.close()
-            self.redis = None
-            logging.info("Redis connection closed")
+            try:
+                if hasattr(self.redis, 'aclose'): # aioredis 2.x
+                    await self.redis.aclose()
+                else: # aioredis 1.x
+                    await self.redis.close()
+                self.redis = None
+                logging.info("Redis connection closed")
+            except Exception as e:
+                logging.error(f"Error closing Redis connection: {e}")
 
     def _scan_key(self, timeframe: str, candle_open_iso: str) -> str:
+        """Generates a Redis key for scan results."""
         return f"bb_touch:scan:{timeframe}:{candle_open_iso}"
 
     def _sent_state_key(self) -> str:
+        """Generates a Redis key for the sent state."""
         return "bb_touch:sent_state"
 
-    async def get_scan_results(self, timeframe: str, candle_open_iso: str) -> Optional[list]:
+    async def get_scan_results(self, timeframe: str, candle_open_iso: str) -> Optional[List[Dict[str, Any]]]:
+        """Retrieves scan results from cache."""
+        if not self.redis: return None
         key = self._scan_key(timeframe, candle_open_iso)
         data = await self.redis.get(key)
         if data:
@@ -126,7 +146,9 @@ class CacheManager:
                 logging.warning(f"Failed to decode cache data for {key}: {e}")
         return None
 
-    async def set_scan_results(self, timeframe: str, candle_open_iso: str, results: list, ttl_seconds: int):
+    async def set_scan_results(self, timeframe: str, candle_open_iso: str, results: List[Dict[str, Any]], ttl_seconds: int):
+        """Stores scan results in cache."""
+        if not self.redis: return
         key = self._scan_key(timeframe, candle_open_iso)
         try:
             await self.redis.set(key, json.dumps(results), ex=ttl_seconds)
@@ -134,7 +156,9 @@ class CacheManager:
         except Exception as e:
             logging.warning(f"Failed to set cache for {key}: {e}")
 
-    async def get_sent_state(self) -> dict:
+    async def get_sent_state(self) -> Dict[str, str]:
+        """Retrieves the last sent state from cache."""
+        if not self.redis: return {}
         key = self._sent_state_key()
         data = await self.redis.get(key)
         if data:
@@ -144,7 +168,9 @@ class CacheManager:
                 logging.warning(f"Failed to decode sent state: {e}")
         return {}
 
-    async def set_sent_state(self, state: dict):
+    async def set_sent_state(self, state: Dict[str, str]):
+        """Stores the current sent state in cache."""
+        if not self.redis: return
         key = self._sent_state_key()
         try:
             await self.redis.set(key, json.dumps(state))
@@ -154,10 +180,12 @@ class CacheManager:
 
 # === UTILITY FUNCTIONS ===
 
-def get_active_timeframes():
+def get_active_timeframes() -> List[str]:
+    """Returns a list of enabled timeframes."""
     return [tf for tf, enabled in TIMEFRAMES_TOGGLE.items() if enabled]
 
-def get_latest_candle_open(timeframe: str, now=None):
+def get_latest_candle_open(timeframe: str, now: Optional[datetime] = None) -> datetime:
+    """Calculates the opening time of the current candle for a given timeframe."""
     if now is None:
         now = datetime.utcnow()
     if timeframe not in TIMEFRAME_MINUTES_MAP:
@@ -172,6 +200,7 @@ def get_latest_candle_open(timeframe: str, now=None):
 # === ASYNC PROXY POOL & REQUESTS ===
 
 async def fetch_proxies_from_url_async(url: str, default_scheme: str = "http") -> List[str]:
+    """Fetches proxies from a given URL."""
     proxies = []
     try:
         async with aiohttp.ClientSession() as session:
@@ -191,26 +220,19 @@ async def fetch_proxies_from_url_async(url: str, default_scheme: str = "http") -
     return proxies
 
 async def test_proxy_async(session: aiohttp.ClientSession, proxy: str) -> bool:
+    """Tests if a proxy is working."""
     try:
         async with session.get(PROXY_TEST_URL, proxy=proxy, timeout=8) as resp:
             return 200 <= resp.status < 300
     except Exception:
         return False
 
-async def test_proxy_speed_async(session: aiohttp.ClientSession, proxy: str) -> float:
-    start = time.time()
-    try:
-        async with session.get(PROXY_TEST_URL, proxy=proxy, timeout=10) as resp:
-            resp.raise_for_status()
-            return time.time() - start
-    except Exception:
-        return float("inf")
-
 async def test_proxies_concurrently_async(
     proxies: List[str],
     max_workers: int = 50,
     max_working: int = 25
 ) -> List[str]:
+    """Tests a list of proxies concurrently and returns working ones."""
     working = []
     sem = asyncio.Semaphore(max_workers)
     async with aiohttp.ClientSession() as session:
@@ -235,7 +257,8 @@ async def test_proxies_concurrently_async(
 async def rank_proxies_by_speed_async(
     proxies: List[str],
     max_workers: int = 20
-) -> List[tuple]:
+) -> List[Tuple[str, float]]:
+    """Ranks proxies by speed."""
     sem = asyncio.Semaphore(max_workers)
     async with aiohttp.ClientSession() as session:
         async def sem_speed(p):
@@ -251,6 +274,7 @@ async def rank_proxies_by_speed_async(
     return valid
 
 class AsyncProxyPool:
+    """Manages a pool of asynchronous proxies."""
     def __init__(
         self,
         sources: List[str] = PROXY_SOURCES,
@@ -264,107 +288,112 @@ class AsyncProxyPool:
         self.min_working = min_working
         self.check_interval = check_interval
         self.max_failures = max_failures
-        self.blacklisted = set()           # Add immediate blacklist
-        self._proxy_lock = asyncio.Lock()  # Add lock for thread safety
+        self.blacklisted: Set[str] = set()
+        self._proxy_lock = asyncio.Lock()
 
         self.proxies: List[str] = []
-        self.failures = {}          # proxy -> count
-        self.failed = set()         # proxies removed
-        self.cycle = None           # itertools.cycle
+        self.failures: Dict[str, int] = {}
+        self.failed: Set[str] = set()
+        self.cycle: Optional[itertools.cycle] = None
 
         self._stop = False
-        self._tasks = []
+        self._tasks: List[asyncio.Task] = []
 
     async def initialize(self):
+        """Initializes the proxy pool and starts health check loops."""
         await self.populate_to_max()
         self._tasks.append(asyncio.create_task(self._health_check_loop()))
         self._tasks.append(asyncio.create_task(self._fastest_proxy_loop()))
 
     async def _health_check_loop(self):
+        """Periodically checks the health of proxies in the pool."""
         while not self._stop:
             await asyncio.sleep(self.check_interval)
             await self.check_proxies()
 
     async def _fastest_proxy_loop(self):
+        """Periodically updates the fastest proxy."""
         while not self._stop:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(3600) # Every hour
             await self.update_fastest_proxy()
 
     async def populate_to_max(self):
-        """Faster, more aggressive proxy replenishment"""
+        """Replenishes the proxy pool up to max_pool_size."""
         async with self._proxy_lock:
             needed = self.max_pool_size - len(self.proxies)
             if needed <= 0:
                 return
-            
-            # Clear blacklist if we're running low on proxies
+
             if len(self.proxies) < self.min_working:
-                logging.warning("Running low on proxies, clearing blacklist")
+                logging.warning("Running low on proxies, clearing blacklist to find more.")
                 self.blacklisted.clear()
                 self.failed.clear()
                 self.failures.clear()
-        
+
             new_list = []
             for src in self.sources:
                 fetched = await fetch_proxies_from_url_async(src)
-                # Filter out already blacklisted proxies
                 fetched = [p for p in fetched if p not in self.blacklisted]
                 new_list.extend(fetched)
-                if len(new_list) >= needed * 2:
+                if len(new_list) >= needed * 2: # Fetch more than needed to have options
                     break
-                
+
             working = await test_proxies_concurrently_async(
-                new_list, 
-                max_workers=100,  # Increase workers for faster testing
+                new_list,
+                max_workers=100,
                 max_working=needed
             )
-        
+
             self.proxies.extend(working)
             self._rebuild_cycle()
             logging.info(f"Pool populated: {len(self.proxies)}/{self.max_pool_size}")
 
     def _rebuild_cycle(self):
-        self.cycle = itertools.cycle(self.proxies)
+        """Rebuilds the proxy cycle iterator."""
+        if self.proxies:
+            self.cycle = itertools.cycle(self.proxies)
+        else:
+            self.cycle = None
 
-    async def get_next_proxy(self) -> str:
-        """Thread-safe proxy selection with immediate blacklisting"""
+    async def get_next_proxy(self) -> Optional[str]:
+        """Retrieves the next available proxy from the pool."""
         async with self._proxy_lock:
             if not self.proxies:
                 return None
-                
+
             # Remove blacklisted proxies from active pool immediately
-            self.proxies = [p for p in self.proxies if p not in self.blacklisted]
+            self.proxies = [p for p p in self.proxies if p not in self.blacklisted]
             if not self.proxies:
                 return None
-                
-            self._rebuild_cycle()
-            
+
+            self._rebuild_cycle() # Rebuild cycle after potential removal
+
+            # Iterate through the cycle to find a non-blacklisted, non-failed proxy
             for _ in range(len(self.proxies)):
-                proxy = next(self.cycle)
-                if proxy not in self.blacklisted and proxy not in self.failed:
-                    return proxy
-            return None
+                if self.cycle:
+                    proxy = next(self.cycle)
+                    if proxy not in self.blacklisted and proxy not in self.failed:
+                        return proxy
+            return None # No suitable proxy found
 
     async def mark_proxy_failure(self, proxy: str):
-        """Immediately blacklist problematic proxies"""
+        """Marks a proxy as failed and potentially blacklists it."""
         async with self._proxy_lock:
             c = self.failures.get(proxy, 0) + 1
             self.failures[proxy] = c
-            
+
             logging.warning(f"Proxy {proxy} failure {c}/{self.max_failures}")
-            
+
             if c >= self.max_failures:
-                # Immediate blacklisting
                 self.blacklisted.add(proxy)
                 self.failed.add(proxy)
-                
                 if proxy in self.proxies:
                     self.proxies.remove(proxy)
-                    logging.warning(f"Removed {proxy} from pool")
+                    logging.warning(f"Removed {proxy} from pool due to excessive failures.")
                     self._rebuild_cycle()
 
     async def reset_proxy_failures(self, proxy: str):
-        """Reset failures and remove from blacklist"""
+        """Resets failure count for a proxy and removes it from blacklist if applicable."""
         async with self._proxy_lock:
             if proxy in self.failures:
                 self.failures[proxy] = 0
@@ -372,11 +401,12 @@ class AsyncProxyPool:
                 self.failed.remove(proxy)
             if proxy in self.blacklisted:
                 self.blacklisted.remove(proxy)
-                if proxy not in self.proxies:
+                if proxy not in self.proxies: # Add back to active pool if it was removed
                     self.proxies.append(proxy)
                     self._rebuild_cycle()
 
     async def check_proxies(self):
+        """Performs a health check on all proxies in the pool."""
         if not self.proxies:
             return
         async with aiohttp.ClientSession() as session:
@@ -390,14 +420,15 @@ class AsyncProxyPool:
         alive = [p for p, ok in results if ok]
         removed = len(self.proxies) - len(alive)
         self.proxies = alive
-        self.failed.clear()
-        self.failures = {}
+        self.failed.clear() # Clear failed list after a full check
+        self.failures = {}  # Reset failure counts
         self._rebuild_cycle()
         logging.info(f"Health check removed {removed} proxies; pool now {len(self.proxies)}")
         if len(self.proxies) < self.min_working:
             await self.populate_to_max()
 
     async def update_fastest_proxy(self):
+        """Identifies and logs the fastest proxy."""
         ranked = await rank_proxies_by_speed_async(self.proxies, max_workers=20)
         if ranked:
             fastest = ranked[0][0]
@@ -406,94 +437,131 @@ class AsyncProxyPool:
             logging.warning("Could not determine fastest proxy")
 
     async def shutdown(self):
+        """Shuts down the proxy pool and cancels background tasks."""
         self._stop = True
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        
+        logging.info("Proxy pool shutdown complete.")
+
 # === ASYNC REQUESTS & SCANNING ===
 
-async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=4):
-    """Fixed request function with proper proxy handling"""
-    
+async def make_request_async(session: aiohttp.ClientSession, url: str, params: Optional[Dict[str, Any]] = None, proxy_manager: Optional[AsyncProxyPool] = None, max_attempts: int = 4) -> Dict[str, Any]:
+    """
+    Makes an asynchronous HTTP request with proxy rotation and retry logic.
+    """
     attempt = 0
-    used_proxies = set()  # Track proxies used in this request
-    
+    used_proxies: Set[str] = set()
+
     while attempt < max_attempts:
-        proxy = await proxy_manager.get_next_proxy()  # Make it async
-        
-        if proxy is None:
-            logging.warning("No working proxies available → refreshing pool…")
-            await proxy_manager.populate_to_max()
+        proxy = None
+        if proxy_manager:
             proxy = await proxy_manager.get_next_proxy()
-            
+
             if proxy is None:
-                logging.error("Still no proxies after repopulation")
-                break
-                
-        # Skip if we already tried this proxy in this request
-        if proxy in used_proxies:
-            attempt += 1
-            continue
-            
-        used_proxies.add(proxy)
-        proxy_url = proxy if proxy.startswith(("http://","https://")) else f"http://{proxy}"
-        
+                logging.warning("No working proxies available → refreshing pool…")
+                await proxy_manager.populate_to_max()
+                proxy = await proxy_manager.get_next_proxy()
+
+                if proxy is None:
+                    logging.error("Still no proxies after repopulation. Cannot make request.")
+                    break
+
+            if proxy in used_proxies: # Avoid retrying with the same proxy in a single request sequence
+                attempt += 1
+                continue
+
+            used_proxies.add(proxy)
+            proxy_url = proxy if proxy.startswith(("http://","https://")) else f"http://{proxy}"
+        else:
+            proxy_url = None # No proxy if manager not provided
+
         try:
             async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
-                if resp.status == 451:
-                    logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure")
-                    await proxy_manager.mark_proxy_failure(proxy)  # Make it async
+                if resp.status == 451: # Unavailable for legal reasons
+                    logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure.")
+                    if proxy_manager: await proxy_manager.mark_proxy_failure(proxy)
                     attempt += 1
                     continue
 
-                resp.raise_for_status()
-                await proxy_manager.reset_proxy_failures(proxy)  # Make it async
+                resp.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
+                if proxy_manager and proxy: await proxy_manager.reset_proxy_failures(proxy)
                 return await resp.json()
 
-        except Exception as e:
-            logging.error(f"Request failed with proxy {proxy}: {e}")
-            await proxy_manager.mark_proxy_failure(proxy)  # Make it async
+        except aiohttp.ClientError as e:
+            logging.error(f"Request failed with proxy {proxy_url if proxy_url else 'direct'}: {e}. Attempt {attempt + 1}/{max_attempts}")
+            if proxy_manager and proxy: await proxy_manager.mark_proxy_failure(proxy)
             attempt += 1
-            
-            # Only sleep if we're going to retry
-            if attempt < max_attempts:
-                await asyncio.sleep(min(2 * attempt, 10))  # Cap the sleep time
-
-    raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts")
-
-async def get_perpetual_usdt_symbols_async(proxy_manager, max_attempts=5):
-    for attempt in range(1, max_attempts + 1):
-        try:
-            async with aiohttp.ClientSession() as session:
-                data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
-                symbols = [
-                    s['symbol'] for s in data.get('symbols', [])
-                    if s.get('contractType') == 'PERPETUAL' and s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING'
-                ]
-                if len(symbols) >= 10:
-                    return symbols
-                logging.warning(f"Too few symbols ({len(symbols)}) via proxy, retrying...")
+            await asyncio.sleep(min(2 * attempt, 10)) # Exponential backoff
         except Exception as e:
-            logging.warning(f"Proxy attempt {attempt} failed: {e}")
-        await asyncio.sleep(3)
-    raise RuntimeError("Failed to fetch USDT perpetual symbols via proxies after multiple attempts")
+            logging.error(f"Unexpected error during request to {url}: {e}. Attempt {attempt + 1}/{max_attempts}")
+            attempt += 1
+            await asyncio.sleep(min(2 * attempt, 10))
 
-async def fetch_klines_async(session, symbol, interval, proxy_manager, limit=CANDLE_LIMIT):
+    raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts.")
+
+async def get_all_tradable_usdt_symbols_async(session: aiohttp.ClientSession, proxy_manager: AsyncProxyPool, max_attempts: int = 5) -> Tuple[List[str], List[str]]:
+    """
+    Fetches tradable USDT symbols from both Futures and Spot, prioritizing Futures.
+    Returns (futures_symbols, spot_symbols_not_on_futures).
+    """
+    futures_symbols_set: Set[str] = set()
+    spot_symbols_set: Set[str] = set()
+
+    # Fetch Futures symbols
+    try:
+        futures_data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
+        if futures_data and 'symbols' in futures_data:
+            for s in futures_data['symbols']:
+                if s.get('contractType') == 'PERPETUAL' and s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING':
+                    futures_symbols_set.add(s['symbol'])
+        logging.info(f"Fetched {len(futures_symbols_set)} Futures USDT perpetual symbols.")
+    except Exception as e:
+        logging.error(f"Error fetching Futures exchange info: {e}")
+
+    # Fetch Spot symbols
+    try:
+        spot_data = await make_request_async(session, BINANCE_SPOT_EXCHANGE_INFO, proxy_manager=proxy_manager)
+        if spot_data and 'symbols' in spot_data:
+            for s in spot_data['symbols']:
+                # Only consider USDT quote assets and trading status
+                if s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING':
+                    spot_symbols_set.add(s['symbol'])
+        logging.info(f"Fetched {len(spot_symbols_set)} Spot USDT symbols.")
+    except Exception as e:
+        logging.error(f"Error fetching Spot exchange info: {e}")
+
+    # Filter Spot symbols to exclude those already on Futures
+    spot_symbols_filtered = sorted(list(spot_symbols_set - futures_symbols_set))
+    futures_symbols_list = sorted(list(futures_symbols_set))
+
+    logging.info(f"Filtered Spot symbols (not on Futures): {len(spot_symbols_filtered)}")
+
+    return futures_symbols_list, spot_symbols_filtered
+
+async def fetch_klines_async(session: aiohttp.ClientSession, symbol: str, interval: str, proxy_manager: AsyncProxyPool, limit: int = CANDLE_LIMIT, is_futures: bool = True) -> Tuple[Optional[List[float]], Optional[List[int]]]:
+    """
+    Fetches klines for a given symbol and interval from either Futures or Spot API.
+    """
+    endpoint = BINANCE_FUTURES_KLINES if is_futures else BINANCE_SPOT_KLINES
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
     try:
-        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
+        data = await make_request_async(session, endpoint, params=params, proxy_manager=proxy_manager)
         closes = [float(k[4]) for k in data]
-        timestamps = [k[0] for k in data]
+        timestamps = [int(k[0]) for k in data]
         return closes, timestamps
     except Exception as e:
-        logging.error(f"Error fetching klines for {symbol} {interval}: {e}")
+        logging.error(f"Error fetching klines for {symbol} {interval} (Futures: {is_futures}): {e}")
         return None, None
 
-async def get_daily_change_percent_async(session, symbol, proxy_manager):
+async def get_daily_change_percent_async(session: aiohttp.ClientSession, symbol: str, proxy_manager: AsyncProxyPool, is_futures: bool = True) -> Optional[float]:
+    """
+    Fetches the daily price change percentage for a symbol.
+    """
+    endpoint = BINANCE_FUTURES_KLINES if is_futures else BINANCE_SPOT_KLINES
     params = {'symbol': symbol, 'interval': '1d', 'limit': 1}
     try:
-        data = await make_request_async(session, BINANCE_FUTURES_KLINES, params=params, proxy_manager=proxy_manager)
+        data = await make_request_async(session, endpoint, params=params, proxy_manager=proxy_manager)
         if not data or len(data) < 1:
             return None
         k = data[-1]
@@ -503,11 +571,12 @@ async def get_daily_change_percent_async(session, symbol, proxy_manager):
             return None
         return (current_price - daily_open) / daily_open * 100
     except Exception as e:
-        logging.warning(f"Could not fetch daily change for {symbol}: {e}")
+        logging.warning(f"Could not fetch daily change for {symbol} (Futures: {is_futures}): {e}")
         return None
 
-def calculate_rsi_bb(closes):
-    closes_np = np.array(closes)
+def calculate_rsi_bb(closes: List[float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Calculates RSI and Bollinger Bands for a given list of close prices."""
+    closes_np = np.array(closes, dtype=float)
     rsi = talib.RSI(closes_np, timeperiod=RSI_PERIOD)
     bb_upper, bb_middle, bb_lower = talib.BBANDS(
         rsi,
@@ -520,160 +589,198 @@ def calculate_rsi_bb(closes):
 
 # === SCANNING FUNCTIONS ===
 
-async def load_cache_async(cache_manager: CacheManager, timeframe: str):
+async def load_cache_async(cache_manager: CacheManager, timeframe: str) -> Optional[List[Dict[str, Any]]]:
+    """Loads scan results for a timeframe from cache."""
     candle_open = get_latest_candle_open(timeframe).isoformat()
     return await cache_manager.get_scan_results(timeframe, candle_open)
 
-async def save_cache_async(cache_manager: CacheManager, timeframe: str, results: list):
+async def save_cache_async(cache_manager: CacheManager, timeframe: str, results: List[Dict[str, Any]]):
+    """Saves scan results for a timeframe to cache."""
     candle_open = get_latest_candle_open(timeframe).isoformat()
     ttl = CACHE_TTL_SECONDS.get(timeframe, 3600)
     await cache_manager.set_scan_results(timeframe, candle_open, results, ttl)
 
-async def load_sent_state_async(cache_manager: CacheManager):
+async def load_sent_state_async(cache_manager: CacheManager) -> Dict[str, str]:
+    """Loads the bot's sent state from cache."""
     return await cache_manager.get_sent_state()
 
-async def save_sent_state_async(cache_manager: CacheManager, state: dict):
+async def save_sent_state_async(cache_manager: CacheManager, state: Dict[str, str]):
+    """Saves the bot's sent state to cache."""
     await cache_manager.set_sent_state(state)
 
-async def scan_symbol_async(symbol, timeframes, proxy_manager):
-    results = []
-    async with aiohttp.ClientSession() as session:
-        daily_change = await get_daily_change_percent_async(session, symbol, proxy_manager)
+async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timeframes: List[str], proxy_manager: AsyncProxyPool, is_futures: bool) -> List[Dict[str, Any]]:
+    """
+    Scans a single symbol across multiple timeframes for BB touches.
+    """
+    results: List[Dict[str, Any]] = []
+    daily_change = await get_daily_change_percent_async(session, symbol, proxy_manager, is_futures)
 
-        for timeframe in timeframes:
-            closes, timestamps = await fetch_klines_async(session, symbol, timeframe, proxy_manager)
-            if closes is None or len(closes) < CANDLE_LIMIT:
-                logging.warning(f"Not enough data for {symbol} {timeframe}. Skipping.")
+    for timeframe in timeframes:
+        closes, timestamps = await fetch_klines_async(session, symbol, timeframe, proxy_manager, is_futures=is_futures)
+        if closes is None or not closes:
+            logging.warning(f"No klines data for {symbol} {timeframe}. Skipping.")
+            continue
+
+        # Determine minimum required candles for calculation
+        required_candles = MIN_CANDLES_FOR_TALIB
+        if timeframe not in HIGH_TIMEFRAMES_RELAX_CANDLE_LIMIT:
+            # For non-high timeframes, we strictly enforce CANDLE_LIMIT
+            if len(closes) < CANDLE_LIMIT:
+                logging.warning(f"Not enough data for {symbol} {timeframe} ({len(closes)} < {CANDLE_LIMIT}). Skipping.")
                 continue
-            idx = -2
-            if idx < -len(closes):
-                logging.warning(f"Not enough candles for {symbol} {timeframe} to skip open candle. Skipping.")
-                continue
+        elif len(closes) < required_candles:
+            # For high timeframes, we relax the CANDLE_LIMIT but still need enough for talib
+            logging.warning(f"Not enough data for {symbol} {timeframe} ({len(closes)} < {required_candles} for talib). Skipping.")
+            continue
 
-            rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
-            if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]) or np.isnan(bb_middle[idx]):
-                logging.warning(f"NaN values for {symbol} {timeframe}, skipping.")
-                continue
+        # Use the second to last candle for analysis (idx = -2)
+        # This ensures we're looking at a closed candle, not the currently forming one.
+        idx = -2
+        if len(closes) < abs(idx): # Ensure there are at least 2 candles
+            logging.warning(f"Not enough closed candles for {symbol} {timeframe} to analyze. Skipping.")
+            continue
 
-            rsi_val = rsi[idx]
-            bb_upper_val = bb_upper[idx]
-            bb_middle_val = bb_middle[idx]
-            bb_lower_val = bb_lower[idx]
+        rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
 
-            upper_touch = rsi_val >= bb_upper_val * (1 - UPPER_TOUCH_THRESHOLD)
-            lower_touch = rsi_val <= bb_lower_val * (1 + LOWER_TOUCH_THRESHOLD)
-            middle_touch = False
-            direction = None
-              
-            if MIDDLE_BAND_TOGGLE.get(timeframe, False):
-                if not upper_touch and not lower_touch \
-                   and abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
-                    middle_touch = True
-            
-                    prev_rsi       = rsi[idx-1]
-                    prev_bb_middle = bb_middle[idx-1]          # ← previous candle’s band
-                    prev_side      = prev_rsi - prev_bb_middle  # + above, – below
-                    curr_side      = rsi_val - bb_middle_val
-            
-                    if prev_side > 0 and curr_side <= 0:            # crossed down
-                        direction = "from above"
-                    elif prev_side < 0 and curr_side >= 0:          # crossed up
-                        direction = "from below"
-                    else:
-                        direction = "from above" if curr_side > 0 else "from below"
+        # Check if the last calculated RSI/BB values are valid (not NaN)
+        if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]) or np.isnan(bb_middle[idx]):
+            logging.warning(f"NaN values for {symbol} {timeframe} at index {idx}, skipping.")
+            continue
 
-            if upper_touch or lower_touch or middle_touch:
-                if upper_touch:
-                    touch_type = "UPPER"
-                elif lower_touch:
-                    touch_type = "LOWER"
-                else:
-                    touch_type = "MIDDLE"
+        rsi_val = rsi[idx]
+        bb_upper_val = bb_upper[idx]
+        bb_middle_val = bb_middle[idx]
+        bb_lower_val = bb_lower[idx]
 
-                timestamp = datetime.utcfromtimestamp(timestamps[idx] / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
-                hot = False
-                if daily_change is not None and daily_change > 5:
-                    hot = True
+        upper_touch = rsi_val >= bb_upper_val * (1 - UPPER_TOUCH_THRESHOLD)
+        lower_touch = rsi_val <= bb_lower_val * (1 + LOWER_TOUCH_THRESHOLD)
+        middle_touch = False
+        direction = None
 
-                item = {
-                    'symbol': symbol,
-                    'timeframe': timeframe,
-                    'rsi': rsi_val,
-                    'bb_upper': bb_upper_val,
-                    'bb_middle': bb_middle_val,
-                    'bb_lower': bb_lower_val,
-                    'touch_type': touch_type,
-                    'timestamp': timestamp,
-                    'hot': hot,
-                    'daily_change': daily_change,
-                    'direction': direction
-                }
+        if MIDDLE_BAND_TOGGLE.get(timeframe, False):
+            if not upper_touch and not lower_touch \
+               and abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
+                middle_touch = True
 
-                results.append(item)
+                # Determine direction of middle band touch
+                prev_rsi = rsi[idx-1]
+                prev_bb_middle = bb_middle[idx-1]
+                prev_side = prev_rsi - prev_bb_middle # + above, – below
+                curr_side = rsi_val - bb_middle_val
+
+                if prev_side > 0 and curr_side <= 0: # crossed down
+                    direction = "from above"
+                elif prev_side < 0 and curr_side >= 0: # crossed up
+                    direction = "from below"
+                else: # Still on one side, but within threshold
+                    direction = "from above" if curr_side > 0 else "from below"
+
+        if upper_touch or lower_touch or middle_touch:
+            touch_type = ""
+            if upper_touch:
+                touch_type = "UPPER"
+            elif lower_touch:
+                touch_type = "LOWER"
+            else:
+                touch_type = "MIDDLE"
+
+            timestamp = datetime.utcfromtimestamp(timestamps[idx] / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
+            hot = False
+            if daily_change is not None and daily_change > 5: # Example: >5% daily change is "hot"
+                hot = True
+
+            item = {
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'rsi': rsi_val,
+                'bb_upper': bb_upper_val,
+                'bb_middle': bb_middle_val,
+                'bb_lower': bb_lower_val,
+                'touch_type': touch_type,
+                'timestamp': timestamp,
+                'hot': hot,
+                'daily_change': daily_change,
+                'direction': direction,
+                'market_type': 'FUTURES' if is_futures else 'SPOT' # New field
+            }
+            results.append(item)
 
     return results
 
-async def scan_for_bb_touches_async(proxy_manager, cache_manager):
-    symbols = await get_perpetual_usdt_symbols_async(proxy_manager)
-    results = []
-    batch_size = 70
+async def scan_for_bb_touches_async(proxy_manager: AsyncProxyPool, cache_manager: CacheManager) -> Tuple[List[Dict[str, Any]], Set[str]]:
+    """
+    Orchestrates the scanning process for BB touches across all symbols and timeframes.
+    """
+    results: List[Dict[str, Any]] = []
+    batch_size = 70 # Number of symbols to process concurrently in a batch
     active_timeframes = get_active_timeframes()
 
     cached_timeframes = [tf for tf in CACHED_TFS if tf in active_timeframes]
     uncached_timeframes = [tf for tf in active_timeframes if tf not in cached_timeframes]
 
-    cached_results = {}
+    cached_results: Dict[str, List[Dict[str, Any]]] = {}
+    fresh_timeframes: Set[str] = set()
 
-    # Load cached results
-    for timeframe in cached_timeframes:
-        cached_results[timeframe] = await load_cache_async(cache_manager, timeframe)
-        if cached_results[timeframe] is not None:
-            logging.info(f"[CACHE] Loaded {timeframe} timeframe results from cache")
-        else:
-            logging.info(f"[CACHE] No valid cache found for {timeframe}, will scan fresh")
+    async with aiohttp.ClientSession() as session:
+        futures_symbols, spot_symbols = await get_all_tradable_usdt_symbols_async(session, proxy_manager)
+        all_symbols_with_type: List[Tuple[str, bool]] = [(s, True) for s in futures_symbols] + [(s, False) for s in spot_symbols]
+        total_symbols = len(all_symbols_with_type)
 
-    total_symbols = len(symbols)
-    fresh_timeframes = set()
+        # Load cached results for relevant timeframes
+        for timeframe in cached_timeframes:
+            cached_data = await load_cache_async(cache_manager, timeframe)
+            if cached_data is not None:
+                cached_results[timeframe] = cached_data
+                logging.info(f"[CACHE] Loaded {len(cached_data)} results for {timeframe} from cache.")
+            else:
+                logging.info(f"[CACHE] No valid cache found for {timeframe}, will scan fresh.")
 
-    # Scan cached timeframes missing cache
-    for timeframe in cached_timeframes:
-        if cached_results.get(timeframe) is None:
-            logging.info(f"[SCAN] Scanning {timeframe} timeframe fresh data...")
-            timeframe_results = []
+        # Process cached timeframes that need a fresh scan (either no cache or cache expired)
+        for timeframe in cached_timeframes:
+            if timeframe not in cached_results: # If cache was not loaded
+                logging.info(f"[SCAN] Performing fresh scan for cached timeframe: {timeframe}")
+                timeframe_scan_results: List[Dict[str, Any]] = []
+                for i in range(0, total_symbols, batch_size):
+                    batch = all_symbols_with_type[i:i + batch_size]
+                    tasks = [
+                        scan_symbol_async(session, symbol, [timeframe], proxy_manager, is_futures)
+                        for symbol, is_futures in batch
+                    ]
+                    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for res in batch_results:
+                        if isinstance(res, Exception):
+                            logging.error(f"Error scanning {timeframe} for a batch: {res}")
+                        else:
+                            timeframe_scan_results.extend(res)
+                await save_cache_async(cache_manager, timeframe, timeframe_scan_results)
+                cached_results[timeframe] = timeframe_scan_results
+                fresh_timeframes.add(timeframe)
+                logging.info(f"[CACHE] Saved fresh scan results for {timeframe} ({len(timeframe_scan_results)} items).")
+
+        # Process uncached timeframes (always fresh scan)
+        if uncached_timeframes:
+            logging.info(f"[SCAN] Scanning uncached timeframes: {', '.join(uncached_timeframes)}")
+            uncached_scan_results: List[Dict[str, Any]] = []
             for i in range(0, total_symbols, batch_size):
-                batch = symbols[i:i + batch_size]
-                tasks = [scan_symbol_async(symbol, [timeframe], proxy_manager) for symbol in batch]
+                batch = all_symbols_with_type[i:i + batch_size]
+                tasks = [
+                    scan_symbol_async(session, symbol, uncached_timeframes, proxy_manager, is_futures)
+                    for symbol, is_futures in batch
+                ]
                 batch_results = await asyncio.gather(*tasks, return_exceptions=True)
                 for res in batch_results:
                     if isinstance(res, Exception):
-                        logging.error(f"Error scanning {timeframe} timeframe: {res}")
+                        logging.error(f"Error scanning uncached timeframes for a batch: {res}")
                     else:
-                        timeframe_results.extend(res)
-            await save_cache_async(cache_manager, timeframe, timeframe_results)
-            cached_results[timeframe] = timeframe_results
-            fresh_timeframes.add(timeframe)
-            logging.info(f"[CACHE] Saved fresh scan results for {timeframe}")
+                        uncached_scan_results.extend(res)
+            results.extend(uncached_scan_results)
+            fresh_timeframes.update(uncached_timeframes)
+            logging.info(f"[SCAN] Completed fresh scan for uncached timeframes ({len(uncached_scan_results)} items).")
 
-    # Scan uncached timeframes fresh every run
-    uncached_results = []
-    if uncached_timeframes:
-        logging.info(f"[SCAN] Scanning uncached timeframes: {uncached_timeframes}")
-        for i in range(0, total_symbols, batch_size):
-            batch = symbols[i:i + batch_size]
-            tasks = [scan_symbol_async(symbol, uncached_timeframes, proxy_manager) for symbol in batch]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in batch_results:
-                if isinstance(res, Exception):
-                    logging.error(f"Error scanning uncached timeframes: {res}")
-                else:
-                    uncached_results.extend(res)
-        fresh_timeframes.update(uncached_timeframes)
-
-    # Combine all results
+    # Combine all results (from cache and fresh scans)
     for timeframe in cached_timeframes:
         if timeframe in cached_results:
             results.extend(cached_results[timeframe])
-    results.extend(uncached_results)
 
     logging.info(f"[RESULTS] Total BB touches found: {len(results)}")
 
@@ -681,20 +788,25 @@ async def scan_for_bb_touches_async(proxy_manager, cache_manager):
 
 # === FORMATTING & TELEGRAM SENDING ===
 
-def format_results_by_timeframe(results, cached_timeframes_used=None):
+def format_results_by_timeframe(results: List[Dict[str, Any]], cached_timeframes_used: Optional[Set[str]] = None) -> List[str]:
+    """
+    Formats the scan results into Telegram-ready messages, grouped by timeframe.
+    Includes market type (Futures/Spot) in the symbol display.
+    """
     if not results:
         return ["*No BB touches detected at this time.*"]
 
     timeframe_order = {'1w': 7, '1d': 6, '4h': 5, '2h': 4, '1h': 3, '30m': 2, '15m': 1, '5m': 0, '3m': -1}
 
-    grouped = {}
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
     for r in results:
         grouped.setdefault(r['timeframe'], []).append(r)
 
     sorted_timeframes = sorted(grouped.keys(), key=lambda tf: timeframe_order.get(tf, -2), reverse=True)
 
-    messages = []
-    for timeframe, items in [(tf, grouped[tf]) for tf in sorted_timeframes]:
+    messages: List[str] = []
+    for timeframe in sorted_timeframes:
+        items = grouped[timeframe]
         header = f"*🔍 BB Touches on {timeframe} Timeframe ({len(items)} symbols)*"
         if cached_timeframes_used and timeframe in cached_timeframes_used:
             header += " _(from cache)_"
@@ -704,15 +816,16 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
         middle_touches = [i for i in items if i['touch_type'] == 'MIDDLE']
         lower_touches = [i for i in items if i['touch_type'] == 'LOWER']
 
-        lines = []
+        lines: List[str] = []
 
-        def format_line(item):
-            base = f"*{item['symbol']}* - RSI: {item['rsi']:.2f}"
+        def format_line(item: Dict[str, Any]) -> str:
+            market_tag = "[F]" if item.get('market_type') == 'FUTURES' else "[S]"
+            base = f"*{item['symbol']}* {market_tag} - RSI: {item['rsi']:.2f}"
             if item['touch_type'] == 'MIDDLE':
-                side  = item.get('direction', 'from below')
-                arrow = "🔻" if side == "from above" else "↑"
+                side = item.get('direction', 'from below')
+                arrow = "🔻" if side == "from above" else "⬆️" # Changed arrow for clarity
                 base += f" ({arrow})"
-        
+
             if item.get('hot'):
                 base += " 🔥"
             return "• " + base
@@ -724,14 +837,14 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
 
         if middle_touches:
             if upper_touches:
-                lines.append("")  # blank line separator
+                lines.append("")
             lines.append("*🔶 MIDDLE BB Touches:*")
             for item in sorted(middle_touches, key=lambda x: x['symbol']):
                 lines.append(format_line(item))
 
         if lower_touches:
             if upper_touches or middle_touches:
-                lines.append("")  # blank line separator
+                lines.append("")
             lines.append("*⬇️ LOWER BB Touches:*")
             for item in sorted(lower_touches, key=lambda x: x['symbol']):
                 lines.append(format_line(item))
@@ -739,40 +852,49 @@ def format_results_by_timeframe(results, cached_timeframes_used=None):
         messages.append(header + "\n" + "\n".join(lines))
 
     timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-    messages = [m + f"\n\n_Report generated at {timestamp}_" for m in messages]
-    return messages
+    # Append timestamp to each message chunk for better readability if split
+    final_messages = []
+    for msg in messages:
+        final_messages.append(msg + f"\n\n_Report generated at {timestamp}_")
+    return final_messages
 
-def split_message(text, max_length=4000):
+def split_message(text: str, max_length: int = 4000) -> List[str]:
+    """Splits a long message into chunks suitable for Telegram."""
     lines = text.split('\n')
-    chunks = []
+    chunks: List[str] = []
     current_chunk = ""
     for line in lines:
+        # Check if adding the next line (plus a newline) exceeds max_length
         if len(current_chunk) + len(line) + 1 > max_length:
-            chunks.append(current_chunk)
-            current_chunk = line
+            if current_chunk: # Add current chunk if not empty
+                chunks.append(current_chunk)
+            current_chunk = line # Start new chunk with current line
         else:
             if current_chunk:
                 current_chunk += "\n" + line
             else:
                 current_chunk = line
-    if current_chunk:
+    if current_chunk: # Add any remaining chunk
         chunks.append(current_chunk)
     return chunks
 
-def send_telegram_alert(bot_token, chat_id, message):
+def send_telegram_alert(bot_token: str, chat_id: str, message: str) -> bool:
+    """Sends a message to Telegram."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         'chat_id': chat_id,
         'text': message,
-        'parse_mode': 'Markdown'
+        'parse_mode': 'Markdown',
+        'disable_web_page_preview': True # Often good for bots
     }
     try:
         for attempt in range(3):
             response = requests.post(url, data=payload, timeout=10)
             if response.status_code == 200:
                 return True
+            logging.warning(f"Telegram API returned {response.status_code}: {response.text}. Retrying...")
             time.sleep(1)
-        logging.error(f"Telegram alert failed: {response.text}")
+        logging.error(f"Telegram alert failed after multiple attempts: {response.text}")
         return False
     except Exception as e:
         logging.error(f"Exception sending Telegram alert: {e}")
@@ -781,64 +903,78 @@ def send_telegram_alert(bot_token, chat_id, message):
 # === MAIN ASYNC ENTRY POINT ===
 
 async def main_async():
+    """Main asynchronous function to run the bot."""
     start_time = time.time()
-    BOT = os.environ.get("TELEGRAM_BOT_TOKEN")
-    CHAT = os.environ.get("TELEGRAM_CHAT_ID")
+    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
     REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+
+    if not BOT_TOKEN or not CHAT_ID:
+        logging.error("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables are not set. Exiting.")
+        return
 
     cache_manager = CacheManager(redis_url=REDIS_URL)
     await cache_manager.initialize()
 
+    proxy_pool = AsyncProxyPool(
+        sources=PROXY_SOURCES,
+        max_pool_size=30, # Slightly increased pool size
+        min_working=7,
+        check_interval=300, # More frequent health checks
+        max_failures=3
+    )
+    await proxy_pool.initialize()
+
     try:
         logging.info("Starting BB touch scanner bot…")
 
-        # Load last sent state and compute candle opens
+        # Load last sent state
         sent_state = await load_sent_state_async(cache_manager)
 
-        active = set(get_active_timeframes())
-        now_opens = {tf: get_latest_candle_open(tf).isoformat() for tf in CACHED_TFS if tf in active}
-        to_send_cached = {tf for tf, iso in now_opens.items() if sent_state.get(tf) != iso}
+        active_timeframes = get_active_timeframes()
+        now_opens = {tf: get_latest_candle_open(tf).isoformat() for tf in CACHED_TFS if tf in active_timeframes}
+        # Determine which cached timeframes need to be sent (new candle open)
+        to_send_cached_tfs = {tf for tf, iso in now_opens.items() if sent_state.get(tf) != iso}
 
-        logging.info(f"Always-fresh TFs (every run): {sorted(active - CACHED_TFS)}")
-        logging.info(f"Cached TFs sending only now: {sorted(to_send_cached)}")
-
-        # Initialize proxy pool (your existing code)
-        proxy_pool = AsyncProxyPool(
-            sources=PROXY_SOURCES,
-            max_pool_size=25,
-            min_working=5,
-            check_interval=600,
-            max_failures=3
-        )
-        await proxy_pool.initialize()
+        logging.info(f"Always-fresh TFs (every run): {sorted(set(active_timeframes) - CACHED_TFS)}")
+        logging.info(f"Cached TFs sending only on new candle open: {sorted(to_send_cached_tfs)}")
 
         # Scan for BB touches
-        results, fresh_timeframes = await scan_for_bb_touches_async(proxy_pool, cache_manager)
+        results, fresh_timeframes_scanned = await scan_for_bb_touches_async(proxy_pool, cache_manager)
 
         # Format messages
-        initial_cached = [tf for tf in CACHED_TFS if tf in active and await load_cache_async(cache_manager, tf) is not None]
-        messages = format_results_by_timeframe(results, cached_timeframes_used=initial_cached)
+        # `fresh_timeframes_scanned` contains TFs that were scanned fresh this run (either uncached or expired cache)
+        messages = format_results_by_timeframe(results, cached_timeframes_used=fresh_timeframes_scanned)
 
-        # Filter messages to send
-        allowed_tfs = (active - CACHED_TFS).union(to_send_cached)
+        # Filter messages to send based on the logic:
+        # 1. Always send results for non-cached timeframes.
+        # 2. Send results for cached timeframes ONLY if their candle has just opened (i.e., in `to_send_cached_tfs`).
+        messages_to_dispatch: List[str] = []
+        for msg in messages:
+            # Extract timeframe from the message header
+            match = re.search(r"BB Touches on (\S+) Timeframe", msg)
+            if match:
+                timeframe_in_msg = match.group(1)
+                if timeframe_in_msg in (set(active_timeframes) - CACHED_TFS):
+                    messages_to_dispatch.append(msg)
+                elif timeframe_in_msg in to_send_cached_tfs:
+                    messages_to_dispatch.append(msg)
+            else:
+                # If timeframe cannot be extracted, it might be a general info message, send it.
+                messages_to_dispatch.append(msg)
 
-        def msg_timeframe(msg: str) -> str:
-            m = re.search(r"BB Touches on (\S+) Timeframe", msg)
-            return m.group(1) if m else ""
-
-        to_send = [m for m in messages if msg_timeframe(m) in allowed_tfs]
 
         # Dispatch alerts
-        if not to_send:
+        if not messages_to_dispatch:
             logging.info("No BB-touch alerts to send this run.")
         else:
-            for i, msg in enumerate(to_send, 1):
-                logging.info(f"Sending message {i}/{len(to_send)}")
+            for i, msg in enumerate(messages_to_dispatch, 1):
+                logging.info(f"Sending message {i}/{len(messages_to_dispatch)}")
                 for chunk in split_message(msg):
-                    send_telegram_alert(BOT, CHAT, chunk)
+                    send_telegram_alert(BOT_TOKEN, CHAT_ID, chunk)
 
-        # Update sent state for cached TFs sent
-        for tf in to_send_cached:
+        # Update sent state for cached TFs that were just sent
+        for tf in to_send_cached_tfs:
             sent_state[tf] = now_opens[tf]
         await save_sent_state_async(cache_manager, sent_state)
 
@@ -846,13 +982,16 @@ async def main_async():
 
     except Exception as e:
         elapsed = time.time() - start_time
-        logging.error(f"Fatal error after {elapsed:.1f}s: {e}")
-        if BOT and CHAT:
-            error_msg = f"*⚠️ Scanner Error*\n`{e}` after {elapsed:.1f}s"
-            send_telegram_alert(BOT, CHAT, error_msg)
+        logging.error(f"Fatal error after {elapsed:.1f}s: {e}", exc_info=True)
+        if BOT_TOKEN and CHAT_ID:
+            error_msg = f"*⚠️ Scanner Error*\n`{e}` after `{elapsed:.1f}s`"
+            send_telegram_alert(BOT_TOKEN, CHAT_ID, error_msg)
 
     finally:
+        await proxy_pool.shutdown() # Ensure proxy pool tasks are cancelled
         await cache_manager.close()
+        logging.info("Bot resources cleaned up.")
 
 if __name__ == "__main__":
     asyncio.run(main_async())
+
