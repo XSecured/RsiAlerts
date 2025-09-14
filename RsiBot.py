@@ -54,7 +54,7 @@ PROXY_SOURCES = [
 
 TIMEFRAMES_TOGGLE = {
     '3m': False,
-    '5m': True,
+    '5m': False,
     '15m': True,
     '30m': True,
     '1h': True,
@@ -66,7 +66,7 @@ TIMEFRAMES_TOGGLE = {
 
 MIDDLE_BAND_TOGGLE = {
     '3m': False,
-    '5m': True,
+    '5m': False,
     '15m': True,
     '30m': True,
     '1h': True,
