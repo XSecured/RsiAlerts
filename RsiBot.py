@@ -820,11 +820,11 @@ def format_results_by_timeframe(results: List[Dict[str, Any]], cached_timeframes
         lines: List[str] = []
 
         def format_line(item: Dict[str, Any]) -> str:
-            market_tag = "[F]" if item.get('market_type') == 'FUTURES' else "[S]"
+            market_tag = "[]" if item.get('market_type') == 'FUTURES' else "[]"
             base = f"*{item['symbol']}* {market_tag} - RSI: {item['rsi']:.2f}"
             if item['touch_type'] == 'MIDDLE':
                 side = item.get('direction', 'from below')
-                arrow = "🔻" if side == "from above" else "⬆️" # Changed arrow for clarity
+                arrow = "🔻" if side == "from above" else "↑"
                 base += f" ({arrow})"
 
             if item.get('hot'):
