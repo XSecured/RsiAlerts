@@ -711,6 +711,7 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
 async def scan_for_bb_touches_async(proxy_manager: AsyncProxyPool, cache_manager: CacheManager) -> Tuple[List[Dict[str, Any]], Set[str]]:
     """
     Orchestrates the scanning process for BB touches across all symbols and timeframes.
+    Returns (results, cached_timeframes_used) where cached_timeframes_used are the timeframes that were loaded from cache.
     """
     results: List[Dict[str, Any]] = []
     batch_size = 70 # Number of symbols to process concurrently in a batch
@@ -720,7 +721,7 @@ async def scan_for_bb_touches_async(proxy_manager: AsyncProxyPool, cache_manager
     uncached_timeframes = [tf for tf in active_timeframes if tf not in cached_timeframes]
 
     cached_results: Dict[str, List[Dict[str, Any]]] = {}
-    fresh_timeframes: Set[str] = set()
+    cached_timeframes_used: Set[str] = set()  # Track which timeframes were actually loaded from cache
 
     async with aiohttp.ClientSession() as session:
         futures_symbols, spot_symbols = await get_all_tradable_usdt_symbols_async(session, proxy_manager)
@@ -732,6 +733,7 @@ async def scan_for_bb_touches_async(proxy_manager: AsyncProxyPool, cache_manager
             cached_data = await load_cache_async(cache_manager, timeframe)
             if cached_data is not None:
                 cached_results[timeframe] = cached_data
+                cached_timeframes_used.add(timeframe)  # Mark this timeframe as loaded from cache
                 logging.info(f"[CACHE] Loaded {len(cached_data)} results for {timeframe} from cache.")
             else:
                 logging.info(f"[CACHE] No valid cache found for {timeframe}, will scan fresh.")
@@ -755,7 +757,7 @@ async def scan_for_bb_touches_async(proxy_manager: AsyncProxyPool, cache_manager
                             timeframe_scan_results.extend(res)
                 await save_cache_async(cache_manager, timeframe, timeframe_scan_results)
                 cached_results[timeframe] = timeframe_scan_results
-                fresh_timeframes.add(timeframe)
+                # Don't add to cached_timeframes_used since this was a fresh scan
                 logging.info(f"[CACHE] Saved fresh scan results for {timeframe} ({len(timeframe_scan_results)} items).")
 
         # Process uncached timeframes (always fresh scan)
@@ -775,7 +777,7 @@ async def scan_for_bb_touches_async(proxy_manager: AsyncProxyPool, cache_manager
                     else:
                         uncached_scan_results.extend(res)
             results.extend(uncached_scan_results)
-            fresh_timeframes.update(uncached_timeframes)
+            # uncached_timeframes are always fresh, so don't add to cached_timeframes_used
             logging.info(f"[SCAN] Completed fresh scan for uncached timeframes ({len(uncached_scan_results)} items).")
 
     # Combine all results (from cache and fresh scans)
@@ -785,7 +787,7 @@ async def scan_for_bb_touches_async(proxy_manager: AsyncProxyPool, cache_manager
 
     logging.info(f"[RESULTS] Total BB touches found: {len(results)}")
 
-    return results, fresh_timeframes
+    return results, cached_timeframes_used  # Return which timeframes were actually from cache
 
 # === FORMATTING & TELEGRAM SENDING ===
 
@@ -941,11 +943,11 @@ async def main_async():
         logging.info(f"Cached TFs sending only on new candle open: {sorted(to_send_cached_tfs)}")
 
         # Scan for BB touches
-        results, fresh_timeframes_scanned = await scan_for_bb_touches_async(proxy_pool, cache_manager)
+        results, cached_timeframes_used = await scan_for_bb_touches_async(proxy_pool, cache_manager)
 
         # Format messages
-        # `fresh_timeframes_scanned` contains TFs that were scanned fresh this run (either uncached or expired cache)
-        messages = format_results_by_timeframe(results, cached_timeframes_used=fresh_timeframes_scanned)
+        # `cached_timeframes_used` contains TFs that were loaded from cache (not scanned fresh)
+        messages = format_results_by_timeframe(results, cached_timeframes_used=cached_timeframes_used)
 
         # Filter messages to send based on the logic:
         # 1. Always send results for non-cached timeframes.
@@ -963,7 +965,6 @@ async def main_async():
             else:
                 # If timeframe cannot be extracted, it might be a general info message, send it.
                 messages_to_dispatch.append(msg)
-
 
         # Dispatch alerts
         if not messages_to_dispatch:
