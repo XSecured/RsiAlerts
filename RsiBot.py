@@ -45,7 +45,7 @@ HIGH_TIMEFRAMES_RELAX_CANDLE_LIMIT = {'1d', '1w'}
 MIN_CANDLES_FOR_TALIB = max(RSI_PERIOD, BB_LENGTH) + 2 # A safe minimum for RSI and BB
 
 UPPER_TOUCH_THRESHOLD = 0.02  # 2%
-MIDDLE_TOUCH_THRESHOLD = 0.015  # 1.5%
+MIDDLE_TOUCH_THRESHOLD = 0.035  # 3.5%
 LOWER_TOUCH_THRESHOLD = 0.02  # 2%
 
 PROXY_SOURCES = [
@@ -826,7 +826,7 @@ def format_results_by_timeframe(results: List[Dict[str, Any]], cached_timeframes
             base = f"*{item['symbol']}* {market_tag} - RSI: {item['rsi']:.2f}"
             if item['touch_type'] == 'MIDDLE':
                 side = item.get('direction', 'from below')
-                arrow = "🔻" if side == "from above" else "↑"
+                arrow = "🔻" if side == "from above" else "🔹"
                 base += f" ({arrow})"
 
             if item.get('hot'):
