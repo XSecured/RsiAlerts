@@ -293,93 +293,6 @@ async def rank_proxies_by_speed_async(
     logging.info(f"rank_proxies_by_speed_async → ranked {len(valid)} proxies")
     return valid
 
-# Updated make_request_async with better error handling
-async def make_request_async(
-    session: aiohttp.ClientSession, 
-    url: str, 
-    params: Optional[Dict[str, Any]] = None, 
-    proxy_manager: Optional[AsyncProxyPool] = None, 
-    max_attempts: int = 4
-) -> Dict[str, Any]:
-    """
-    Makes an asynchronous HTTP request with proxy rotation and retry logic.
-    """
-    attempt = 0
-    last_error = None
-    used_proxies: Set[str] = set()
-
-    while attempt < max_attempts:
-        proxy = None
-        proxy_url = None
-        
-        if proxy_manager:
-            proxy = await proxy_manager.get_next_proxy()
-
-            if proxy is None:
-                logging.warning("No working proxies available → refreshing pool…")
-                await proxy_manager.populate_to_max()
-                proxy = await proxy_manager.get_next_proxy()
-
-                if proxy is None:
-                    logging.error("Still no proxies after repopulation. Trying direct connection.")
-                    # Try without proxy as last resort
-                    proxy_url = None
-                else:
-                    if proxy in used_proxies:
-                        attempt += 1
-                        continue
-                    used_proxies.add(proxy)
-                    proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
-            else:
-                if proxy in used_proxies:
-                    attempt += 1
-                    continue
-                used_proxies.add(proxy)
-                proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
-
-        try:
-            # Use ssl=False for proxy connections to avoid SSL verification issues
-            async with session.get(
-                url, 
-                params=params, 
-                proxy=proxy_url, 
-                timeout=aiohttp.ClientTimeout(total=15),
-                ssl=False if proxy_url else True
-            ) as resp:
-                if resp.status == 451:  # Unavailable for legal reasons
-                    logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure.")
-                    if proxy_manager and proxy:
-                        await proxy_manager.mark_proxy_failure(proxy)
-                    attempt += 1
-                    continue
-
-                resp.raise_for_status()
-                if proxy_manager and proxy:
-                    await proxy_manager.reset_proxy_failures(proxy)
-                return await resp.json()
-
-        except aiohttp.ClientError as e:
-            last_error = str(e)
-            logging.error(f"Request failed with proxy {proxy if proxy else 'direct'}: {e}. Attempt {attempt + 1}/{max_attempts}")
-            if proxy_manager and proxy:
-                await proxy_manager.mark_proxy_failure(proxy)
-            attempt += 1
-            await asyncio.sleep(min(2 ** attempt, 10))
-        except asyncio.TimeoutError as e:
-            last_error = "Timeout"
-            logging.error(f"Request timeout with proxy {proxy if proxy else 'direct'}. Attempt {attempt + 1}/{max_attempts}")
-            if proxy_manager and proxy:
-                await proxy_manager.mark_proxy_failure(proxy)
-            attempt += 1
-            await asyncio.sleep(min(2 ** attempt, 10))
-        except Exception as e:
-            last_error = str(e)
-            logging.error(f"Unexpected error during request to {url}: {e}. Attempt {attempt + 1}/{max_attempts}")
-            attempt += 1
-            await asyncio.sleep(min(2 ** attempt, 10))
-
-    raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts. Last error: {last_error}")
-
 class AsyncProxyPool:
     """Manages a pool of asynchronous proxies."""
     def __init__(
@@ -581,15 +494,25 @@ class AsyncProxyPool:
 
 # === ASYNC REQUESTS & SCANNING ===
 
-async def make_request_async(session: aiohttp.ClientSession, url: str, params: Optional[Dict[str, Any]] = None, proxy_manager: Optional[AsyncProxyPool] = None, max_attempts: int = 4) -> Dict[str, Any]:
+# Updated make_request_async with better error handling
+async def make_request_async(
+    session: aiohttp.ClientSession, 
+    url: str, 
+    params: Optional[Dict[str, Any]] = None, 
+    proxy_manager: Optional[AsyncProxyPool] = None, 
+    max_attempts: int = 4
+) -> Dict[str, Any]:
     """
     Makes an asynchronous HTTP request with proxy rotation and retry logic.
     """
     attempt = 0
+    last_error = None
     used_proxies: Set[str] = set()
 
     while attempt < max_attempts:
         proxy = None
+        proxy_url = None
+        
         if proxy_manager:
             proxy = await proxy_manager.get_next_proxy()
 
@@ -599,41 +522,64 @@ async def make_request_async(session: aiohttp.ClientSession, url: str, params: O
                 proxy = await proxy_manager.get_next_proxy()
 
                 if proxy is None:
-                    logging.error("Still no proxies after repopulation. Cannot make request.")
-                    break
-
-            if proxy in used_proxies: # Avoid retrying with the same proxy in a single request sequence
-                attempt += 1
-                continue
-
-            used_proxies.add(proxy)
-            proxy_url = proxy if proxy.startswith(("http://","https://")) else f"http://{proxy}"
-        else:
-            proxy_url = None # No proxy if manager not provided
+                    logging.error("Still no proxies after repopulation. Trying direct connection.")
+                    # Try without proxy as last resort
+                    proxy_url = None
+                else:
+                    if proxy in used_proxies:
+                        attempt += 1
+                        continue
+                    used_proxies.add(proxy)
+                    proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
+            else:
+                if proxy in used_proxies:
+                    attempt += 1
+                    continue
+                used_proxies.add(proxy)
+                proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
 
         try:
-            async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
-                if resp.status == 451: # Unavailable for legal reasons
+            # Use ssl=False for proxy connections to avoid SSL verification issues
+            async with session.get(
+                url, 
+                params=params, 
+                proxy=proxy_url, 
+                timeout=aiohttp.ClientTimeout(total=15),
+                ssl=False if proxy_url else True
+            ) as resp:
+                if resp.status == 451:  # Unavailable for legal reasons
                     logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure.")
-                    if proxy_manager: await proxy_manager.mark_proxy_failure(proxy)
+                    if proxy_manager and proxy:
+                        await proxy_manager.mark_proxy_failure(proxy)
                     attempt += 1
                     continue
 
-                resp.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
-                if proxy_manager and proxy: await proxy_manager.reset_proxy_failures(proxy)
+                resp.raise_for_status()
+                if proxy_manager and proxy:
+                    await proxy_manager.reset_proxy_failures(proxy)
                 return await resp.json()
 
         except aiohttp.ClientError as e:
-            logging.error(f"Request failed with proxy {proxy_url if proxy_url else 'direct'}: {e}. Attempt {attempt + 1}/{max_attempts}")
-            if proxy_manager and proxy: await proxy_manager.mark_proxy_failure(proxy)
+            last_error = str(e)
+            logging.error(f"Request failed with proxy {proxy if proxy else 'direct'}: {e}. Attempt {attempt + 1}/{max_attempts}")
+            if proxy_manager and proxy:
+                await proxy_manager.mark_proxy_failure(proxy)
             attempt += 1
-            await asyncio.sleep(min(2 * attempt, 10)) # Exponential backoff
+            await asyncio.sleep(min(2 ** attempt, 10))
+        except asyncio.TimeoutError as e:
+            last_error = "Timeout"
+            logging.error(f"Request timeout with proxy {proxy if proxy else 'direct'}. Attempt {attempt + 1}/{max_attempts}")
+            if proxy_manager and proxy:
+                await proxy_manager.mark_proxy_failure(proxy)
+            attempt += 1
+            await asyncio.sleep(min(2 ** attempt, 10))
         except Exception as e:
+            last_error = str(e)
             logging.error(f"Unexpected error during request to {url}: {e}. Attempt {attempt + 1}/{max_attempts}")
             attempt += 1
-            await asyncio.sleep(min(2 * attempt, 10))
+            await asyncio.sleep(min(2 ** attempt, 10))
 
-    raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts.")
+    raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts. Last error: {last_error}")
 
 async def get_all_tradable_usdt_symbols_async(session: aiohttp.ClientSession, proxy_manager: AsyncProxyPool, max_attempts: int = 5) -> Tuple[List[str], List[str]]:
     """
