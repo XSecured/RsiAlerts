@@ -201,7 +201,6 @@ def get_latest_candle_open(timeframe: str, now: Optional[datetime] = None) -> da
 # === ASYNC PROXY POOL & REQUESTS ===
 
 async def fetch_proxies_from_url_async(url: str, default_scheme: str = "http") -> List[str]:
-    """Fetches proxies from a given URL."""
     proxies = []
     try:
         async with aiohttp.ClientSession() as session:
@@ -221,37 +220,29 @@ async def fetch_proxies_from_url_async(url: str, default_scheme: str = "http") -
     return proxies
 
 async def test_proxy_async(session: aiohttp.ClientSession, proxy: str) -> bool:
-    """Tests if a proxy is working."""
     try:
-        proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
-        async with session.get(PROXY_TEST_URL, proxy=proxy_url, timeout=8, ssl=False) as resp:
+        async with session.get(PROXY_TEST_URL, proxy=proxy, timeout=8) as resp:
             return 200 <= resp.status < 300
     except Exception:
         return False
 
 async def test_proxy_speed_async(session: aiohttp.ClientSession, proxy: str) -> float:
-    """Tests the speed of a proxy by measuring response time."""
+    start = time.time()
     try:
-        proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
-        start = time.time()
-        async with session.get(PROXY_TEST_URL, proxy=proxy_url, timeout=8, ssl=False) as resp:
-            if 200 <= resp.status < 300:
-                return time.time() - start
-            return float('inf')
+        async with session.get(PROXY_TEST_URL, proxy=proxy, timeout=10) as resp:
+            resp.raise_for_status()
+            return time.time() - start
     except Exception:
-        return float('inf')
+        return float("inf")
 
 async def test_proxies_concurrently_async(
     proxies: List[str],
     max_workers: int = 50,
     max_working: int = 25
 ) -> List[str]:
-    """Tests a list of proxies concurrently and returns working ones."""
     working = []
     sem = asyncio.Semaphore(max_workers)
-    
-    connector = aiohttp.TCPConnector(limit=100, force_close=True)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession() as session:
         async def sem_test(p):
             async with sem:
                 ok = await test_proxy_async(session, p)
@@ -267,19 +258,15 @@ async def test_proxies_concurrently_async(
                         if not t.done():
                             t.cancel()
                     break
-    
     logging.info(f"test_proxies_concurrently_async → {len(working)}/{len(proxies)} worked")
     return working
 
 async def rank_proxies_by_speed_async(
     proxies: List[str],
     max_workers: int = 20
-) -> List[Tuple[str, float]]:
-    """Ranks proxies by speed."""
+) -> List[tuple]:
     sem = asyncio.Semaphore(max_workers)
-    
-    connector = aiohttp.TCPConnector(limit=100, force_close=True)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession() as session:
         async def sem_speed(p):
             async with sem:
                 spd = await test_proxy_speed_async(session, p)
@@ -287,14 +274,12 @@ async def rank_proxies_by_speed_async(
 
         tasks = [asyncio.create_task(sem_speed(p)) for p in proxies]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    valid = [(r[0], r[1]) for r in results if isinstance(r, tuple) and r[1] != float('inf')]
+    valid = [r for r in results if isinstance(r, tuple)]
     valid.sort(key=lambda x: x[1])
     logging.info(f"rank_proxies_by_speed_async → ranked {len(valid)} proxies")
     return valid
 
 class AsyncProxyPool:
-    """Manages a pool of asynchronous proxies."""
     def __init__(
         self,
         sources: List[str] = PROXY_SOURCES,
@@ -308,175 +293,140 @@ class AsyncProxyPool:
         self.min_working = min_working
         self.check_interval = check_interval
         self.max_failures = max_failures
-        self.blacklisted: Set[str] = set()
-        self._proxy_lock = asyncio.Lock()
+        self.blacklisted = set()           # Add immediate blacklist
+        self._proxy_lock = asyncio.Lock()  # Add lock for thread safety
 
         self.proxies: List[str] = []
-        self.failures: Dict[str, int] = {}
-        self.failed: Set[str] = set()
-        self.cycle: Optional[itertools.cycle] = None
-        self.fastest_proxy: Optional[str] = None
+        self.failures = {}          # proxy -> count
+        self.failed = set()         # proxies removed
+        self.cycle = None           # itertools.cycle
 
         self._stop = False
-        self._tasks: List[asyncio.Task] = []
+        self._tasks = []
 
     async def initialize(self):
-        """Initializes the proxy pool and starts health check loops."""
         await self.populate_to_max()
         self._tasks.append(asyncio.create_task(self._health_check_loop()))
         self._tasks.append(asyncio.create_task(self._fastest_proxy_loop()))
 
     async def _health_check_loop(self):
-        """Periodically checks the health of proxies in the pool."""
         while not self._stop:
             await asyncio.sleep(self.check_interval)
             await self.check_proxies()
 
     async def _fastest_proxy_loop(self):
-        """Periodically updates the fastest proxy."""
         while not self._stop:
-            await asyncio.sleep(3600)  # Every hour
+            await asyncio.sleep(3600)
             await self.update_fastest_proxy()
 
     async def populate_to_max(self):
-        """Replenishes the proxy pool up to max_pool_size."""
+        """Faster, more aggressive proxy replenishment"""
         async with self._proxy_lock:
             needed = self.max_pool_size - len(self.proxies)
             if needed <= 0:
                 return
-
+            
+            # Clear blacklist if we're running low on proxies
             if len(self.proxies) < self.min_working:
-                logging.warning("Running low on proxies, clearing blacklist to find more.")
+                logging.warning("Running low on proxies, clearing blacklist")
                 self.blacklisted.clear()
                 self.failed.clear()
                 self.failures.clear()
-
+        
             new_list = []
             for src in self.sources:
                 fetched = await fetch_proxies_from_url_async(src)
-                # Filter out already blacklisted and existing proxies
-                fetched = [p for p in fetched if p not in self.blacklisted and p not in self.proxies]
+                # Filter out already blacklisted proxies
+                fetched = [p for p in fetched if p not in self.blacklisted]
                 new_list.extend(fetched)
-                if len(new_list) >= needed * 3:  # Fetch 3x more than needed to have better selection
+                if len(new_list) >= needed * 2:
                     break
-
-            if not new_list:
-                logging.error("No new proxies fetched from sources!")
-                return
-
-            # Test more proxies to find good ones
+                
             working = await test_proxies_concurrently_async(
-                new_list,
-                max_workers=100,
-                max_working=min(needed + 10, len(new_list))  # Try to get a few extra
+                new_list, 
+                max_workers=100,  # Increase workers for faster testing
+                max_working=needed
             )
-
-            if working:
-                # Rank by speed and take the fastest ones
-                ranked = await rank_proxies_by_speed_async(working[:needed + 5], max_workers=20)
-                if ranked:
-                    fastest_working = [p for p, _ in ranked[:needed]]
-                    self.proxies.extend(fastest_working)
-                    if ranked and not self.fastest_proxy:
-                        self.fastest_proxy = ranked[0][0]
-                else:
-                    self.proxies.extend(working[:needed])
-            
+        
+            self.proxies.extend(working)
             self._rebuild_cycle()
             logging.info(f"Pool populated: {len(self.proxies)}/{self.max_pool_size}")
 
     def _rebuild_cycle(self):
-        """Rebuilds the proxy cycle iterator."""
-        if self.proxies:
-            # Put fastest proxy first if available
-            if self.fastest_proxy and self.fastest_proxy in self.proxies:
-                self.proxies.remove(self.fastest_proxy)
-                self.proxies.insert(0, self.fastest_proxy)
-            self.cycle = itertools.cycle(self.proxies)
-        else:
-            self.cycle = None
+        self.cycle = itertools.cycle(self.proxies)
 
-    async def get_next_proxy(self) -> Optional[str]:
-        """Retrieves the next available proxy from the pool."""
+    async def get_next_proxy(self) -> str:
+        """Thread-safe proxy selection with immediate blacklisting"""
         async with self._proxy_lock:
             if not self.proxies:
                 return None
-
+                
             # Remove blacklisted proxies from active pool immediately
             self.proxies = [p for p in self.proxies if p not in self.blacklisted]
             if not self.proxies:
                 return None
-
+                
             self._rebuild_cycle()
-
-            # Iterate through the cycle to find a non-blacklisted, non-failed proxy
+            
             for _ in range(len(self.proxies)):
-                if self.cycle:
-                    proxy = next(self.cycle)
-                    if proxy not in self.blacklisted and proxy not in self.failed:
-                        return proxy
+                proxy = next(self.cycle)
+                if proxy not in self.blacklisted and proxy not in self.failed:
+                    return proxy
             return None
 
     async def mark_proxy_failure(self, proxy: str):
-        """Marks a proxy as failed and potentially blacklists it."""
-        if not proxy:
-            return
-            
+        """Immediately blacklist problematic proxies"""
         async with self._proxy_lock:
             c = self.failures.get(proxy, 0) + 1
             self.failures[proxy] = c
-
+            
             logging.warning(f"Proxy {proxy} failure {c}/{self.max_failures}")
-
+            
             if c >= self.max_failures:
+                # Immediate blacklisting
                 self.blacklisted.add(proxy)
                 self.failed.add(proxy)
+                
                 if proxy in self.proxies:
                     self.proxies.remove(proxy)
-                    logging.warning(f"Removed {proxy} from pool due to excessive failures.")
+                    logging.warning(f"Removed {proxy} from pool")
                     self._rebuild_cycle()
-                
-                # If we're running low on proxies, immediately try to replenish
-                if len(self.proxies) < self.min_working:
-                    asyncio.create_task(self.populate_to_max())
 
     async def reset_proxy_failures(self, proxy: str):
-        """Resets failure count for a proxy and removes it from blacklist if applicable."""
-        if not proxy:
-            return
-            
+        """Reset failures and remove from blacklist"""
         async with self._proxy_lock:
             if proxy in self.failures:
                 self.failures[proxy] = 0
             if proxy in self.failed:
                 self.failed.remove(proxy)
+            if proxy in self.blacklisted:
+                self.blacklisted.remove(proxy)
+                if proxy not in self.proxies:
+                    self.proxies.append(proxy)
+                    self._rebuild_cycle()
 
     async def check_proxies(self):
-        """Performs a health check on all proxies in the pool."""
         if not self.proxies:
-            await self.populate_to_max()
             return
-            
-        connector = aiohttp.TCPConnector(limit=100, force_close=True)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession() as session:
             sem = asyncio.Semaphore(50)
             async def sem_test(p):
                 async with sem:
                     ok = await test_proxy_async(session, p)
                     return (p, ok)
-            tasks = [asyncio.create_task(sem_test(p)) for p in self.proxies[:]]
+            tasks = [asyncio.create_task(sem_test(p)) for p in self.proxies]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        alive = [p for r in results if isinstance(r, tuple) for p, ok in [r] if ok]
+        alive = [p for p, ok in results if ok]
         removed = len(self.proxies) - len(alive)
         self.proxies = alive
         self.failed.clear()
         self.failures = {}
         self._rebuild_cycle()
         logging.info(f"Health check removed {removed} proxies; pool now {len(self.proxies)}")
+        if len(self.proxies) < self.min_working:
+            await self.populate_to_max()
 
     async def update_fastest_proxy(self):
-        """Identifies and logs the fastest proxy."""
         ranked = await rank_proxies_by_speed_async(self.proxies, max_workers=20)
         if ranked:
             fastest = ranked[0][0]
@@ -485,101 +435,61 @@ class AsyncProxyPool:
             logging.warning("Could not determine fastest proxy")
 
     async def shutdown(self):
-        """Shuts down the proxy pool and cancels background tasks."""
         self._stop = True
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        logging.info("Proxy pool shutdown complete.")
-
+        
 # === ASYNC REQUESTS & SCANNING ===
 
-# Updated make_request_async with better error handling
-async def make_request_async(
-    session: aiohttp.ClientSession, 
-    url: str, 
-    params: Optional[Dict[str, Any]] = None, 
-    proxy_manager: Optional[AsyncProxyPool] = None, 
-    max_attempts: int = 4
-) -> Dict[str, Any]:
-    """
-    Makes an asynchronous HTTP request with proxy rotation and retry logic.
-    """
+async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=4):
+    """Fixed request function with proper proxy handling"""
+    
     attempt = 0
-    last_error = None
-    used_proxies: Set[str] = set()
-
+    used_proxies = set()  # Track proxies used in this request
+    
     while attempt < max_attempts:
-        proxy = None
-        proxy_url = None
+        proxy = await proxy_manager.get_next_proxy()  # Make it async
         
-        if proxy_manager:
+        if proxy is None:
+            logging.warning("No working proxies available → refreshing pool…")
+            await proxy_manager.populate_to_max()
             proxy = await proxy_manager.get_next_proxy()
-
+            
             if proxy is None:
-                logging.warning("No working proxies available → refreshing pool…")
-                await proxy_manager.populate_to_max()
-                proxy = await proxy_manager.get_next_proxy()
-
-                if proxy is None:
-                    logging.error("Still no proxies after repopulation. Trying direct connection.")
-                    # Try without proxy as last resort
-                    proxy_url = None
-                else:
-                    if proxy in used_proxies:
-                        attempt += 1
-                        continue
-                    used_proxies.add(proxy)
-                    proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
-            else:
-                if proxy in used_proxies:
-                    attempt += 1
-                    continue
-                used_proxies.add(proxy)
-                proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
-
+                logging.error("Still no proxies after repopulation")
+                break
+                
+        # Skip if we already tried this proxy in this request
+        if proxy in used_proxies:
+            attempt += 1
+            continue
+            
+        used_proxies.add(proxy)
+        proxy_url = proxy if proxy.startswith(("http://","https://")) else f"http://{proxy}"
+        
         try:
-            # Use ssl=False for proxy connections to avoid SSL verification issues
-            async with session.get(
-                url, 
-                params=params, 
-                proxy=proxy_url, 
-                timeout=aiohttp.ClientTimeout(total=15),
-                ssl=False if proxy_url else True
-            ) as resp:
-                if resp.status == 451:  # Unavailable for legal reasons
-                    logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure.")
-                    if proxy_manager and proxy:
-                        await proxy_manager.mark_proxy_failure(proxy)
+            async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
+                if resp.status == 451:
+                    logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure")
+                    await proxy_manager.mark_proxy_failure(proxy)  # Make it async
                     attempt += 1
                     continue
 
                 resp.raise_for_status()
-                if proxy_manager and proxy:
-                    await proxy_manager.reset_proxy_failures(proxy)
+                await proxy_manager.reset_proxy_failures(proxy)  # Make it async
                 return await resp.json()
 
-        except aiohttp.ClientError as e:
-            last_error = str(e)
-            logging.error(f"Request failed with proxy {proxy if proxy else 'direct'}: {e}. Attempt {attempt + 1}/{max_attempts}")
-            if proxy_manager and proxy:
-                await proxy_manager.mark_proxy_failure(proxy)
-            attempt += 1
-            await asyncio.sleep(min(2 ** attempt, 10))
-        except asyncio.TimeoutError as e:
-            last_error = "Timeout"
-            logging.error(f"Request timeout with proxy {proxy if proxy else 'direct'}. Attempt {attempt + 1}/{max_attempts}")
-            if proxy_manager and proxy:
-                await proxy_manager.mark_proxy_failure(proxy)
-            attempt += 1
-            await asyncio.sleep(min(2 ** attempt, 10))
         except Exception as e:
-            last_error = str(e)
-            logging.error(f"Unexpected error during request to {url}: {e}. Attempt {attempt + 1}/{max_attempts}")
+            logging.error(f"Request failed with proxy {proxy}: {e}")
+            await proxy_manager.mark_proxy_failure(proxy)  # Make it async
             attempt += 1
-            await asyncio.sleep(min(2 ** attempt, 10))
+            
+            # Only sleep if we're going to retry
+            if attempt < max_attempts:
+                await asyncio.sleep(min(2 * attempt, 10))  # Cap the sleep time
 
-    raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts. Last error: {last_error}")
+    raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts")
 
 async def get_all_tradable_usdt_symbols_async(session: aiohttp.ClientSession, proxy_manager: AsyncProxyPool, max_attempts: int = 5) -> Tuple[List[str], List[str]]:
     """
