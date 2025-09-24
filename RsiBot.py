@@ -442,7 +442,7 @@ class AsyncProxyPool:
         
 # === ASYNC REQUESTS & SCANNING ===
 
-async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=4):
+async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=13):
     """Fixed request function with proper proxy handling"""
     
     attempt = 0
