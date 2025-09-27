@@ -355,19 +355,20 @@ class AsyncProxyPool:
     def _rebuild_cycle(self):
         self.cycle = itertools.cycle(self.proxies)
 
-    async def get_next_proxy(self) -> str:
-        """Thread-safe proxy selection with immediate blacklisting"""
+    async def get_next_proxy(self) -> Optional[str]:
+        """Return the next available proxy without resetting the cycle each call."""
         async with self._proxy_lock:
+            # prune blacklisted from active list
+            if self.proxies:
+                self.proxies = [p for p in self.proxies if p not in self.blacklisted]
             if not self.proxies:
                 return None
-                
-            # Remove blacklisted proxies from active pool immediately
-            self.proxies = [p for p in self.proxies if p not in self.blacklisted]
-            if not self.proxies:
-                return None
-                
-            self._rebuild_cycle()
-            
+    
+            # Only (re)build the cycle when it doesn't exist or after pool mutations elsewhere
+            if self.cycle is None:
+                self._rebuild_cycle()
+    
+            # Walk at most N steps to find a usable proxy
             for _ in range(len(self.proxies)):
                 proxy = next(self.cycle)
                 if proxy not in self.blacklisted and proxy not in self.failed:
@@ -501,7 +502,7 @@ async def get_all_tradable_usdt_symbols_async(session: aiohttp.ClientSession, pr
 
     # Fetch Futures symbols
     try:
-        futures_data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager)
+        futures_data = await make_request_async(session, BINANCE_FUTURES_EXCHANGE_INFO, proxy_manager=proxy_manager, max_attempts=getattr(proxy_manager, "max_pool_size", 20))
         if futures_data and 'symbols' in futures_data:
             for s in futures_data['symbols']:
                 if s.get('contractType') == 'PERPETUAL' and s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING':
@@ -512,7 +513,7 @@ async def get_all_tradable_usdt_symbols_async(session: aiohttp.ClientSession, pr
 
     # Fetch Spot symbols
     try:
-        spot_data = await make_request_async(session, BINANCE_SPOT_EXCHANGE_INFO, proxy_manager=proxy_manager)
+        spot_data = await make_request_async(session, BINANCE_SPOT_EXCHANGE_INFO, proxy_manager=proxy_manager, max_attempts=getattr(proxy_manager, "max_pool_size", 20))
         if spot_data and 'symbols' in spot_data:
             for s in spot_data['symbols']:
                 # Only consider USDT quote assets and trading status
