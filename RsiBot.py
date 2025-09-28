@@ -443,54 +443,52 @@ class AsyncProxyPool:
         
 # === ASYNC REQUESTS & SCANNING ===
 
-async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=5):
-    """Each attempt uses a distinct proxy; no direct connection fallback."""
+async def make_request_async(session, url, params=None, proxy_manager=None, max_attempts=4):
+    """Fixed request function with proper proxy handling"""
+    
     attempt = 0
-    used_proxies: Set[str] = set()
-
+    used_proxies = set()  # Track proxies used in this request
+    
     while attempt < max_attempts:
-        # Find a proxy not used in this request
-        proxy = None
-        spins = 0
-        pool_size = len(getattr(proxy_manager, "proxies", [])) or 0
-        while spins < max(pool_size, 1) + 2:
-            cand = await proxy_manager.get_next_proxy() if proxy_manager else None
-            if cand is None:
-                break
-            if cand not in used_proxies:
-                proxy = cand
-                break
-            spins += 1
-
+        proxy = await proxy_manager.get_next_proxy()  # Make it async
+        
         if proxy is None:
-            logging.warning("No fresh proxy available → refreshing pool…")
-            if proxy_manager:
-                await proxy_manager.populate_to_max()
-            used_proxies.clear()
+            logging.warning("No working proxies available → refreshing pool…")
+            await proxy_manager.populate_to_max()
+            proxy = await proxy_manager.get_next_proxy()
+            
+            if proxy is None:
+                logging.error("Still no proxies after repopulation")
+                break
+                
+        # Skip if we already tried this proxy in this request
+        if proxy in used_proxies:
+            attempt += 1
             continue
-
+            
         used_proxies.add(proxy)
-        proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
-
+        proxy_url = proxy if proxy.startswith(("http://","https://")) else f"http://{proxy}"
+        
         try:
-            async with session.get(
-                url, params=params, proxy=proxy_url, timeout=12, ssl=True,
-                headers={"User-Agent": "Mozilla/5.0"}
-            ) as resp:
-                if resp.status in (403, 418, 429, 451):
-                    logging.warning(f"Proxy {proxy} got HTTP {resp.status} → rotating")
-                    await proxy_manager.mark_proxy_failure(proxy)
+            async with session.get(url, params=params, proxy=proxy_url, timeout=15, ssl=True) as resp:
+                if resp.status == 451:
+                    logging.warning(f"Proxy {proxy} returned HTTP 451 → marking failure")
+                    await proxy_manager.mark_proxy_failure(proxy)  # Make it async
                     attempt += 1
                     continue
+
                 resp.raise_for_status()
-                await proxy_manager.reset_proxy_failures(proxy)
+                await proxy_manager.reset_proxy_failures(proxy)  # Make it async
                 return await resp.json()
+
         except Exception as e:
             logging.error(f"Request failed with proxy {proxy}: {e}")
-            await proxy_manager.mark_proxy_failure(proxy)
+            await proxy_manager.mark_proxy_failure(proxy)  # Make it async
             attempt += 1
+            
+            # Only sleep if we're going to retry
             if attempt < max_attempts:
-                await asyncio.sleep(min(1 + attempt // 2, 5))
+                await asyncio.sleep(min(2 * attempt, 10))  # Cap the sleep time
 
     raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts")
 
