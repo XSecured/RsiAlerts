@@ -198,6 +198,16 @@ def get_latest_candle_open(timeframe: str, now: Optional[datetime] = None) -> da
     candle_open = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=candle_open_minutes)
     return candle_open
 
+# Env-driven proxy blocklist (comma-separated: "ip:port,ip:port")
+def _normalize_proxy_env(p: str) -> str:
+    p = p.strip()
+    return p if "://" in p else f"http://{p}"
+
+PROXY_BLOCK_PERM = os.getenv("PROXY_BLOCK_PERM", "")
+ENV_BLOCKED_PROXIES = {
+    _normalize_proxy_env(p) for p in PROXY_BLOCK_PERM.split(",") if p.strip()
+}
+
 # === ASYNC PROXY POOL & REQUESTS ===
 
 async def fetch_proxies_from_url_async(url: str, default_scheme: str = "http") -> List[str]:
@@ -337,7 +347,7 @@ class AsyncProxyPool:
             for src in self.sources:
                 fetched = await fetch_proxies_from_url_async(src)
                 # Filter out already blacklisted proxies
-                fetched = [p for p in fetched if p not in self.blacklisted]
+                fetched = [p for p in fetched if p not in self.blacklisted and p not in ENV_BLOCKED_PROXIES]
                 new_list.extend(fetched)
                 if len(new_list) >= needed * 2:
                     break
@@ -347,7 +357,8 @@ class AsyncProxyPool:
                 max_workers=100,  # Increase workers for faster testing
                 max_working=needed
             )
-        
+            working = [p for p in working if p not in ENV_BLOCKED_PROXIES]
+
             self.proxies.extend(working)
             self._rebuild_cycle()
             logging.info(f"Pool populated: {len(self.proxies)}/{self.max_pool_size}")
@@ -362,7 +373,7 @@ class AsyncProxyPool:
                 return None
                 
             # Remove blacklisted proxies from active pool immediately
-            self.proxies = [p for p in self.proxies if p not in self.blacklisted]
+            self.proxies = [p for p in self.proxies if p not in self.blacklisted and p not in ENV_BLOCKED_PROXIES]
             if not self.proxies:
                 return None
                 
