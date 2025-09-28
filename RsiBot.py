@@ -203,7 +203,7 @@ def _normalize_proxy_env(p: str) -> str:
     p = p.strip()
     return p if "://" in p else f"http://{p}"
 
-PROXY_BLOCK_PERM = os.getenv("PROXY_BLOCK_PERM", "")
+PROXY_BLOCK_PERM = os.getenv("PROXY_BLOCK_PERM", "201.174.239.25:8080")
 ENV_BLOCKED_PROXIES = {
     _normalize_proxy_env(p) for p in PROXY_BLOCK_PERM.split(",") if p.strip()
 }
