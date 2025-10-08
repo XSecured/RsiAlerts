@@ -618,22 +618,24 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
     Calculates 2-day price change from 1h timeframe data (48 hours).
     """
     results: List[Dict[str, Any]] = []
-    daily_change = None  # Will be calculated from 1h timeframe data if available
+    daily_change = None
     
-    for timeframe in timeframes:
-        closes, timestamps = await fetch_klines_async(session, symbol, timeframe, proxy_manager, is_futures=is_futures)
-        
-        # Calculate 2-day change from 1h timeframe data if available
-        if timeframe == '1h' and closes and len(closes) >= 48:
-            try:
-                # Calculate 48 hours ago (2 days * 24 hours = 48 candles)
-                two_days_ago_close = closes[-48]  # 48 hours ago
-                current_price = closes[-1]         # Current hour
+    # IMPORTANT: Calculate 2-day change FIRST from 1h data if available
+    if '1h' in timeframes:
+        try:
+            closes_1h, _ = await fetch_klines_async(session, symbol, '1h', proxy_manager, is_futures=is_futures)
+            if closes_1h and len(closes_1h) >= 48:
+                two_days_ago_close = closes_1h[-48]  # 48 hours ago
+                current_price = closes_1h[-1]         # Current hour
                 if two_days_ago_close != 0:
                     daily_change = (current_price - two_days_ago_close) / two_days_ago_close * 100
-                    logging.debug(f"{symbol}: 2-day change calculated from 1h data: {daily_change:.2f}%")
-            except Exception as e:
-                logging.warning(f"Could not calculate 2-day change for {symbol} from 1h data: {e}")
+                    logging.debug(f"{symbol}: 2-day change from 1h: {daily_change:.2f}%")
+        except Exception as e:
+            logging.warning(f"Could not calculate 2-day change for {symbol} from 1h data: {e}")
+    
+    # Now process all timeframes with the daily_change already calculated
+    for timeframe in timeframes:
+        closes, timestamps = await fetch_klines_async(session, symbol, timeframe, proxy_manager, is_futures=is_futures)
         
         if closes is None or not closes:
             logging.warning(f"No klines data for {symbol} {timeframe}. Skipping.")
