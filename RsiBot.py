@@ -703,7 +703,7 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
             timestamp = datetime.utcfromtimestamp(timestamps[idx] / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
             
             hot = False
-            if daily_change is not None and daily_change > 10:  # >10% two-day change is "hot"
+            if daily_change is not None and daily_change > 7:  # >10% two-day change is "hot"
                 hot = True
             
             item = {
