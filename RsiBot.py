@@ -615,22 +615,25 @@ async def save_sent_state_async(cache_manager: CacheManager, state: Dict[str, st
 async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timeframes: List[str], proxy_manager: AsyncProxyPool, is_futures: bool) -> List[Dict[str, Any]]:
     """
     Scans a single symbol across multiple timeframes for BB touches.
+    Calculates 2-day price change from 1h timeframe data (48 hours).
     """
     results: List[Dict[str, Any]] = []
-    daily_change = None  # Will be calculated from 1d timeframe data if available
+    daily_change = None  # Will be calculated from 1h timeframe data if available
     
     for timeframe in timeframes:
         closes, timestamps = await fetch_klines_async(session, symbol, timeframe, proxy_manager, is_futures=is_futures)
         
-        # Calculate 2-day change from daily timeframe data if available
-        if timeframe == '1d' and closes and len(closes) >= 3:
+        # Calculate 2-day change from 1h timeframe data if available
+        if timeframe == '1h' and closes and len(closes) >= 48:
             try:
-                two_days_ago_close = closes[-3]
-                current_price = closes[-1]
+                # Calculate 48 hours ago (2 days * 24 hours = 48 candles)
+                two_days_ago_close = closes[-48]  # 48 hours ago
+                current_price = closes[-1]         # Current hour
                 if two_days_ago_close != 0:
                     daily_change = (current_price - two_days_ago_close) / two_days_ago_close * 100
+                    logging.debug(f"{symbol}: 2-day change calculated from 1h data: {daily_change:.2f}%")
             except Exception as e:
-                logging.warning(f"Could not calculate 2-day change for {symbol}: {e}")
+                logging.warning(f"Could not calculate 2-day change for {symbol} from 1h data: {e}")
         
         if closes is None or not closes:
             logging.warning(f"No klines data for {symbol} {timeframe}. Skipping.")
@@ -700,7 +703,7 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
             timestamp = datetime.utcfromtimestamp(timestamps[idx] / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
             
             hot = False
-            if daily_change is not None and daily_change > 10:  # Updated: >10% two-day change is "hot"
+            if daily_change is not None and daily_change > 10:  # >10% two-day change is "hot"
                 hot = True
             
             item = {
@@ -715,7 +718,7 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
                 'hot': hot,
                 'daily_change': daily_change,
                 'direction': direction,
-                'market_type': 'FUTURES' if is_futures else 'SPOT'  # New field
+                'market_type': 'FUTURES' if is_futures else 'SPOT'
             }
             
             results.append(item)
