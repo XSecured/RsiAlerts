@@ -617,14 +617,25 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
     Scans a single symbol across multiple timeframes for BB touches.
     """
     results: List[Dict[str, Any]] = []
-    daily_change = await get_daily_change_percent_async(session, symbol, proxy_manager, is_futures)
-
+    daily_change = None  # Will be calculated from 1d timeframe data if available
+    
     for timeframe in timeframes:
         closes, timestamps = await fetch_klines_async(session, symbol, timeframe, proxy_manager, is_futures=is_futures)
+        
+        # Calculate 2-day change from daily timeframe data if available
+        if timeframe == '1d' and closes and len(closes) >= 3:
+            try:
+                two_days_ago_close = closes[-3]
+                current_price = closes[-1]
+                if two_days_ago_close != 0:
+                    daily_change = (current_price - two_days_ago_close) / two_days_ago_close * 100
+            except Exception as e:
+                logging.warning(f"Could not calculate 2-day change for {symbol}: {e}")
+        
         if closes is None or not closes:
             logging.warning(f"No klines data for {symbol} {timeframe}. Skipping.")
             continue
-
+        
         # Determine minimum required candles for calculation
         required_candles = MIN_CANDLES_FOR_TALIB
         if timeframe not in HIGH_TIMEFRAMES_RELAX_CANDLE_LIMIT:
@@ -636,49 +647,47 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
             # For high timeframes, we relax the CANDLE_LIMIT but still need enough for talib
             logging.warning(f"Not enough data for {symbol} {timeframe} ({len(closes)} < {required_candles} for talib). Skipping.")
             continue
-
+        
         # Use the second to last candle for analysis (idx = -2)
         # This ensures we're looking at a closed candle, not the currently forming one.
         idx = -2
-        if len(closes) < abs(idx): # Ensure there are at least 2 candles
+        if len(closes) < abs(idx):  # Ensure there are at least 2 candles
             logging.warning(f"Not enough closed candles for {symbol} {timeframe} to analyze. Skipping.")
             continue
-
+        
         rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
-
+        
         # Check if the last calculated RSI/BB values are valid (not NaN)
         if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]) or np.isnan(bb_middle[idx]):
             logging.warning(f"NaN values for {symbol} {timeframe} at index {idx}, skipping.")
             continue
-
+        
         rsi_val = rsi[idx]
         bb_upper_val = bb_upper[idx]
         bb_middle_val = bb_middle[idx]
         bb_lower_val = bb_lower[idx]
-
+        
         upper_touch = rsi_val >= bb_upper_val * (1 - UPPER_TOUCH_THRESHOLD)
         lower_touch = rsi_val <= bb_lower_val * (1 + LOWER_TOUCH_THRESHOLD)
         middle_touch = False
         direction = None
-
+        
         if MIDDLE_BAND_TOGGLE.get(timeframe, False):
             if not upper_touch and not lower_touch \
-               and abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
+                and abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
                 middle_touch = True
-
                 # Determine direction of middle band touch
                 prev_rsi = rsi[idx-1]
                 prev_bb_middle = bb_middle[idx-1]
-                prev_side = prev_rsi - prev_bb_middle # + above, – below
+                prev_side = prev_rsi - prev_bb_middle  # + above, – below
                 curr_side = rsi_val - bb_middle_val
-
-                if prev_side > 0 and curr_side <= 0: # crossed down
+                if prev_side > 0 and curr_side <= 0:  # crossed down
                     direction = "from above"
-                elif prev_side < 0 and curr_side >= 0: # crossed up
+                elif prev_side < 0 and curr_side >= 0:  # crossed up
                     direction = "from below"
-                else: # Still on one side, but within threshold
+                else:  # Still on one side, but within threshold
                     direction = "from above" if curr_side > 0 else "from below"
-
+        
         if upper_touch or lower_touch or middle_touch:
             touch_type = ""
             if upper_touch:
@@ -687,12 +696,13 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
                 touch_type = "LOWER"
             else:
                 touch_type = "MIDDLE"
-
+            
             timestamp = datetime.utcfromtimestamp(timestamps[idx] / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
+            
             hot = False
-            if daily_change is not None and daily_change > 5: # Example: >5% daily change is "hot"
+            if daily_change is not None and daily_change > 10:  # Updated: >10% two-day change is "hot"
                 hot = True
-
+            
             item = {
                 'symbol': symbol,
                 'timeframe': timeframe,
@@ -705,10 +715,11 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
                 'hot': hot,
                 'daily_change': daily_change,
                 'direction': direction,
-                'market_type': 'FUTURES' if is_futures else 'SPOT' # New field
+                'market_type': 'FUTURES' if is_futures else 'SPOT'  # New field
             }
+            
             results.append(item)
-
+    
     return results
 
 async def scan_for_bb_touches_async(proxy_manager: AsyncProxyPool, cache_manager: CacheManager) -> Tuple[List[Dict[str, Any]], Set[str]]:
