@@ -578,6 +578,56 @@ async def get_daily_change_percent_async(session: aiohttp.ClientSession, symbol:
         logging.warning(f"Could not fetch daily change for {symbol} (Futures: {is_futures}): {e}")
         return None
 
+async def calculate_volatility_rankings(session: aiohttp.ClientSession, symbols: List[Tuple[str, bool]], proxy_manager: AsyncProxyPool, top_n: int = 60) -> Set[str]:
+    """
+    Calculate 24h volatility for all symbols and return top N most volatile.
+    Uses standard deviation of 1h returns over 24 candles.
+    """
+    volatility_scores = {}
+    
+    async def get_volatility(symbol, is_futures):
+        try:
+            # Fetch 1h data (24 candles = 24 hours)
+            endpoint = BINANCE_FUTURES_KLINES if is_futures else BINANCE_SPOT_KLINES
+            params = {'symbol': symbol, 'interval': '1h', 'limit': 25}  # 25 to calculate 24 returns
+            
+            data = await make_request_async(session, endpoint, params=params, proxy_manager=proxy_manager)
+            
+            if data and len(data) >= 25:
+                closes = [float(candle[4]) for candle in data]
+                
+                # Calculate hourly returns (percentage changes)
+                returns = []
+                for i in range(1, len(closes)):
+                    if closes[i-1] != 0:
+                        ret = (closes[i] - closes[i-1]) / closes[i-1] * 100
+                        returns.append(ret)
+                
+                # Calculate volatility as standard deviation of returns
+                if len(returns) >= 24:
+                    volatility = np.std(returns)  # Standard deviation
+                    volatility_scores[symbol] = volatility
+                    logging.debug(f"{symbol}: 24h volatility = {volatility:.4f}%")
+        
+        except Exception as e:
+            logging.warning(f"Failed to calculate volatility for {symbol}: {e}")
+    
+    # Process in batches to avoid overwhelming API
+    batch_size = 50
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i + batch_size]
+        tasks = [get_volatility(symbol, is_futures) for symbol, is_futures in batch]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0.5)  # Small delay between batches
+    
+    # Sort by volatility and get top N
+    sorted_symbols = sorted(volatility_scores.items(), key=lambda x: x[1], reverse=True)
+    top_volatile = set([symbol for symbol, vol in sorted_symbols[:top_n]])
+    
+    logging.info(f"Top {top_n} most volatile coins: {list(top_volatile)[:10]}...")  # Log first 10
+    
+    return top_volatile
+
 def calculate_rsi_bb(closes: List[float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Calculates RSI and Bollinger Bands for a given list of close prices."""
     closes_np = np.array(closes, dtype=float)
@@ -612,28 +662,17 @@ async def save_sent_state_async(cache_manager: CacheManager, state: Dict[str, st
     """Saves the bot's sent state to cache."""
     await cache_manager.set_sent_state(state)
 
-async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timeframes: List[str], proxy_manager: AsyncProxyPool, is_futures: bool) -> List[Dict[str, Any]]:
+async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timeframes: List[str], proxy_manager: AsyncProxyPool, is_futures: bool, hot_coins: Set[str] = None) -> List[Dict[str, Any]]:
     """
     Scans a single symbol across multiple timeframes for BB touches.
-    Calculates 2-day price change from 1h timeframe data (48 hours).
+    Marks symbol as hot if it's in the top volatile coins set.
     """
     results: List[Dict[str, Any]] = []
-    daily_change = None
     
-    # IMPORTANT: Calculate 2-day change FIRST from 1h data if available
-    if '1h' in timeframes:
-        try:
-            closes_1h, _ = await fetch_klines_async(session, symbol, '1h', proxy_manager, is_futures=is_futures)
-            if closes_1h and len(closes_1h) >= 48:
-                two_days_ago_close = closes_1h[-48]  # 48 hours ago
-                current_price = closes_1h[-1]         # Current hour
-                if two_days_ago_close != 0:
-                    daily_change = (current_price - two_days_ago_close) / two_days_ago_close * 100
-                    logging.debug(f"{symbol}: 2-day change from 1h: {daily_change:.2f}%")
-        except Exception as e:
-            logging.warning(f"Could not calculate 2-day change for {symbol} from 1h data: {e}")
+    # Check if this symbol is in top volatile coins
+    is_hot = (hot_coins is not None and symbol in hot_coins)
     
-    # Now process all timeframes with the daily_change already calculated
+    # Process all timeframes
     for timeframe in timeframes:
         closes, timestamps = await fetch_klines_async(session, symbol, timeframe, proxy_manager, is_futures=is_futures)
         
@@ -644,25 +683,20 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
         # Determine minimum required candles for calculation
         required_candles = MIN_CANDLES_FOR_TALIB
         if timeframe not in HIGH_TIMEFRAMES_RELAX_CANDLE_LIMIT:
-            # For non-high timeframes, we strictly enforce CANDLE_LIMIT
             if len(closes) < CANDLE_LIMIT:
                 logging.warning(f"Not enough data for {symbol} {timeframe} ({len(closes)} < {CANDLE_LIMIT}). Skipping.")
                 continue
         elif len(closes) < required_candles:
-            # For high timeframes, we relax the CANDLE_LIMIT but still need enough for talib
             logging.warning(f"Not enough data for {symbol} {timeframe} ({len(closes)} < {required_candles} for talib). Skipping.")
             continue
         
-        # Use the second to last candle for analysis (idx = -2)
-        # This ensures we're looking at a closed candle, not the currently forming one.
         idx = -2
-        if len(closes) < abs(idx):  # Ensure there are at least 2 candles
+        if len(closes) < abs(idx):
             logging.warning(f"Not enough closed candles for {symbol} {timeframe} to analyze. Skipping.")
             continue
         
         rsi, bb_upper, bb_middle, bb_lower = calculate_rsi_bb(closes)
         
-        # Check if the last calculated RSI/BB values are valid (not NaN)
         if np.isnan(rsi[idx]) or np.isnan(bb_upper[idx]) or np.isnan(bb_lower[idx]) or np.isnan(bb_middle[idx]):
             logging.warning(f"NaN values for {symbol} {timeframe} at index {idx}, skipping.")
             continue
@@ -681,16 +715,15 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
             if not upper_touch and not lower_touch \
                 and abs(rsi_val - bb_middle_val) <= bb_middle_val * MIDDLE_TOUCH_THRESHOLD:
                 middle_touch = True
-                # Determine direction of middle band touch
                 prev_rsi = rsi[idx-1]
                 prev_bb_middle = bb_middle[idx-1]
-                prev_side = prev_rsi - prev_bb_middle  # + above, – below
+                prev_side = prev_rsi - prev_bb_middle
                 curr_side = rsi_val - bb_middle_val
-                if prev_side > 0 and curr_side <= 0:  # crossed down
+                if prev_side > 0 and curr_side <= 0:
                     direction = "from above"
-                elif prev_side < 0 and curr_side >= 0:  # crossed up
+                elif prev_side < 0 and curr_side >= 0:
                     direction = "from below"
-                else:  # Still on one side, but within threshold
+                else:
                     direction = "from above" if curr_side > 0 else "from below"
         
         if upper_touch or lower_touch or middle_touch:
@@ -704,10 +737,6 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
             
             timestamp = datetime.utcfromtimestamp(timestamps[idx] / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
             
-            hot = False
-            if daily_change is not None and daily_change > 7:  # >10% two-day change is "hot"
-                hot = True
-            
             item = {
                 'symbol': symbol,
                 'timeframe': timeframe,
@@ -717,8 +746,7 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
                 'bb_lower': bb_lower_val,
                 'touch_type': touch_type,
                 'timestamp': timestamp,
-                'hot': hot,
-                'daily_change': daily_change,
+                'hot': is_hot,  # Use the pre-calculated ranking
                 'direction': direction,
                 'market_type': 'FUTURES' if is_futures else 'SPOT'
             }
@@ -730,24 +758,29 @@ async def scan_symbol_async(session: aiohttp.ClientSession, symbol: str, timefra
 async def scan_for_bb_touches_async(proxy_manager: AsyncProxyPool, cache_manager: CacheManager) -> Tuple[List[Dict[str, Any]], Set[str]]:
     """
     Orchestrates the scanning process for BB touches across all symbols and timeframes.
+    Includes volatility-based hot coin detection.
     Returns (results, cached_timeframes_used) where cached_timeframes_used are the timeframes that were loaded from cache.
     """
     results: List[Dict[str, Any]] = []
-    batch_size = 70 # Number of symbols to process concurrently in a batch
+    batch_size = 70  # Number of symbols to process concurrently in a batch
     active_timeframes = get_active_timeframes()
-
     cached_timeframes = [tf for tf in CACHED_TFS if tf in active_timeframes]
     uncached_timeframes = [tf for tf in active_timeframes if tf not in cached_timeframes]
-
     cached_results: Dict[str, List[Dict[str, Any]]] = {}
     cached_timeframes_used: Set[str] = set()  # Track which timeframes were actually loaded from cache
-
+    
     async with aiohttp.ClientSession() as session:
+        # STEP 1: Get all symbols
         futures_symbols, spot_symbols = await get_all_tradable_usdt_symbols_async(session, proxy_manager)
         all_symbols_with_type: List[Tuple[str, bool]] = [(s, True) for s in futures_symbols] + [(s, False) for s in spot_symbols]
         total_symbols = len(all_symbols_with_type)
-
-        # Load cached results for relevant timeframes
+        
+        # STEP 2: Calculate volatility rankings for ALL symbols
+        logging.info(f"[VOLATILITY] Calculating 24h volatility for {total_symbols} symbols...")
+        hot_coins = await calculate_volatility_rankings(session, all_symbols_with_type, proxy_manager, top_n=60)
+        logging.info(f"[VOLATILITY] Identified top 60 most volatile coins")
+        
+        # STEP 3: Load cached results for relevant timeframes
         for timeframe in cached_timeframes:
             cached_data = await load_cache_async(cache_manager, timeframe)
             if cached_data is not None:
@@ -756,57 +789,70 @@ async def scan_for_bb_touches_async(proxy_manager: AsyncProxyPool, cache_manager
                 logging.info(f"[CACHE] Loaded {len(cached_data)} results for {timeframe} from cache.")
             else:
                 logging.info(f"[CACHE] No valid cache found for {timeframe}, will scan fresh.")
-
-        # Process cached timeframes that need a fresh scan (either no cache or cache expired)
+        
+        # STEP 4: Process cached timeframes that need a fresh scan (either no cache or cache expired)
         for timeframe in cached_timeframes:
-            if timeframe not in cached_results: # If cache was not loaded
+            if timeframe not in cached_results:  # If cache was not loaded
                 logging.info(f"[SCAN] Performing fresh scan for cached timeframe: {timeframe}")
                 timeframe_scan_results: List[Dict[str, Any]] = []
+                
                 for i in range(0, total_symbols, batch_size):
                     batch = all_symbols_with_type[i:i + batch_size]
                     tasks = [
-                        scan_symbol_async(session, symbol, [timeframe], proxy_manager, is_futures)
+                        scan_symbol_async(session, symbol, [timeframe], proxy_manager, is_futures, hot_coins=hot_coins)
                         for symbol, is_futures in batch
                     ]
                     batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
                     for res in batch_results:
                         if isinstance(res, Exception):
                             logging.error(f"Error scanning {timeframe} for a batch: {res}")
                         else:
                             timeframe_scan_results.extend(res)
+                
                 await save_cache_async(cache_manager, timeframe, timeframe_scan_results)
                 cached_results[timeframe] = timeframe_scan_results
                 # Don't add to cached_timeframes_used since this was a fresh scan
                 logging.info(f"[CACHE] Saved fresh scan results for {timeframe} ({len(timeframe_scan_results)} items).")
-
-        # Process uncached timeframes (always fresh scan)
+        
+        # STEP 5: Update cached results with fresh volatility data
+        # Since cached results might have old 'hot' flags, we need to update them
+        for timeframe in cached_timeframes:
+            if timeframe in cached_results:
+                for item in cached_results[timeframe]:
+                    # Update hot flag based on current volatility rankings
+                    item['hot'] = item['symbol'] in hot_coins
+        
+        # STEP 6: Process uncached timeframes (always fresh scan)
         if uncached_timeframes:
             logging.info(f"[SCAN] Scanning uncached timeframes: {', '.join(uncached_timeframes)}")
             uncached_scan_results: List[Dict[str, Any]] = []
+            
             for i in range(0, total_symbols, batch_size):
                 batch = all_symbols_with_type[i:i + batch_size]
                 tasks = [
-                    scan_symbol_async(session, symbol, uncached_timeframes, proxy_manager, is_futures)
+                    scan_symbol_async(session, symbol, uncached_timeframes, proxy_manager, is_futures, hot_coins=hot_coins)
                     for symbol, is_futures in batch
                 ]
                 batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
                 for res in batch_results:
                     if isinstance(res, Exception):
                         logging.error(f"Error scanning uncached timeframes for a batch: {res}")
                     else:
                         uncached_scan_results.extend(res)
+            
             results.extend(uncached_scan_results)
             # uncached_timeframes are always fresh, so don't add to cached_timeframes_used
             logging.info(f"[SCAN] Completed fresh scan for uncached timeframes ({len(uncached_scan_results)} items).")
-
-    # Combine all results (from cache and fresh scans)
-    for timeframe in cached_timeframes:
-        if timeframe in cached_results:
-            results.extend(cached_results[timeframe])
-
-    logging.info(f"[RESULTS] Total BB touches found: {len(results)}")
-
-    return results, cached_timeframes_used  # Return which timeframes were actually from cache
+        
+        # STEP 7: Combine all results (from cache and fresh scans)
+        for timeframe in cached_timeframes:
+            if timeframe in cached_results:
+                results.extend(cached_results[timeframe])
+        
+        logging.info(f"[RESULTS] Total BB touches found: {len(results)}")
+        return results, cached_timeframes_used  # Return which timeframes were actually from cache
 
 # === FORMATTING & TELEGRAM SENDING ===
 
