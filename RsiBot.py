@@ -65,8 +65,7 @@ class AppConfig:
 
     # Proxy Sources
     PROXY_SOURCES: List[str] = field(default_factory=lambda: [
-        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
-        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
     ])
 
 CONFIG = AppConfig()
