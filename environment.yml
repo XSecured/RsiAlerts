@@ -3,10 +3,12 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.10
-  - pandas
-  - numpy  
-  - requests
+  - python=3.11
+  - numpy
   - ta-lib
   - aiohttp
-  - redis-py>=4.2.0  # Use conda version instead of pip
+  - redis-py
+  # uvloop makes asyncio 2-4x faster. 
+  # NOTE: If you are on WINDOWS, delete the line below (uvloop is Linux/Mac only).
+  - uvloop 
+  - pip
