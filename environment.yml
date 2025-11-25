@@ -8,6 +8,8 @@ dependencies:
   - ta-lib
   - aiohttp
   - redis-py
+  - pandas
+  - requests
   # uvloop makes asyncio 2-4x faster. 
   # NOTE: If you are on WINDOWS, delete the line below (uvloop is Linux/Mac only).
   - uvloop 
