@@ -1,6 +1,5 @@
 import aiohttp
 import asyncio
-import requests
 import numpy as np
 import talib
 import logging
