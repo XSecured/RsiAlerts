@@ -141,6 +141,8 @@ def normalize_proxy(p: str) -> str:
 
 # === PROXY MANAGER ===
 
+# === PROXY MANAGER ===
+
 class ProxyManager:
     """
     High-performance Proxy Rotator with health tracking and async locking.
@@ -164,15 +166,21 @@ class ProxyManager:
         raw_proxies = set()
         for url in CONF.PROXY_SOURCES:
             try:
+                logger.info(f"Fetching proxies from {url}...")
                 async with session.get(url, timeout=10) as resp:
                     if resp.status == 200:
                         text = await resp.text()
-                        for line in text.splitlines():
-                            p = line.strip()
-                            if p: 
-                                p_norm = normalize_proxy(p)
-                                if p_norm not in self.perm_block and p_norm not in self.blacklist:
-                                    raw_proxies.add(p_norm)
+                        if text:
+                            for line in text.splitlines():
+                                p = line.strip()
+                                if p: 
+                                    p_norm = normalize_proxy(p)
+                                    if p_norm not in self.perm_block and p_norm not in self.blacklist:
+                                        raw_proxies.add(p_norm)
+                        else:
+                            logger.warning(f"No content returned from {url}.")
+                    else:
+                        logger.error(f"Failed to fetch proxies: HTTP {resp.status}")
             except Exception as e:
                 logger.error(f"Proxy fetch failed from {url}: {e}")
 
