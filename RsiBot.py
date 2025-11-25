@@ -5,11 +5,10 @@ import os
 import time
 import json
 import random
-import math
 import ssl
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple, Dict, Any, Set, NamedTuple
+from typing import List, Optional, Tuple, Dict, Any, Set
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial, wraps
 
@@ -17,10 +16,6 @@ from functools import partial, wraps
 import numpy as np
 import talib
 import redis.asyncio as aioredis
-
-# NOTE: We removed uvloop. 
-# While uvloop is faster, it is unstable with low-quality proxies and SSL handshakes.
-# Python 3.10/3.11 native asyncio is fast enough and much more robust.
 
 # === CONFIGURATION ===
 
@@ -48,8 +43,6 @@ class AppConfig:
     # Limits
     CANDLE_LIMIT: int = 60
     MIN_CANDLES_TALIB: int = 36
-    # REDUCED BATCH SIZE: High concurrency + bad proxies = crash. 
-    # 30 is the sweet spot for stability.
     BATCH_SIZE: int = 30  
     
     # Logic Toggles
@@ -72,7 +65,8 @@ class AppConfig:
 
     # Proxy Sources
     PROXY_SOURCES: List[str] = field(default_factory=lambda: [
-        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
     ])
 
 CONFIG = AppConfig()
@@ -87,7 +81,9 @@ logger = logging.getLogger("RsiBot")
 
 # === DATA STRUCTURES ===
 
-class ScanResult(NamedTuple):
+# FIX: Converted to dataclass with slots=True to allow asdict() usage while keeping memory low
+@dataclass(slots=True)
+class ScanResult:
     symbol: str
     timeframe: str
     rsi: float
@@ -103,10 +99,6 @@ class ScanResult(NamedTuple):
 # === UTILS & DECORATORS ===
 
 def retry_async(retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
-    """
-    Robust retry decorator. 
-    Catches client errors AND RuntimeError (often thrown by asyncio during SSL handshake failures).
-    """
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -119,10 +111,8 @@ def retry_async(retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
                     last_exception = e
                     if attempt == retries:
                         break
-                    # Optional: logger.debug(f"Retry {attempt+1} for {func.__name__}: {e}")
                     await asyncio.sleep(current_delay)
                     current_delay *= backoff
-            # Return None or empty list on failure instead of crashing the whole batch
             return None 
         return wrapper
     return decorator
@@ -130,7 +120,6 @@ def retry_async(retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
 # === CORE SERVICES ===
 
 class ProxyManager:
-    """Reactive Proxy Manager."""
     def __init__(self):
         self.proxies: List[str] = []
         self.blacklist: Set[str] = set()
@@ -175,24 +164,17 @@ class ProxyManager:
             self.blacklist.add(proxy)
 
 class NetworkClient:
-    """
-    Centralized HTTP Client.
-    Optimized for stability over raw connection count.
-    """
     def __init__(self, proxy_manager: ProxyManager):
         self.proxy_manager = proxy_manager
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def start(self):
-        # LIMITING connections is crucial for free proxies.
-        # limit=100 ensures we don't open too many files/sockets and crash the OS or asyncio loop.
         conn = aiohttp.TCPConnector(
             limit=100, 
             limit_per_host=20,
             ttl_dns_cache=300,
-            ssl=False # Disabling strict SSL check improves compatibility with shady proxies
+            ssl=False
         )
-        # Timeout settings to fail fast on bad proxies
         timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=10)
         self.session = aiohttp.ClientSession(connector=conn, timeout=timeout)
 
@@ -203,25 +185,21 @@ class NetworkClient:
     @retry_async(retries=2, delay=0.5)
     async def request(self, method: str, url: str, params: dict = None) -> Any:
         proxy = await self.proxy_manager.get_proxy()
-        
-        # If no proxy available, try direct (or fail if required)
         try:
             async with self.session.request(
                 method, url, params=params, proxy=proxy
             ) as resp:
                 if resp.status in [403, 429, 451]:
                     if proxy: await self.proxy_manager.report_failure(proxy)
-                    # Raise exception to trigger retry
                     raise aiohttp.ClientError(f"Bad status {resp.status}")
                 
                 resp.raise_for_status()
                 return await resp.json()
         except Exception as e:
             if proxy: await self.proxy_manager.report_failure(proxy)
-            raise e # Re-raise to trigger retry logic
+            raise e
 
 class CacheService:
-    """Redis Cache Manager."""
     def __init__(self):
         self.redis: Optional[aioredis.Redis] = None
 
@@ -269,7 +247,6 @@ class CacheService:
         except Exception: pass
 
 class TechnicalAnalysisEngine:
-    """Calculations offloaded to separate process."""
     def __init__(self):
         self.executor = ProcessPoolExecutor(max_workers=4)
 
@@ -301,7 +278,6 @@ class TechnicalAnalysisEngine:
         )
 
 class NotificationService:
-    """Telegram Notifier."""
     def __init__(self):
         self.base_url = f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage"
 
@@ -371,7 +347,6 @@ class RsiBot:
     async def update_volatility_rankings(self, all_symbols: List[Tuple[str, bool]]):
         logger.info("Updating volatility rankings...")
         scores = []
-        # Lower concurrency for volatility check too
         sem = asyncio.Semaphore(50) 
 
         async def check_vol(sym, is_fut):
@@ -489,7 +464,6 @@ class RsiBot:
                 for sym, is_fut in all_pairs:
                     jobs.append((sym, tf, is_fut))
             
-            # Using BATCH_SIZE (30) to prevent OS socket crashes
             sem = asyncio.Semaphore(CONFIG.BATCH_SIZE)
             
             async def worker(job):
@@ -504,6 +478,7 @@ class RsiBot:
             for res in results:
                 if isinstance(res, ScanResult):
                     final_results.append(res)
+                    # FIX: asdict now works because ScanResult is a dataclass
                     fresh_grouped[res.timeframe].append(asdict(res))
 
             for tf, data in fresh_grouped.items():
