@@ -29,6 +29,23 @@ try:
 except ImportError:
     import json
 
+# === MONKEY-PATCH FOR HTTPS PROXIES ===
+import ssl
+import aiohttp
+
+if hasattr(aiohttp, 'ClientSession'):
+    original_create_connection = aiohttp.connector.TCPConnector._create_connection
+
+    async def _create_connection(self, req, traces, timeout):
+        proxy_host = req.proxy.split(':')[1][2:]  # Extract proxy host
+        proxy_port = int(req.proxy.split(':')[2])  # Extract proxy port
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        return await original_create_connection(self, req, traces, timeout)
+
+    aiohttp.connector.TCPConnector._create_connection = _create_connection
+
 # === CONFIGURATION ===
 
 @dataclass(frozen=True)
@@ -244,8 +261,7 @@ class Cache:
 
     async def set_json(self, key: str, value: Any, ttl: int = None):
         if not self.redis: return
-        # Use orjson for speed
-        await self.redis.set(key, json.dumps(value).decode('utf-8'), ex=ttl)
+        await self.redis.set(key, json.dumps(value), ex=ttl)
 
     async def get_sent_state(self) -> Dict[str, str]:
         res = await self.get_json(f"{CONF.CACHE_PREFIX}:sent_state")
@@ -416,8 +432,6 @@ class TechnicalAnalysis:
                 
                 if prev_diff > 0 >= curr_diff: direction = "from above"
                 elif prev_diff < 0 <= curr_diff: direction = "from below"
-                else: direction = "from above" if curr_diff > 0 else "from below"
-                
                 # Only trigger middle if not upper/lower
                 if not touch_type: touch_type = "MIDDLE"
 
