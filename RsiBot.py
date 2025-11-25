@@ -167,10 +167,10 @@ class ProxyManager:
                 async with session.get(url, timeout=10) as resp:
                     if resp.status == 200:
                         text = await resp.text()
-                        if text:
+                        if text:  # Ensure we have text content
                             for line in text.splitlines():
                                 p = line.strip()
-                                if p: 
+                                if p:
                                     p_norm = normalize_proxy(p)
                                     if p_norm not in self.perm_block and p_norm not in self.blacklist:
                                         raw_proxies.add(p_norm)
@@ -180,7 +180,12 @@ class ProxyManager:
                         logger.error(f"Failed to fetch proxies: HTTP {resp.status}")
             except Exception as e:
                 logger.error(f"Proxy fetch failed from {url}: {e}")
-
+    
+        # If no proxies fetched, use fallback
+        if not raw_proxies:
+            logger.warning("No proxies fetched, using fallback list.")
+            raw_proxies.update(FALLBACK_PROXIES)
+    
         # Fast concurrent validation
         valid_proxies = await self._validate_concurrently(session, list(raw_proxies))
         
