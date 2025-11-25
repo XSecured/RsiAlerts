@@ -140,9 +140,6 @@ def normalize_proxy(p: str) -> str:
     return p if "://" in p else f"http://{p}"
 
 # === PROXY MANAGER ===
-
-# === PROXY MANAGER ===
-
 class ProxyManager:
     """
     High-performance Proxy Rotator with health tracking and async locking.
