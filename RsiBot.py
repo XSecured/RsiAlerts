@@ -22,7 +22,7 @@ import redis.asyncio as aioredis
 
 @dataclass
 class Config:
-    MAX_CONCURRENCY: int = 250
+    MAX_CONCURRENCY: int = 200
     REQUEST_TIMEOUT: int = 5
     MAX_RETRIES: int = 5
     
@@ -106,7 +106,7 @@ class AsyncProxyPool:
         try:
             logging.info(f"📥 Fetching proxies from {url}...")
             async with session.get(url, timeout=15) as resp:
-                if resp.status == 250:
+                if resp.status == 200:
                     text = await resp.text()
                     for line in text.splitlines():
                         p = line.strip()
@@ -120,7 +120,7 @@ class AsyncProxyPool:
         self.failures = {} # Reset failures on repopulate
         random.shuffle(raw)
         
-        sem = asyncio.Semaphore(200)
+        sem = asyncio.Semaphore(250)
         async def protected_test(p):
             async with sem: return await self._test_proxy(p, session)
 
