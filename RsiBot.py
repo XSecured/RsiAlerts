@@ -98,6 +98,7 @@ class AsyncProxyPool:
         self.max_pool_size = max_pool_size
         self.iterator = None
         self._lock = asyncio.Lock()
+        self.failures: Dict[str, int] = {} # Track strikes
 
     async def populate(self, url: str, session: aiohttp.ClientSession):
         if not url: return
@@ -105,7 +106,7 @@ class AsyncProxyPool:
         try:
             logging.info(f"📥 Fetching proxies from {url}...")
             async with session.get(url, timeout=15) as resp:
-                if resp.status == 200:
+                if resp.status == 250:
                     text = await resp.text()
                     for line in text.splitlines():
                         p = line.strip()
@@ -116,9 +117,10 @@ class AsyncProxyPool:
 
         logging.info(f"🔎 Validating {len(raw)} proxies...")
         self.proxies = []
+        self.failures = {} # Reset failures on repopulate
         random.shuffle(raw)
         
-        sem = asyncio.Semaphore(300)
+        sem = asyncio.Semaphore(200)
         async def protected_test(p):
             async with sem: return await self._test_proxy(p, session)
 
@@ -149,7 +151,23 @@ class AsyncProxyPool:
 
     async def get_proxy(self) -> Optional[str]:
         if not self.proxies: return None
-        async with self._lock: return next(self.iterator)
+        async with self._lock: 
+            if not self.proxies: return None # Double check inside lock
+            return next(self.iterator)
+
+    async def report_failure(self, proxy: str):
+        """Report a proxy failure. 3 strikes = Banned."""
+        async with self._lock:
+            self.failures[proxy] = self.failures.get(proxy, 0) + 1
+            strikes = self.failures[proxy]
+            
+            if strikes >= 3:
+                if proxy in self.proxies:
+                    self.proxies.remove(proxy)
+                    # Rebuild cycle logic
+                    if self.proxies:
+                        self.iterator = cycle(self.proxies)
+                    logging.warning(f"🚫 Banned Proxy {proxy} (3 strikes)")
 
 # ==========================================
 # REDIS CACHE MANAGER
@@ -209,53 +227,41 @@ class ExchangeClient:
     def __init__(self, session: aiohttp.ClientSession, proxy_pool: AsyncProxyPool):
         self.session = session
         self.proxies = proxy_pool
-        # Limit local concurrency to avoid OS file descriptor limits
         limit = CONFIG.MAX_CONCURRENCY if proxy_pool.proxies else 5
         self.sem = asyncio.Semaphore(limit)
 
     async def _request(self, url: str, params: dict = None) -> Any:
-        """Ultra-robust request with aggressive retries."""
-        last_error = None
-        
+        """Robust request with proxy rotation & blacklisting."""
         for attempt in range(CONFIG.MAX_RETRIES):
             proxy = await self.proxies.get_proxy()
+            if not proxy:
+                # No proxies left? Wait a bit and retry (maybe repopulate happens externally?)
+                await asyncio.sleep(1)
+                continue
+
             try:
                 async with self.sem:
-                    async with self.session.get(
-                        url, 
-                        params=params, 
-                        proxy=proxy, 
-                        timeout=CONFIG.REQUEST_TIMEOUT
-                    ) as resp:
+                    async with self.session.get(url, params=params, proxy=proxy, timeout=CONFIG.REQUEST_TIMEOUT) as resp:
                         if resp.status == 200:
                             return await resp.json()
                         elif resp.status == 429:
-                            # Rate Limit: Backoff longer
-                            logging.warning(f"⚠️ 429 Rate Limit on {proxy}. Sleeping 5s.")
+                            logging.warning(f"⚠️ 429 Rate Limit ({proxy}). Sleeping 5s.")
                             await asyncio.sleep(5)
                         elif resp.status >= 500:
-                            # Server Error: Retry immediately with different proxy
+                            # Server Error, try next proxy immediately
                             pass
                         else:
-                            # Other error (404, 403): Log it
-                            last_error = f"HTTP {resp.status}"
-                            
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                last_error = str(e)
-                # Don't spam logs with timeouts, just retry
-                pass
-            except Exception as e:
-                last_error = str(e)
+                            pass # 4xx errors
             
-            # Exponential backoff with jitter
-            sleep_time = (attempt + 1) * 0.5 + random.random() * 0.5
-            await asyncio.sleep(sleep_time)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+                # Network error = Strike for proxy
+                await self.proxies.report_failure(proxy)
+                # Only log if it's a "clean" error message to reduce noise
+                logging.warning(f"❌ Failed {url} after {CONFIG.MAX_RETRIES} tries. Last err: {last_error}")
             
-        # If we reach here, all retries failed
-        if last_error:
-            # Optional: Log only if you want deep debug (spammy)
-            logging.warning(f"❌ Failed {url} after {CONFIG.MAX_RETRIES} tries. Last err: {last_error}")
-            pass
+            # Jittered backoff
+            await asyncio.sleep(0.5 + random.random() * 0.5)
+            
         return None
 
 class BinanceClient(ExchangeClient):
@@ -435,6 +441,36 @@ class RsiBot:
                         await asyncio.sleep(0.5)
                     except: pass
 
+    async def fetch_all_symbols_robust(self, binance: BinanceClient, bybit: BybitClient):
+        """Critical function to fetch symbols with retry logic."""
+        results = {"bp": [], "bs": [], "yp": [], "ys": []}
+        
+        for attempt in range(3): # Try up to 3 times to get a sane list
+            logging.info(f"Fetching Symbols (Attempt {attempt+1})...")
+            
+            # Fetch in parallel
+            t_bp = asyncio.create_task(binance.get_perp_symbols())
+            t_bs = asyncio.create_task(binance.get_spot_symbols())
+            t_yp = asyncio.create_task(bybit.get_perp_symbols())
+            t_ys = asyncio.create_task(bybit.get_spot_symbols())
+            
+            bp, bs, yp, ys = await asyncio.gather(t_bp, t_bs, t_yp, t_ys)
+            
+            results = {"bp": bp, "bs": bs, "yp": yp, "ys": ys}
+            
+            counts = [len(x) for x in [bp, bs, yp, ys]]
+            log_msg = f"BinPerp: {counts[0]} | BinSpot: {counts[1]} | BybPerp: {counts[2]} | BybSpot: {counts[3]}"
+            
+            if all(c > 0 for c in counts):
+                logging.info(f"✅ Symbols fetched successfully: {log_msg}")
+                return bp, bs, yp, ys
+            else:
+                logging.warning(f"⚠️ Partial symbol fetch failure: {log_msg}. Retrying...")
+                await asyncio.sleep(2)
+        
+        logging.error("❌ Critical: Failed to fetch all symbol lists after retries. Proceeding with partial data.")
+        return results["bp"], results["bs"], results["yp"], results["ys"]
+
     async def run(self):
         logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
         await self.cache.init()
@@ -444,10 +480,10 @@ class RsiBot:
             binance = BinanceClient(session, self.proxies)
             bybit = BybitClient(session, self.proxies)
             
-            logging.info("Fetching symbols...")
-            bp, bs = await asyncio.gather(binance.get_perp_symbols(), binance.get_spot_symbols())
-            yp, ys = await asyncio.gather(bybit.get_perp_symbols(), bybit.get_spot_symbols())
+            # ROBUST FETCH
+            bp, bs, yp, ys = await self.fetch_all_symbols_robust(binance, bybit)
             
+            # Filter & Deduplicate
             seen = set()
             def filter_u(syms):
                 res = []
@@ -467,33 +503,29 @@ class RsiBot:
             for s in f_ys: all_pairs.append((bybit, s, 'spot', 'Bybit'))
             
             total_sym_count = len(all_pairs)
-            logging.info(f"Total symbols: {total_sym_count}")
+            logging.info(f"Total symbols after deduplication: {total_sym_count}")
             
             # Volatility Check
             logging.info("Calculating Volatility...")
             vol_scores = {}
-            
             async def check_vol(client, sym, mkt):
                 c = await client.fetch_closes_volatility(sym, mkt)
                 v = calculate_volatility(c)
                 if v > 0: vol_scores[sym] = v
             
             vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
+            # Batch volatility
             for i in range(0, len(vol_tasks), 200): 
                 await asyncio.gather(*vol_tasks[i:i+200])
-                
+            
             hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
+            logging.info(f"Volatility Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot Coins: {len(hot_coins)}")
             
-            # UPDATED LOG LINE
-            logging.info(f"Volatility Calc: {len(vol_scores)}/{len(all_pairs)} | Hot Coins: {len(hot_coins)}")
-            
-            # Prepare Scan Logic
+            # Scan Setup
             sent_state = await self.cache.get_sent_state()
             tfs_to_scan_fresh = set()
             tfs_fresh_map = {}
             cached_hits_to_use = []
-            
-            # Init Stats
             scan_stats = {tf: ScanStats(tf, "Unknown", total_symbols=total_sym_count) for tf in ACTIVE_TFS}
             
             for tf in ACTIVE_TFS:
@@ -501,28 +533,23 @@ class RsiBot:
                     iso = get_candle_open_iso(tf)
                     cached_res = await self.cache.get_scan_results(tf, iso)
                     if cached_res is None:
-                        # NEEDS FRESH SCAN
                         tfs_to_scan_fresh.add(tf)
                         tfs_fresh_map[tf] = iso
                         scan_stats[tf].source = "Fresh Scan (New Candle)"
                     else:
-                        # LOAD FROM CACHE
                         hits = [TouchHit.from_dict(d) for d in cached_res]
                         cached_hits_to_use.extend(hits)
                         scan_stats[tf].source = "Cached"
                         scan_stats[tf].hits_found = len(hits)
-                        # Cached implies 100% success for logic purposes (skipped)
                         scan_stats[tf].successful_scans = 0 
                 else:
-                    # ALWAYS FRESH
                     tfs_to_scan_fresh.add(tf)
                     scan_stats[tf].source = "Fresh Scan (Low TF)"
 
-            # 1. EXECUTE FRESH SCANS
+            # Fresh Scans
             final_hits = []
             if tfs_to_scan_fresh:
                 logging.info(f"Scanning fresh: {tfs_to_scan_fresh}")
-                
                 scan_tasks = []
                 async def scan_one(client, sym, mkt, ex, tfs):
                     hits = []
@@ -539,55 +566,39 @@ class RsiBot:
                 for client, sym, mkt, ex in all_pairs:
                     scan_tasks.append(scan_one(client, sym, mkt, ex, list(tfs_to_scan_fresh)))
                 
-                # Process Results
                 for f in asyncio.as_completed(scan_tasks):
                     res_hits, res_tfs, res_ex = await f
                     final_hits.extend(res_hits)
-                    
-                    # Update Stats: Success Count
-                    for tf in res_tfs:
-                        scan_stats[tf].successful_scans += 1
-                    
-                    # Update Stats: Hit Count (FIXED LOGIC)
-                    for h in res_hits:
-                        scan_stats[h.timeframe].hits_found += 1
+                    for tf in res_tfs: scan_stats[tf].successful_scans += 1
+                    for h in res_hits: scan_stats[h.timeframe].hits_found += 1
 
-                # Save Cache for Fresh High TFs
                 for tf, iso in tfs_fresh_map.items():
                     tf_hits = [h for h in final_hits if h.timeframe == tf]
                     await self.cache.save_scan_results(tf, iso, [h.to_dict() for h in tf_hits])
 
-            # 2. MERGE CACHED
+            # Merge Cached
             for h in cached_hits_to_use:
                 h.hot = (h.symbol in hot_coins)
                 final_hits.append(h)
 
-            # 3. LOGGING SUMMARY
+            # Summary Log
             logging.info("="*60)
             logging.info(f"{'TF':<5} | {'Source':<25} | {'Success':<15} | {'Hits'}")
             logging.info("-" * 60)
-            
             for tf in sorted(ACTIVE_TFS, key=lambda x: ["15m","30m","1h","2h","4h","1d","1w"].index(x)):
                 st = scan_stats[tf]
-                if st.source == "Cached":
-                    # For cached, "Success" concept is N/A, so we show "Skipped"
-                    succ_str = "Skipped (Cached)"
-                else:
-                    succ_str = f"{st.successful_scans}/{st.total_symbols}"
-                    
+                succ_str = "Skipped (Cached)" if st.source == "Cached" else f"{st.successful_scans}/{st.total_symbols}"
                 logging.info(f"[{tf:<3}] {st.source:<25} | {succ_str:<15} | {st.hits_found}")
             logging.info("="*60)
 
-            # 4. ALERT FILTERING
+            # Send
             hits_to_send = []
             new_state = sent_state.copy()
-            
             for h in final_hits:
                 tf = h.timeframe
                 if tf in CACHED_TFS:
                     iso = get_candle_open_iso(tf)
-                    last_sent = sent_state.get(tf, "")
-                    if last_sent != iso:
+                    if sent_state.get(tf, "") != iso:
                         hits_to_send.append(h)
                         new_state[tf] = iso
                 else:
