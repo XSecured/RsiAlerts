@@ -22,7 +22,7 @@ import redis.asyncio as aioredis
 
 @dataclass
 class Config:
-    MAX_CONCURRENCY: int = 50
+    MAX_CONCURRENCY: int = 150
     REQUEST_TIMEOUT: int = 5
     MAX_RETRIES: int = 3
     
