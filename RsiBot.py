@@ -22,9 +22,9 @@ import redis.asyncio as aioredis
 
 @dataclass
 class Config:
-    MAX_CONCURRENCY: int = 150
+    MAX_CONCURRENCY: int = 200
     REQUEST_TIMEOUT: int = 5
-    MAX_RETRIES: int = 3
+    MAX_RETRIES: int = 7
     
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     CACHE_TTL_MAP: Dict[str, int] = field(default_factory=lambda: {
@@ -209,19 +209,53 @@ class ExchangeClient:
     def __init__(self, session: aiohttp.ClientSession, proxy_pool: AsyncProxyPool):
         self.session = session
         self.proxies = proxy_pool
+        # Limit local concurrency to avoid OS file descriptor limits
         limit = CONFIG.MAX_CONCURRENCY if proxy_pool.proxies else 5
         self.sem = asyncio.Semaphore(limit)
 
     async def _request(self, url: str, params: dict = None) -> Any:
+        """Ultra-robust request with aggressive retries."""
+        last_error = None
+        
         for attempt in range(CONFIG.MAX_RETRIES):
             proxy = await self.proxies.get_proxy()
             try:
                 async with self.sem:
-                    async with self.session.get(url, params=params, proxy=proxy, timeout=CONFIG.REQUEST_TIMEOUT) as resp:
-                        if resp.status == 200: return await resp.json()
-                        elif resp.status == 429: await asyncio.sleep(5)
-            except: pass
-            await asyncio.sleep(0.5 * attempt)
+                    async with self.session.get(
+                        url, 
+                        params=params, 
+                        proxy=proxy, 
+                        timeout=CONFIG.REQUEST_TIMEOUT
+                    ) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+                        elif resp.status == 429:
+                            # Rate Limit: Backoff longer
+                            logging.warning(f"⚠️ 429 Rate Limit on {proxy}. Sleeping 5s.")
+                            await asyncio.sleep(5)
+                        elif resp.status >= 500:
+                            # Server Error: Retry immediately with different proxy
+                            pass
+                        else:
+                            # Other error (404, 403): Log it
+                            last_error = f"HTTP {resp.status}"
+                            
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_error = str(e)
+                # Don't spam logs with timeouts, just retry
+                pass
+            except Exception as e:
+                last_error = str(e)
+            
+            # Exponential backoff with jitter
+            sleep_time = (attempt + 1) * 0.5 + random.random() * 0.5
+            await asyncio.sleep(sleep_time)
+            
+        # If we reach here, all retries failed
+        if last_error:
+            # Optional: Log only if you want deep debug (spammy)
+            # logging.warning(f"❌ Failed {url} after {CONFIG.MAX_RETRIES} tries. Last err: {last_error}")
+            pass
         return None
 
 class BinanceClient(ExchangeClient):
@@ -438,18 +472,20 @@ class RsiBot:
             # Volatility Check
             logging.info("Calculating Volatility...")
             vol_scores = {}
+            
             async def check_vol(client, sym, mkt):
                 c = await client.fetch_closes_volatility(sym, mkt)
                 v = calculate_volatility(c)
                 if v > 0: vol_scores[sym] = v
             
             vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
-            # Batch volatility to prevent timeouts
             for i in range(0, len(vol_tasks), 200): 
                 await asyncio.gather(*vol_tasks[i:i+200])
-            
+                
             hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
-            logging.info(f"Hot Coins: {len(hot_coins)}")
+            
+            # UPDATED LOG LINE
+            logging.info(f"Volatility Calc: {len(vol_scores)}/{len(all_pairs)} | Hot Coins: {len(hot_coins)}")
             
             # Prepare Scan Logic
             sent_state = await self.cache.get_sent_state()
