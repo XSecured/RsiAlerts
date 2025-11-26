@@ -57,7 +57,7 @@ TIMEFRAME_MINUTES = {
 }
 
 ACTIVE_TFS = ['15m', '30m', '1h', '2h', '4h', '1d', '1w']
-MIDDLE_BAND_TFS = ['1h', '2h', '4h', '1d', '1w']
+MIDDLE_BAND_TFS = ['15m', '30m', '1h', '2h', '4h', '1d', '1w']
 CACHED_TFS = {'4h', '1d', '1w'}
 
 # ==========================================
@@ -337,35 +337,64 @@ class RsiBot:
         for h in hits: grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
         
         messages = []
-        for tf in ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]:
+        # Sort timeframes logically
+        tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
+        
+        for tf in tf_order:
             if tf not in grouped: continue
             
-            lines = [f"*🔍 BB Touches on {tf} Timeframe ({len(grouped[tf].get('UPPER',[]) + grouped[tf].get('MIDDLE',[]) + grouped[tf].get('LOWER',[]))} symbols)*", ""]
-            headers = {"UPPER": "⬆️ UPPER BB Touches:", "MIDDLE": "🔶 MIDDLE BB Touches:", "LOWER": "⬇️ LOWER BB Touches:"}
+            # Header
+            lines = [
+                f"▣ TIMEFRAME: {tf}",
+                "────────────────",
+                ""
+            ]
             
-            for t_type in ["UPPER", "MIDDLE", "LOWER"]:
+            headers = {"UPPER": "⬆️ UPPER BB", "MIDDLE": "🔶 MIDDLE BB", "LOWER": "⬇️ LOWER BB"}
+            types_found = [t for t in ["UPPER", "MIDDLE", "LOWER"] if grouped[tf].get(t)]
+            
+            for i, t_type in enumerate(types_found):
                 items = grouped[tf].get(t_type, [])
-                if not items: continue
-                
-                lines.append(f"*{headers[t_type]}*")
                 items.sort(key=lambda x: x.symbol)
                 
-                for item in items:
-                    market_tag = "[FUTURES]" if item.market == 'perp' else "[SPOT]"
-                    base = f"*{item.symbol}* {market_tag} - RSI: {item.rsi:.2f}"
+                lines.append(f"┌ {headers[t_type]}")
+                
+                for idx, item in enumerate(items):
+                    is_last = (idx == len(items) - 1)
+                    prefix = "└" if is_last else "│"
+                    
+                    # Exchange Icon
+                    icon = "🟡" if item.exchange == "Binance" else "⚫"
+                    sym = item.symbol 
+                    
+                    # Value
+                    val = f"{item.rsi:.2f}"
+                    
+                    # Extras
+                    extras = ""
                     if t_type == "MIDDLE":
                         arrow = "🔻" if item.direction == "from above" else "🔹"
-                        base += f" ({arrow})"
-                    if item.hot: base += " 🔥"
-                    lines.append(f"• {base}")
-                lines.append("")
+                        extras = f" ({arrow})"
+                    
+                    if item.hot:
+                        extras += " 🔥"
+                    
+                    # Line: │ 🟡 BTCUSDT | 75.42 🔥
+                    lines.append(f"{prefix} {icon} {sym} | {val}{extras}")
+                
+                lines.append("") # Spacer
+                
+            lines.append("────────────────")
+            
+            # Footer Date: 26 Nov 18:45 UTC
+            ts = datetime.utcnow().strftime('%d %b %H:%M UTC')
+            lines.append(ts)
+            
             messages.append("\n".join(lines))
             
         async with aiohttp.ClientSession() as session:
             for msg in messages:
-                ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-                full_msg = msg + f"\n\n_Report generated at {ts}_"
-                for chunk in [full_msg[i:i+4000] for i in range(0, len(full_msg), 4000)]:
+                for chunk in [msg[i:i+4000] for i in range(0, len(msg), 4000)]:
                     try:
                         await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage", 
                                          json={"chat_id": CONFIG.CHAT_ID, "text": chunk, "parse_mode": "Markdown"})
