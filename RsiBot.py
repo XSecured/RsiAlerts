@@ -22,24 +22,19 @@ import redis.asyncio as aioredis
 
 @dataclass
 class Config:
-    # System
     MAX_CONCURRENCY: int = 50
     REQUEST_TIMEOUT: int = 5
     MAX_RETRIES: int = 3
     
-    # Redis & Cache
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
-    # TTL: 4h=4h+10m, 1d=24h+30m, 1w=7d+1h
     CACHE_TTL_MAP: Dict[str, int] = field(default_factory=lambda: {
         '4h': 14400 + 600, '1d': 86400 + 1800, '1w': 604800 + 3600
     })
     
-    # Telegram
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
     PROXY_URL: str = "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 
-    # Trading Params
     RSI_PERIOD: int = 14
     BB_LENGTH: int = 34
     BB_STDDEV: float = 2.0
@@ -50,7 +45,6 @@ class Config:
     LOWER_TOUCH_THRESHOLD: float = 0.02
     MIDDLE_TOUCH_THRESHOLD: float = 0.035
 
-    # Ignore List
     IGNORED_SYMBOLS: Set[str] = field(default_factory=lambda: {
         "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT"
     })
@@ -77,16 +71,22 @@ class TouchHit:
     market: str   
     timeframe: str
     rsi: float
-    touch_type: str # UPPER, LOWER, MIDDLE
+    touch_type: str
     direction: str = "" 
     hot: bool = False
     
-    def to_dict(self):
-        return asdict(self)
-    
+    def to_dict(self): return asdict(self)
     @staticmethod
-    def from_dict(d):
-        return TouchHit(**d)
+    def from_dict(d): return TouchHit(**d)
+
+@dataclass
+class ScanStats:
+    timeframe: str
+    source: str # 'Fresh' or 'Cache'
+    total_symbols: int = 0
+    successful_scans: int = 0
+    hits_found: int = 0
+    details: str = ""
 
 # ==========================================
 # PROXY POOL
@@ -236,7 +236,6 @@ class BinanceClient(ExchangeClient):
         return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
 
     async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
-        # 1h klines for vol calculation
         base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
         data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': 25})
         if not data: return []
@@ -341,10 +340,7 @@ class RsiBot:
         for tf in ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]:
             if tf not in grouped: continue
             
-            # ORIGINAL REPORT FORMAT RESTORED
             lines = [f"*🔍 BB Touches on {tf} Timeframe ({len(grouped[tf].get('UPPER',[]) + grouped[tf].get('MIDDLE',[]) + grouped[tf].get('LOWER',[]))} symbols)*", ""]
-            
-            # Headers logic from original: "⬆️ UPPER BB Touches:" etc.
             headers = {"UPPER": "⬆️ UPPER BB Touches:", "MIDDLE": "🔶 MIDDLE BB Touches:", "LOWER": "⬇️ LOWER BB Touches:"}
             
             for t_type in ["UPPER", "MIDDLE", "LOWER"]:
@@ -355,31 +351,20 @@ class RsiBot:
                 items.sort(key=lambda x: x.symbol)
                 
                 for item in items:
-                    # Exact original line format
                     market_tag = "[FUTURES]" if item.market == 'perp' else "[SPOT]"
-                    # Original symbol name (no stripping USDT in code, but let's keep it if user wants normalized names, 
-                    # but original code just used item['symbol']. We'll assume simple symbol)
-                    
-                    # "• *BTCUSDT* [FUTURES] - RSI: 30.50 🔥"
                     base = f"*{item.symbol}* {market_tag} - RSI: {item.rsi:.2f}"
-                    
                     if t_type == "MIDDLE":
                         arrow = "🔻" if item.direction == "from above" else "🔹"
                         base += f" ({arrow})"
-                    
-                    if item.hot:
-                        base += " 🔥"
-                        
+                    if item.hot: base += " 🔥"
                     lines.append(f"• {base}")
                 lines.append("")
             messages.append("\n".join(lines))
             
         async with aiohttp.ClientSession() as session:
             for msg in messages:
-                # Append timestamp as per original
                 ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
                 full_msg = msg + f"\n\n_Report generated at {ts}_"
-                
                 for chunk in [full_msg[i:i+4000] for i in range(0, len(full_msg), 4000)]:
                     try:
                         await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage", 
@@ -412,8 +397,6 @@ class RsiBot:
                 return res
                 
             f_bp, f_bs, f_yp, f_ys = filter_u(bp), filter_u(bs), filter_u(yp), filter_u(ys)
-            
-            # Build Full Pair List
             all_pairs = []
             for s in f_bp: all_pairs.append((binance, s, 'perp', 'Binance'))
             for s in f_bs: all_pairs.append((binance, s, 'spot', 'Binance'))
@@ -422,85 +405,101 @@ class RsiBot:
             
             logging.info(f"Total symbols: {len(all_pairs)}")
             
-            # Volatility Check (ALL SYMBOLS)
-            logging.info("Calculating Volatility (All Symbols)...")
+            # Volatility Check
+            logging.info("Calculating Volatility...")
             vol_scores = {}
-            
             async def check_vol(client, sym, mkt):
                 c = await client.fetch_closes_volatility(sym, mkt)
                 v = calculate_volatility(c)
                 if v > 0: vol_scores[sym] = v
             
-            # Create tasks for all pairs
-            vol_tasks = []
-            for client, s, mkt, ex in all_pairs:
-                vol_tasks.append(check_vol(client, s, mkt))
-            
-            # Batch execution for volatility
-            for i in range(0, len(vol_tasks), 100): 
-                await asyncio.gather(*vol_tasks[i:i+100])
-                
+            vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
+            for i in range(0, len(vol_tasks), 100): await asyncio.gather(*vol_tasks[i:i+100])
             hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
             logging.info(f"Hot Coins: {len(hot_coins)}")
             
-            # Prepare Scan
+            # Prepare Scan Logic
             sent_state = await self.cache.get_sent_state()
-            tfs_cached_logic = []   
-            tfs_always_scan = []    
+            tfs_to_scan_fresh = set()
+            tfs_fresh_map = {}
+            cached_hits_to_use = []
+            
+            # Statistics for Logging
+            scan_stats = {tf: ScanStats(tf, "Unknown") for tf in ACTIVE_TFS}
             
             for tf in ACTIVE_TFS:
                 if tf in CACHED_TFS:
                     iso = get_candle_open_iso(tf)
                     cached_res = await self.cache.get_scan_results(tf, iso)
                     if cached_res is None:
-                        tfs_cached_logic.append((tf, iso, True, None))
+                        # NEEDS FRESH SCAN
+                        tfs_to_scan_fresh.add(tf)
+                        tfs_fresh_map[tf] = iso
+                        scan_stats[tf].source = "Fresh Scan (New Candle)"
                     else:
+                        # LOAD FROM CACHE
                         hits = [TouchHit.from_dict(d) for d in cached_res]
-                        tfs_cached_logic.append((tf, iso, False, hits)) 
+                        cached_hits_to_use.extend(hits)
+                        scan_stats[tf].source = "Cached"
+                        scan_stats[tf].hits_found = len(hits)
                 else:
-                    tfs_always_scan.append(tf)
-            
-            # Build Task List
-            scan_tasks = []
-            async def scan_one(client, sym, mkt, ex, tfs):
-                hits = []
-                for tf in tfs:
-                    closes = await client.fetch_closes(sym, tf, mkt)
-                    t_type, direction, rsi_val = check_bb_rsi(closes, tf)
-                    if t_type:
-                        hits.append(TouchHit(sym, ex, mkt, tf, rsi_val, t_type, direction, sym in hot_coins))
-                return hits
-
-            # 1. Scan "Fresh"
-            tfs_to_scan_fresh = set(tfs_always_scan)
-            tfs_fresh_map = {} 
-            
-            for tf, iso, needs_scan, _ in tfs_cached_logic:
-                if needs_scan:
+                    # ALWAYS FRESH
                     tfs_to_scan_fresh.add(tf)
-                    tfs_fresh_map[tf] = iso
-            
+                    scan_stats[tf].source = "Fresh Scan (Low TF)"
+
+            # 1. EXECUTE FRESH SCANS
             final_hits = []
             if tfs_to_scan_fresh:
+                logging.info(f"Scanning fresh: {tfs_to_scan_fresh}")
+                
+                # We scan specific TFs for specific symbols to be efficient, but here we do bulk
+                scan_tasks = []
+                
+                async def scan_one(client, sym, mkt, ex, tfs):
+                    # Return hits AND success count
+                    hits = []
+                    scanned_tfs = []
+                    for tf in tfs:
+                        closes = await client.fetch_closes(sym, tf, mkt)
+                        if closes: 
+                            scanned_tfs.append(tf)
+                            t_type, direction, rsi_val = check_bb_rsi(closes, tf)
+                            if t_type:
+                                hits.append(TouchHit(sym, ex, mkt, tf, rsi_val, t_type, direction, sym in hot_coins))
+                    return hits, scanned_tfs, ex
+
                 for client, sym, mkt, ex in all_pairs:
                     scan_tasks.append(scan_one(client, sym, mkt, ex, list(tfs_to_scan_fresh)))
                 
-                scan_results = []
                 for f in asyncio.as_completed(scan_tasks):
-                    scan_results.extend(await f)
-                final_hits.extend(scan_results)
-                
+                    res_hits, res_tfs, res_ex = await f
+                    final_hits.extend(res_hits)
+                    # Update Stats
+                    for tf in res_tfs:
+                        scan_stats[tf].successful_scans += 1
+                        
+                # Save Cache for Fresh High TFs
                 for tf, iso in tfs_fresh_map.items():
-                    tf_hits = [h for h in scan_results if h.timeframe == tf]
+                    tf_hits = [h for h in final_hits if h.timeframe == tf]
                     await self.cache.save_scan_results(tf, iso, [h.to_dict() for h in tf_hits])
-            
-            # 2. Add "Cached"
-            for tf, iso, needs_scan, hits in tfs_cached_logic:
-                if not needs_scan and hits:
-                    for h in hits: h.hot = (h.symbol in hot_coins)
-                    final_hits.extend(hits)
-            
-            # 3. Filter Alerts
+                    scan_stats[tf].hits_found = len(tf_hits)
+
+            # 2. MERGE CACHED
+            for h in cached_hits_to_use:
+                h.hot = (h.symbol in hot_coins)
+                final_hits.append(h)
+
+            # 3. LOGGING SUMMARY
+            logging.info("="*50)
+            logging.info("       SCAN SUMMARY REPORT")
+            logging.info("="*50)
+            for tf in sorted(ACTIVE_TFS, key=lambda x: ["15m","30m","1h","2h","4h","1d","1w"].index(x)):
+                st = scan_stats[tf]
+                # Approximate totals based on exchange split
+                logging.info(f"[{tf:<3}] {st.source:<22} | Success: {st.successful_scans} | Hits: {st.hits_found}")
+            logging.info("="*50)
+
+            # 4. ALERT FILTERING (Strict Deduplication)
             hits_to_send = []
             new_state = sent_state.copy()
             
@@ -509,10 +508,16 @@ class RsiBot:
                 if tf in CACHED_TFS:
                     iso = get_candle_open_iso(tf)
                     last_sent = sent_state.get(tf, "")
+                    
+                    # ONLY SEND IF: We haven't sent this candle yet
                     if last_sent != iso:
                         hits_to_send.append(h)
                         new_state[tf] = iso
+                    else:
+                        # Already sent for this candle. Suppress.
+                        pass
                 else:
+                    # Low TFs always send
                     hits_to_send.append(h)
             
             await self.send_report(hits_to_send)
