@@ -22,9 +22,9 @@ import redis.asyncio as aioredis
 
 @dataclass
 class Config:
-    MAX_CONCURRENCY: int = 200
+    MAX_CONCURRENCY: int = 250
     REQUEST_TIMEOUT: int = 5
-    MAX_RETRIES: int = 7
+    MAX_RETRIES: int = 10
     
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     CACHE_TTL_MAP: Dict[str, int] = field(default_factory=lambda: {
@@ -118,7 +118,7 @@ class AsyncProxyPool:
         self.proxies = []
         random.shuffle(raw)
         
-        sem = asyncio.Semaphore(200)
+        sem = asyncio.Semaphore(300)
         async def protected_test(p):
             async with sem: return await self._test_proxy(p, session)
 
