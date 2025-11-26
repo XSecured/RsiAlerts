@@ -254,7 +254,7 @@ class ExchangeClient:
         # If we reach here, all retries failed
         if last_error:
             # Optional: Log only if you want deep debug (spammy)
-            # logging.warning(f"❌ Failed {url} after {CONFIG.MAX_RETRIES} tries. Last err: {last_error}")
+            logging.warning(f"❌ Failed {url} after {CONFIG.MAX_RETRIES} tries. Last err: {last_error}")
             pass
         return None
 
