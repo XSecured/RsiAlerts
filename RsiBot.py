@@ -24,7 +24,7 @@ import redis.asyncio as aioredis
 class Config:
     MAX_CONCURRENCY: int = 250
     REQUEST_TIMEOUT: int = 5
-    MAX_RETRIES: int = 10
+    MAX_RETRIES: int = 5
     
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     CACHE_TTL_MAP: Dict[str, int] = field(default_factory=lambda: {
