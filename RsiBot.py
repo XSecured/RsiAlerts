@@ -432,7 +432,8 @@ class RsiBot:
             for s in f_yp: all_pairs.append((bybit, s, 'perp', 'Bybit'))
             for s in f_ys: all_pairs.append((bybit, s, 'spot', 'Bybit'))
             
-            logging.info(f"Total symbols: {len(all_pairs)}")
+            total_sym_count = len(all_pairs)
+            logging.info(f"Total symbols: {total_sym_count}")
             
             # Volatility Check
             logging.info("Calculating Volatility...")
@@ -443,7 +444,10 @@ class RsiBot:
                 if v > 0: vol_scores[sym] = v
             
             vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
-            for i in range(0, len(vol_tasks), 100): await asyncio.gather(*vol_tasks[i:i+100])
+            # Batch volatility to prevent timeouts
+            for i in range(0, len(vol_tasks), 200): 
+                await asyncio.gather(*vol_tasks[i:i+200])
+            
             hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
             logging.info(f"Hot Coins: {len(hot_coins)}")
             
@@ -453,8 +457,8 @@ class RsiBot:
             tfs_fresh_map = {}
             cached_hits_to_use = []
             
-            # Statistics for Logging
-            scan_stats = {tf: ScanStats(tf, "Unknown") for tf in ACTIVE_TFS}
+            # Init Stats
+            scan_stats = {tf: ScanStats(tf, "Unknown", total_symbols=total_sym_count) for tf in ACTIVE_TFS}
             
             for tf in ACTIVE_TFS:
                 if tf in CACHED_TFS:
@@ -471,6 +475,8 @@ class RsiBot:
                         cached_hits_to_use.extend(hits)
                         scan_stats[tf].source = "Cached"
                         scan_stats[tf].hits_found = len(hits)
+                        # Cached implies 100% success for logic purposes (skipped)
+                        scan_stats[tf].successful_scans = 0 
                 else:
                     # ALWAYS FRESH
                     tfs_to_scan_fresh.add(tf)
@@ -481,11 +487,8 @@ class RsiBot:
             if tfs_to_scan_fresh:
                 logging.info(f"Scanning fresh: {tfs_to_scan_fresh}")
                 
-                # We scan specific TFs for specific symbols to be efficient, but here we do bulk
                 scan_tasks = []
-                
                 async def scan_one(client, sym, mkt, ex, tfs):
-                    # Return hits AND success count
                     hits = []
                     scanned_tfs = []
                     for tf in tfs:
@@ -500,18 +503,23 @@ class RsiBot:
                 for client, sym, mkt, ex in all_pairs:
                     scan_tasks.append(scan_one(client, sym, mkt, ex, list(tfs_to_scan_fresh)))
                 
+                # Process Results
                 for f in asyncio.as_completed(scan_tasks):
                     res_hits, res_tfs, res_ex = await f
                     final_hits.extend(res_hits)
-                    # Update Stats
+                    
+                    # Update Stats: Success Count
                     for tf in res_tfs:
                         scan_stats[tf].successful_scans += 1
-                        
+                    
+                    # Update Stats: Hit Count (FIXED LOGIC)
+                    for h in res_hits:
+                        scan_stats[h.timeframe].hits_found += 1
+
                 # Save Cache for Fresh High TFs
                 for tf, iso in tfs_fresh_map.items():
                     tf_hits = [h for h in final_hits if h.timeframe == tf]
                     await self.cache.save_scan_results(tf, iso, [h.to_dict() for h in tf_hits])
-                    scan_stats[tf].hits_found = len(tf_hits)
 
             # 2. MERGE CACHED
             for h in cached_hits_to_use:
@@ -519,16 +527,22 @@ class RsiBot:
                 final_hits.append(h)
 
             # 3. LOGGING SUMMARY
-            logging.info("="*50)
-            logging.info("       SCAN SUMMARY REPORT")
-            logging.info("="*50)
+            logging.info("="*60)
+            logging.info(f"{'TF':<5} | {'Source':<25} | {'Success':<15} | {'Hits'}")
+            logging.info("-" * 60)
+            
             for tf in sorted(ACTIVE_TFS, key=lambda x: ["15m","30m","1h","2h","4h","1d","1w"].index(x)):
                 st = scan_stats[tf]
-                # Approximate totals based on exchange split
-                logging.info(f"[{tf:<3}] {st.source:<22} | Success: {st.successful_scans} | Hits: {st.hits_found}")
-            logging.info("="*50)
+                if st.source == "Cached":
+                    # For cached, "Success" concept is N/A, so we show "Skipped"
+                    succ_str = "Skipped (Cached)"
+                else:
+                    succ_str = f"{st.successful_scans}/{st.total_symbols}"
+                    
+                logging.info(f"[{tf:<3}] {st.source:<25} | {succ_str:<15} | {st.hits_found}")
+            logging.info("="*60)
 
-            # 4. ALERT FILTERING (Strict Deduplication)
+            # 4. ALERT FILTERING
             hits_to_send = []
             new_state = sent_state.copy()
             
@@ -537,16 +551,10 @@ class RsiBot:
                 if tf in CACHED_TFS:
                     iso = get_candle_open_iso(tf)
                     last_sent = sent_state.get(tf, "")
-                    
-                    # ONLY SEND IF: We haven't sent this candle yet
                     if last_sent != iso:
                         hits_to_send.append(h)
                         new_state[tf] = iso
-                    else:
-                        # Already sent for this candle. Suppress.
-                        pass
                 else:
-                    # Low TFs always send
                     hits_to_send.append(h)
             
             await self.send_report(hits_to_send)
