@@ -57,7 +57,7 @@ TIMEFRAME_MINUTES = {
 }
 
 ACTIVE_TFS = ['15m', '30m', '1h', '2h', '4h', '1d', '1w']
-MIDDLE_BAND_TFS = ['1h', '2h', '4h', '1d', '1w']
+MIDDLE_BAND_TFS = ['15m', '30m', '1h', '2h', '4h', '1d', '1w']
 CACHED_TFS = {'4h', '1d', '1w'}
 
 # ==========================================
@@ -388,8 +388,7 @@ class RsiBot:
                 lines.append("")
             lines.append("────────────────")
             lines.append(datetime.utcnow().strftime('%d %b %H:%M UTC'))
-            messages.append("
-".join(lines))
+            messages.append("\n".join(lines))
             
         async with aiohttp.ClientSession() as s:
             for msg in messages:
