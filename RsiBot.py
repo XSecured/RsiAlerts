@@ -218,7 +218,7 @@ class CacheManager:
             self.redis = None
 
     async def close(self):
-        if self.redis: await self.redis.close()
+        if self.redis: await self.redis.aclose()
 
     # --- Symbol List Caching (Manual Expiry) ---
     async def get_cached_symbols(self) -> Optional[Dict]:
@@ -439,7 +439,7 @@ class RsiBot:
                     lines.append(f"{prefix} {icon} {item.symbol} | {item.rsi:.2f}{ext}")
                 lines.append("")
             lines.append("────────────────")
-            lines.append(datetime.utcnow().strftime('%d %b %H:%M UTC'))
+            lines.append(datetime.now(timezone.utc).strftime('%d %b %H:%M UTC'))
             messages.append("\n".join(lines))
             
         async with aiohttp.ClientSession() as s:
