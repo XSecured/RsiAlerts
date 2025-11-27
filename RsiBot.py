@@ -161,7 +161,7 @@ class AsyncProxyPool:
             self.failures[proxy] = self.failures.get(proxy, 0) + 1
             strikes = self.failures[proxy]
             
-            if strikes >= 3:
+            if strikes >= 10:
                 if proxy in self.proxies:
                     self.proxies.remove(proxy)
                     # Rebuild cycle logic
