@@ -23,7 +23,7 @@ import redis.asyncio as aioredis
 @dataclass
 class Config:
     MAX_CONCURRENCY: int = 200
-    REQUEST_TIMEOUT: int = 7
+    REQUEST_TIMEOUT: int = 6
     MAX_RETRIES: int = 5
     
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -181,7 +181,7 @@ class AsyncProxyPool:
 
     async def _test_proxy(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool]:
         try:
-            async with session.get("https://api.binance.com/api/v3/time", proxy=proxy, timeout=7) as resp:
+            async with session.get("https://api.binance.com/api/v3/time", proxy=proxy, timeout=6) as resp:
                 return proxy, resp.status == 200
         except: return proxy, False
 
@@ -194,11 +194,11 @@ class AsyncProxyPool:
     async def report_failure(self, proxy: str):
         async with self._lock:
             self.failures[proxy] = self.failures.get(proxy, 0) + 1
-            if self.failures[proxy] >= 25:
+            if self.failures[proxy] >= 13:
                 if proxy in self.proxies:
                     self.proxies.remove(proxy)
                     if self.proxies: self.iterator = cycle(self.proxies)
-                    logging.warning(f"🚫 Banned Proxy {proxy} (25 failures)")
+                    logging.warning(f"🚫 Banned Proxy {proxy} (13 failures)")
 
 # ==========================================
 # REDIS CACHE MANAGER (UPDATED)
