@@ -144,7 +144,7 @@ class AsyncProxyPool:
 
     async def _test_proxy(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool]:
         try:
-            async with session.get("https://api.binance.com/api/v3/time", proxy=proxy, timeout=5) as resp:
+            async with session.get("https://api.binance.com/api/v3/time", proxy=proxy, timeout=6) as resp:
                 return proxy, resp.status == 200
         except: return proxy, False
 
