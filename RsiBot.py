@@ -58,7 +58,7 @@ TIMEFRAME_MINUTES = {
 
 ACTIVE_TFS = ['15m', '30m', '1h', '2h', '4h', '1d', '1w']
 MIDDLE_BAND_TFS = ['15m', '30m', '1h', '2h', '4h', '1d', '1w']
-CACHED_TFS = {'4h', '1d', '1w'}
+CACHED_TFS = {'2h', '4h', '1d', '1w'}
 
 # ==========================================
 # DATA MODELS
@@ -425,7 +425,7 @@ class RsiBot:
             bp, bs, yp, ys = await asyncio.gather(t_bp, t_bs, t_yp, t_ys)
             
             counts = [len(x) for x in [bp, bs, yp, ys]]
-            log_msg = f"BP:{counts[0]} BS:{counts[1]} YP:{counts[2]} YS:{counts[3]}"
+            log_msg = f"BinPerp: {counts[0]} | BinSpot: {counts[1]} | BybPerp: {counts[2]} | BybSpot: {counts[3]}"
             
             # STRICT VALIDATION: Ensure ALL lists have data
             if all(c > 0 for c in counts):
