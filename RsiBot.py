@@ -23,7 +23,7 @@ import redis.asyncio as aioredis
 @dataclass
 class Config:
     MAX_CONCURRENCY: int = 200
-    REQUEST_TIMEOUT: int = 5
+    REQUEST_TIMEOUT: int = 6
     MAX_RETRIES: int = 5
     
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
