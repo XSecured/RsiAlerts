@@ -476,8 +476,7 @@ class RsiBot:
                 lines.append("")
             lines.append("────────────────")
             lines.append(datetime.utcnow().strftime('%d %b %H:%M UTC'))
-            messages.append("
-".join(lines))
+            messages.append("\n".join(lines))
             
         async with aiohttp.ClientSession() as s:
             for msg in messages:
