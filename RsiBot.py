@@ -232,10 +232,11 @@ class ExchangeClient:
 
     async def _request(self, url: str, params: dict = None) -> Any:
         """Robust request with proxy rotation & blacklisting."""
+        last_error = "Unknown Error" # Default value to prevent NameError
+        
         for attempt in range(CONFIG.MAX_RETRIES):
             proxy = await self.proxies.get_proxy()
             if not proxy:
-                # No proxies left? Wait a bit and retry (maybe repopulate happens externally?)
                 await asyncio.sleep(1)
                 continue
 
@@ -247,21 +248,24 @@ class ExchangeClient:
                         elif resp.status == 429:
                             logging.warning(f"⚠️ 429 Rate Limit ({proxy}). Sleeping 5s.")
                             await asyncio.sleep(5)
+                            last_error = "429 Rate Limit"
                         elif resp.status >= 500:
-                            # Server Error, try next proxy immediately
-                            pass
+                            last_error = f"Server Error {resp.status}"
                         else:
-                            pass # 4xx errors
+                            last_error = f"HTTP {resp.status}"
             
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
                 # Network error = Strike for proxy
                 await self.proxies.report_failure(proxy)
-                # Only log if it's a "clean" error message to reduce noise
-                logging.warning(f"❌ Failed {url} after {CONFIG.MAX_RETRIES} tries. Last err: {last_error}")
+                last_error = str(e)
+            except Exception as e:
+                last_error = f"Unexpected: {str(e)}"
             
             # Jittered backoff
             await asyncio.sleep(0.5 + random.random() * 0.5)
             
+        # Log failure after all retries
+        logging.warning(f"❌ Failed {url} after {CONFIG.MAX_RETRIES} tries. Last err: {last_error}")
         return None
 
 class BinanceClient(ExchangeClient):
