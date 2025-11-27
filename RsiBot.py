@@ -92,47 +92,18 @@ class ScanStats:
 # ==========================================
 
 class AsyncProxyPool:
-    def __init__(self, max_pool_size=25, cache_manager=None):
+    def __init__(self, max_pool_size=25):
         self.proxies: List[str] = []
         self.max_pool_size = max_pool_size
         self.iterator = None
         self._lock = asyncio.Lock()
         self.failures: Dict[str, int] = {}
-        self.cache = cache_manager # Needs cache manager access
 
     async def populate(self, url: str, session: aiohttp.ClientSession):
         if not url: return
-        
-        # 1. Try loading from Cache first (Fast Path)
-        if self.cache:
-            cached_proxies = await self.cache.get_cached_proxies()
-            if cached_proxies:
-                logging.info(f"♻️ Found {len(cached_proxies)} cached proxies. Retesting...")
-                # Test them quickly
-                valid_cached = []
-                sem = asyncio.Semaphore(100)
-                async def test(p):
-                    async with sem: return p if await self._test_proxy(p, session) else None
-                
-                tasks = [asyncio.create_task(test(p)) for p in cached_proxies]
-                for f in asyncio.as_completed(tasks):
-                    res = await f
-                    if res: valid_cached.append(res)
-                
-                logging.info(f"♻️ {len(valid_cached)}/{len(cached_proxies)} cached proxies are still alive.")
-                self.proxies.extend(valid_cached)
-                
-                if len(self.proxies) >= self.max_pool_size:
-                    self.iterator = cycle(self.proxies)
-                    logging.info("✅ Pool filled from Cache! Skipping main fetch.")
-                    return
-
-        # 2. Main Fetch (Slow Path) - Only if needed
-        needed = self.max_pool_size - len(self.proxies)
-        logging.info(f"📥 Fetching fresh proxies to find {needed} more...")
-        
         raw = []
         try:
+            logging.info(f"📥 Fetching proxies from {url}...")
             async with session.get(url, timeout=15) as resp:
                 if resp.status == 200:
                     text = await resp.text()
@@ -141,16 +112,11 @@ class AsyncProxyPool:
                         if p: raw.append(p if "://" in p else f"http://{p}")
         except Exception as e:
             logging.error(f"❌ Proxy fetch failed: {e}")
-            # If we have *some* cached proxies, proceed with them rather than dying
-            if self.proxies:
-                self.iterator = cycle(self.proxies)
-                return
             return
 
         logging.info(f"🔎 Validating {len(raw)} proxies...")
-        # Exclude ones we already have
-        existing_set = set(self.proxies)
-        raw = [p for p in raw if p not in existing_set]
+        self.proxies = []
+        self.failures = {}
         random.shuffle(raw)
         
         sem = asyncio.Semaphore(250)
@@ -173,15 +139,12 @@ class AsyncProxyPool:
         if self.proxies:
             self.iterator = cycle(self.proxies)
             logging.info(f"✅ Proxy Pool Ready: {len(self.proxies)} proxies.")
-            # Save valid list for next run
-            if self.cache:
-                await self.cache.save_cached_proxies(self.proxies)
         else:
             logging.error("❌ NO WORKING PROXIES FOUND!")
 
     async def _test_proxy(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool]:
         try:
-            async with session.get("https://api.binance.com/api/v3/time", proxy=proxy, timeout=6) as resp:
+            async with session.get("https://api.binance.com/api/v3/time", proxy=proxy, timeout=5) as resp:
                 return proxy, resp.status == 200
         except: return proxy, False
 
@@ -194,11 +157,11 @@ class AsyncProxyPool:
     async def report_failure(self, proxy: str):
         async with self._lock:
             self.failures[proxy] = self.failures.get(proxy, 0) + 1
-            if self.failures[proxy] >= 13:
+            if self.failures[proxy] >= 10:
                 if proxy in self.proxies:
                     self.proxies.remove(proxy)
                     if self.proxies: self.iterator = cycle(self.proxies)
-                    logging.warning(f"🚫 Banned Proxy {proxy} (13 failures)")
+                    logging.warning(f"🚫 Banned Proxy {proxy} (10 failures)")
 
 # ==========================================
 # REDIS CACHE MANAGER (UPDATED)
@@ -236,21 +199,6 @@ class CacheManager:
         await self.redis.set("bb_bot:symbols_cache_v3", json.dumps(payload))
         logging.info("💾 Saved symbol list to cache (Persistent)")
 
-    # --- Proxy Cache ---
-    async def get_cached_proxies(self) -> List[str]:
-        if not self.redis: return []
-        try:
-            data = await self.redis.get("bb_bot:working_proxies")
-            return json.loads(data) if data else []
-        except: return []
-
-    async def save_cached_proxies(self, proxies: List[str]):
-        if not self.redis: return
-        try:
-            # Cache for 1 hour. If bot doesn't run for an hour, assume they are dead.
-            await self.redis.set("bb_bot:working_proxies", json.dumps(list(proxies)), ex=7200)
-        except: pass
-            
     # --- Existing Cache Methods ---
     def _scan_key(self, tf: str, iso_time: str) -> str:
         return f"bb_touch:scan:{tf}:{iso_time}"
@@ -414,7 +362,7 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
 class RsiBot:
     def __init__(self):
         self.cache = CacheManager()
-        self.proxies = AsyncProxyPool(cache_manager=self.cache)
+        self.proxies = AsyncProxyPool()
         
     async def send_report(self, hits: List[TouchHit]):
         if not hits: return
@@ -636,22 +584,8 @@ class RsiBot:
             
             await self.send_report(hits_to_send)
             await self.cache.save_sent_state(new_state)
-
-            # --- PROXY PERSISTENCE (STRICT) ---
-            elite_proxies = []
-            for p in self.proxies.proxies:
-                # Only save proxies with ZERO or very low failures
-                if p not in self.proxies.failures or self.proxies.failures[p] == 0:
-                    elite_proxies.append(p)
             
-            logging.info(f"💾 Saving {len(elite_proxies)} Elite Proxies (0 failures) to cache.")
-            
-            if elite_proxies:
-                await self.cache.save_cached_proxies(elite_proxies)
-            else:
-                await self.cache.save_cached_proxies([])
-            
-            await self.cache.close()
+        await self.cache.close()
 
 if __name__ == "__main__":
     if os.name == 'nt':
