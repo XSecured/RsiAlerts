@@ -2,12 +2,17 @@ name: Run BB Touch Bot
 
 on:
   schedule:
-    - cron: '0 * * * *'
-  workflow_dispatch:
+    - cron: '1 * * * *'  # Every Hour
+  workflow_dispatch:  # Manual trigger
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    
+    # Use micromamba-shell for all steps (auto-activates environment)
+    defaults:
+      run:
+        shell: micromamba-shell {0}
 
     env:
       REDIS_URL: ${{ secrets.REDIS_URL }}
@@ -15,29 +20,25 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v6
 
-      # Cache only the conda packages (recommended approach)
-      - name: Cache conda packages
-        uses: actions/cache@v4
-        env:
-          CACHE_NUMBER: 0  # Increment to reset cache
-        with:
-          path: ~/conda_pkgs_dir
-          key: ${{ runner.os }}-conda-${{ env.CACHE_NUMBER }}-${{ hashFiles('environment.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-conda-
-
-      - name: Set up Miniconda and create environment
-        uses: conda-incubator/setup-miniconda@v2
+      - name: Setup Micromamba
+        uses: mamba-org/setup-micromamba@v2
         with:
           environment-file: environment.yml
-          activate-environment: bb-touch-bot
-          python-version: '3.10'
-          auto-update-conda: false
-          use-mamba: true
-          use-only-tar-bz2: true  # IMPORTANT: Required for package caching!
+          environment-name: bb-touch-bot
+          cache-environment: true    # Cache the installed environment
+          cache-downloads: true      # Cache package downloads
+          post-cleanup: 'all'        # Clean up after run to save space
+          init-shell: >-
+            bash
+            powershell
+
+      - name: Verify environment
+        run: |
+          python --version
+          python -c "import talib; import numpy; import aiohttp; print('✅ All imports OK')"
 
       - name: Run bot
-        shell: bash -l {0}
         run: python RsiBot.py
