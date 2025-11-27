@@ -637,12 +637,21 @@ class RsiBot:
             await self.send_report(hits_to_send)
             await self.cache.save_sent_state(new_state)
 
-            # At the VERY END of run(), save the proxies again (to update TTL)
-            # self.proxies.proxies contains only the survivors (banned ones were removed during run)
-            if self.proxies.proxies:
-                await self.cache.save_cached_proxies(self.proxies.proxies)
-                 
-        await self.cache.close()
+            # --- PROXY PERSISTENCE (STRICT) ---
+            elite_proxies = []
+            for p in self.proxies.proxies:
+                # Only save proxies with ZERO or very low failures
+                if p not in self.proxies.failures or self.proxies.failures[p] == 0:
+                    elite_proxies.append(p)
+            
+            logging.info(f"💾 Saving {len(elite_proxies)} Elite Proxies (0 failures) to cache.")
+            
+            if elite_proxies:
+                await self.cache.save_cached_proxies(elite_proxies)
+            else:
+                await self.cache.save_cached_proxies([])
+            
+            await self.cache.close()
 
 if __name__ == "__main__":
     if os.name == 'nt':
