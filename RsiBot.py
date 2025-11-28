@@ -419,7 +419,7 @@ class RsiBot:
                     # CLEAN SYMBOL: Remove USDT
                     sym_clean = item.symbol.replace("USDT", "")
                     
-                    ext = f" ({'🔻' if item.direction=='from above' else '🔹'})" if t=="MIDDLE" else ""
+                    ext = f" {'🔻' if item.direction=='from above' else '🔹'}" if t=="MIDDLE" else ""
                     if item.hot: ext += " 🔥"
                     
                     # FORMAT: │ 🟡 *BTC* ➜ *75.20* 🔥
