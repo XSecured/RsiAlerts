@@ -398,7 +398,7 @@ class RsiBot:
             # Header
             lines = [
                 f" ▣ TIMEFRAME: {tf} ({total_hits} Hits)",
-                " ─────────────────────────",
+                "─────────────────────────",
                 ""
             ]
             
