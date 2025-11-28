@@ -384,33 +384,85 @@ class RsiBot:
         if not hits: return
         grouped = {}
         for h in hits: grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
-        messages = []
+        
+        # 1. Build individual timeframe blocks first
+        tf_blocks = []
         tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
+        
         for tf in tf_order:
             if tf not in grouped: continue
-            lines = [f"▣ TIMEFRAME: {tf}", "────────────────", ""]
+            
+            # Calculate total hits for this TF
+            total_hits = sum(len(grouped[tf].get(t, [])) for t in ["UPPER", "MIDDLE", "LOWER"])
+            
+            # Header
+            lines = [
+                f" ▣ TIMEFRAME: {tf} ({total_hits} Hits)",
+                " ─────────────────────────",
+                ""
+            ]
+            
             headers = {"UPPER": "⬆️ UPPER BB", "MIDDLE": "🔶 MIDDLE BB", "LOWER": "⬇️ LOWER BB"}
             found = [t for t in ["UPPER", "MIDDLE", "LOWER"] if grouped[tf].get(t)]
+            
             for t in found:
                 items = grouped[tf].get(t, [])
                 items.sort(key=lambda x: x.symbol)
+                
                 lines.append(f"┌ {headers[t]}")
                 for idx, item in enumerate(items):
-                    prefix = "└" if idx == len(items)-1 else "│"
-                    icon = "🍋" if item.exchange == "Binance" else "🍙"
+                    is_last = (idx == len(items)-1)
+                    prefix = "└" if is_last else "│"
+                    
+                    icon = "🥐" if item.exchange == "Binance" else "💣"
+                    
+                    # CLEAN SYMBOL: Remove USDT
+                    sym_clean = item.symbol.replace("USDT", "")
+                    
                     ext = f" ({'🔻' if item.direction=='from above' else '🔹'})" if t=="MIDDLE" else ""
                     if item.hot: ext += " 🔥"
-                    lines.append(f"{prefix} {icon} {item.symbol} | {item.rsi:.2f}{ext}")
+                    
+                    # FORMAT: │ 🟡 *BTC* ➜ *75.20* 🔥
+                    lines.append(f"{prefix} {icon} *{sym_clean}* ➜ *{item.rsi:.2f}*{ext}")
                 lines.append("")
-            lines.append("────────────────")
-            lines.append(datetime.now(timezone.utc).strftime('%d %b %H:%M UTC'))
-            messages.append("\n".join(lines))
             
+            lines.append("─────────────────────────")
+            tf_blocks.append("\n".join(lines))
+
+        if not tf_blocks: return
+
+        # 2. Smart Pagination / Sending
+        # Combine blocks until we hit ~3800 chars, then send and start new message
+        current_msg = []
+        current_len = 0
+        
+        ts_footer = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
+        
         async with aiohttp.ClientSession() as s:
-            for msg in messages:
-                for chunk in [msg[i:i+4000] for i in range(0, len(msg), 4000)]:
-                    try: await s.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CONFIG.CHAT_ID, "text": chunk, "parse_mode": "Markdown"}); await asyncio.sleep(0.5)
-                    except: pass
+            for block in tf_blocks:
+                if current_len + len(block) > 3800:
+                    # Send current buffer
+                    full_text = "\n\n".join(current_msg) + f"\n{ts_footer}"
+                    try: 
+                        await s.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage", 
+                                   json={"chat_id": CONFIG.CHAT_ID, "text": full_text, "parse_mode": "Markdown"})
+                        await asyncio.sleep(0.5)
+                    except Exception as e: logging.error(f"TG Send Fail: {e}")
+                    
+                    # Reset
+                    current_msg = []
+                    current_len = 0
+                
+                current_msg.append(block)
+                current_len += len(block)
+            
+            # Send remaining
+            if current_msg:
+                full_text = "\n\n".join(current_msg) + f"\n{ts_footer}"
+                try: 
+                    await s.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage", 
+                               json={"chat_id": CONFIG.CHAT_ID, "text": full_text, "parse_mode": "Markdown"})
+                except Exception as e: logging.error(f"TG Send Fail: {e}")
 
     async def fetch_symbols_smart(self, binance: BinanceClient, bybit: BybitClient) -> Tuple[List[str], List[str], List[str], List[str]]:
         """Fetches symbols with Soft Expiration. Falls back to stale cache if fetch fails."""
