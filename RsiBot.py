@@ -92,7 +92,7 @@ class ScanStats:
 # ==========================================
 
 class AsyncProxyPool:
-    def __init__(self, max_pool_size=25):
+    def __init__(self, max_pool_size=10):
         self.proxies: List[str] = []
         self.max_pool_size = max_pool_size
         self.iterator = None
@@ -117,7 +117,7 @@ class AsyncProxyPool:
         logging.info(f"🔎 Validating {len(raw)} proxies...")
         self.proxies = []
         self.failures = {}
-        random.shuffle(raw)
+        #random.shuffle(raw)
         
         sem = asyncio.Semaphore(200)
         async def protected_test(p):
@@ -144,9 +144,25 @@ class AsyncProxyPool:
 
     async def _test_proxy(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool]:
         try:
-            async with session.get("https://api.binance.com/api/v3/time", proxy=proxy, timeout=6) as resp:
-                return proxy, resp.status == 200
-        except: return proxy, False
+            # HEAVY TEST: Fetch actual Futures data, not just time.
+            # This filters out proxies that are blocked by WAF or too slow for data.
+            url = "https://fapi.binance.com/fapi/v1/klines"
+            params = {
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "limit": "2"
+            }
+            
+            # If it can't get a candle in 3s, it will fail your bot's 6s scan timeout anyway.
+            async with session.get(url, params=params, proxy=proxy, timeout=7) as resp:
+                if resp.status == 200:
+                    # Verify we actually got data, not just a 200 OK HTML page (common proxy trick)
+                    data = await resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        return proxy, True
+                return proxy, False
+        except:
+            return proxy, False
 
     async def get_proxy(self) -> Optional[str]:
         if not self.proxies: return None
