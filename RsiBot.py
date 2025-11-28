@@ -92,7 +92,7 @@ class ScanStats:
 # ==========================================
 
 class AsyncProxyPool:
-    def __init__(self, max_pool_size=10):
+    def __init__(self, max_pool_size=20):
         self.proxies: List[str] = []
         self.max_pool_size = max_pool_size
         self.iterator = None
@@ -173,11 +173,11 @@ class AsyncProxyPool:
     async def report_failure(self, proxy: str):
         async with self._lock:
             self.failures[proxy] = self.failures.get(proxy, 0) + 1
-            if self.failures[proxy] >= 50:
+            if self.failures[proxy] >= 10:
                 if proxy in self.proxies:
                     self.proxies.remove(proxy)
                     if self.proxies: self.iterator = cycle(self.proxies)
-                    logging.warning(f"🚫 Banned Proxy {proxy} (50 failures)")
+                    logging.warning(f"🚫 Banned Proxy {proxy} (10 failures)")
 
 # ==========================================
 # REDIS CACHE MANAGER (UPDATED)
