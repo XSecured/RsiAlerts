@@ -572,15 +572,15 @@ class RsiBot:
         """Step 3: Vectorized Volatility Analysis"""
         logging.info("🔥 Calculating Market Volatility...")
         vol_scores = {}
-
-        async def process_vol(client, sym, mkt):
+    
+        async def process_vol(client, sym, mkt, ex_name):  # ✅ ADD ex_name parameter
             # Only need 25 candles for vol check
             closes = await client.fetch_ohlcv(sym, '1h', mkt, 25)
             if not closes: return
             
             v = calculate_volatility_vectorized(closes)
             if v > 0: vol_scores[sym] = v
-
+    
         # Batch execution
         tasks = [process_vol(c, s, m, e) for c, s, m, e in self.all_pairs]
         
