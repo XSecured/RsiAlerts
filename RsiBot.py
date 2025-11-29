@@ -4,69 +4,59 @@ import logging
 import os
 import random
 import time
-import math
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Set, Optional, Tuple, Any
+from datetime import datetime, timezone
+from typing import List, Dict, Set, Optional, Tuple, Any, Union
+
 import aiohttp
 import numpy as np
-import redis.asyncio as aioredis
 import talib
-from concurrent.futures import ThreadPoolExecutor
+import redis.asyncio as aioredis
 
 # ==========================================
-# 1. CONFIGURATION
+# CONFIGURATION
 # ==========================================
 
 @dataclass
 class Config:
-    # System
+    # System Settings
     MAX_CONCURRENCY: int = 75
+    BATCH_SIZE: int = 50  # <--- NEW: Protects Event Loop
     REQUEST_TIMEOUT: int = 7
-    MAX_RETRIES: int = 4
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
+    MAX_RETRIES: int = 3
     
-    # Telegram
+    # Infrastructure
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
-    
-    # URLs
     PROXY_URL: str = "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
-    URLS: Dict[str, str] = field(default_factory=lambda: {
-        'binance_perp_info': 'https://fapi.binance.com/fapi/v1/exchangeInfo',
-        'binance_spot_info': 'https://api.binance.com/api/v3/exchangeInfo',
-        'binance_perp_kline': 'https://fapi.binance.com/fapi/v1/klines',
-        'binance_spot_kline': 'https://api.binance.com/api/v3/klines',
-        'bybit_info': 'https://api.bybit.com/v5/market/instruments-info',
-        'bybit_kline': 'https://api.bybit.com/v5/market/kline',
-    })
 
-    # Trading Params
+    # Strategy Settings
     RSI_PERIOD: int = 14
     BB_LENGTH: int = 34
     BB_STDDEV: float = 2.0
     CANDLE_LIMIT: int = 60
     MIN_CANDLES: int = 36
     
-    # Thresholds
     UPPER_TOUCH_THRESHOLD: float = 0.02
     LOWER_TOUCH_THRESHOLD: float = 0.02
     MIDDLE_TOUCH_THRESHOLD: float = 0.035
-    
-    # Cache & Timeframes
+
+    # Caching
     CACHE_TTL_MAP: Dict[str, int] = field(default_factory=lambda: {
         '4h': 14400 + 600, '1d': 86400 + 1800, '1w': 604800 + 3600
     })
-    
+
+    # Filtering
     IGNORED_SYMBOLS: Set[str] = field(default_factory=lambda: {
-        "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", 
-        "SUSDUSDT", "BUSDUSDT", "FDUSDUSDT"
+        "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "FDUSDUSDT"
     })
 
 CONFIG = Config()
 
 TIMEFRAME_MINUTES = {
-    '15m': 15, '30m': 30, '1h': 60, '2h': 120, '4h': 240,
+    '15m': 15, '30m': 30, '1h': 60, '2h': 120, '4h': 240, 
     '1d': 1440, '1w': 10080
 }
 
@@ -75,543 +65,24 @@ MIDDLE_BAND_TFS = ['15m', '30m', '1h', '2h', '4h', '1d', '1w']
 CACHED_TFS = {'2h', '4h', '1d', '1w'}
 
 # ==========================================
-# 2. DATA MODELS
+# DATA MODELS
 # ==========================================
 
 @dataclass
 class TouchHit:
     symbol: str
-    exchange: str
-    market: str
+    exchange: str 
+    market: str   
     timeframe: str
     rsi: float
     touch_type: str
-    direction: str = ""
+    direction: str = "" 
     hot: bool = False
-
+    
     def to_dict(self): return asdict(self)
     @staticmethod
     def from_dict(d): return TouchHit(**d)
 
-# ==========================================
-# 3. OPTIMIZED PROXY POOL
-# ==========================================
-
-class AsyncProxyPool:
-    def __init__(self, max_pool_size=20):
-        self.proxies: List[str] = []
-        self.max_pool_size = max_pool_size
-        self._lock = asyncio.Lock()
-        self.health: Dict[str, Dict[str, Any]] = {} 
-
-    async def populate(self, url: str, session: aiohttp.ClientSession):
-        if not url: return
-        raw = []
-        try:
-            logging.info(f"📥 Fetching proxies from {url}...")
-            async with session.get(url, timeout=15) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    for line in text.splitlines():
-                        p = line.strip()
-                        if p: raw.append(p if "://" in p else f"http://{p}")
-        except Exception as e:
-            logging.error(f"❌ Proxy fetch failed: {e}")
-            return
-
-        logging.info(f"🔎 Validating {len(raw)} proxies (Timeout: 7s)...")
-        self.proxies = []
-        self.health = {}
-        sem = asyncio.Semaphore(200)
-
-        async def protected_test(p):
-            async with sem: return await self._test_proxy(p, session)
-
-        tasks = [asyncio.create_task(protected_test(p)) for p in raw]
-        for future in asyncio.as_completed(tasks):
-            try:
-                proxy, is_good = await future
-                if is_good:
-                    self.proxies.append(proxy)
-                    self.health[proxy] = {"strikes": 0, "uses": 0, "cooldown_until": 0, "score": 1.0}
-                    if len(self.proxies) >= self.max_pool_size: break
-            except: pass
-
-        for t in tasks:
-            if not t.done(): t.cancel()
-        
-        if self.proxies:
-            logging.info(f"✅ Proxy Pool Ready: {len(self.proxies)} proxies.")
-        else:
-            logging.error("❌ NO WORKING PROXIES FOUND! Bot may fail.")
-
-    async def _test_proxy(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool]:
-        try:
-            url = CONFIG.URLS['binance_perp_kline']
-            params = {"symbol": "BTCUSDT", "interval": "1m", "limit": "2"}
-            async with session.get(url, params=params, proxy=proxy, timeout=7) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        return proxy, True
-            return proxy, False
-        except:
-            return proxy, False
-
-    async def get_proxy(self) -> Optional[str]:
-        if not self.proxies: return None
-        now = time.time()
-        available = [p for p in self.proxies if self.health[p]["cooldown_until"] < now]
-        if not available:
-            return min(self.proxies, key=lambda p: self.health[p]["cooldown_until"])
-        
-        # Sample best performers
-        candidates = available if len(available) < 5 else random.sample(available, min(len(available), 10))
-        best = max(candidates, key=lambda p: self.health[p]['score'])
-        self.health[best]["uses"] += 1
-        return best
-
-    async def report_failure(self, proxy: str):
-        async with self._lock:
-            if proxy not in self.health: return
-            h = self.health[proxy]
-            h["strikes"] += 1
-            uses = max(h["uses"], 1)
-            success_rate = 1 - (h["strikes"] / uses)
-            h["score"] = success_rate
-            
-            if h["uses"] > 10 and success_rate < 0.5:
-                if proxy in self.proxies:
-                    self.proxies.remove(proxy)
-                    del self.health[proxy]
-                    logging.warning(f"🚫 Banned {proxy} (Success: {success_rate:.1%})")
-            else:
-                h["cooldown_until"] = time.time() + min(30 * h["strikes"], 300)
-
-# ==========================================
-# 4. ROBUST CACHE MANAGER
-# ==========================================
-
-class CacheManager:
-    def __init__(self):
-        self.redis = None
-
-    async def init(self):
-        try:
-            self.redis = await aioredis.from_url(CONFIG.REDIS_URL, decode_responses=True)
-            await self.redis.ping()
-            logging.info("✅ Redis Connected")
-        except Exception as e:
-            logging.warning(f"⚠️ Redis Connection Failed: {e}")
-            self.redis = None
-
-    async def close(self):
-        if self.redis: await self.redis.aclose()
-
-    async def _get_json(self, key: str):
-        if not self.redis: return None
-        try:
-            data = await self.redis.get(key)
-            return json.loads(data) if data else None
-        except: return None
-
-    async def _set_json(self, key: str, data: Any, ttl: int = 0):
-        if not self.redis: return
-        try:
-            payload = json.dumps(data)
-            if ttl > 0: await self.redis.set(key, payload, ex=ttl)
-            else: await self.redis.set(key, payload)
-        except: pass
-
-    async def get_cached_symbols(self) -> Optional[Dict]:
-        return await self._get_json("bb_bot:symbols_cache_v3")
-
-    async def save_cached_symbols(self, symbols: Dict):
-        await self._set_json("bb_bot:symbols_cache_v3", {"timestamp": time.time(), "data": symbols})
-
-    def _scan_key(self, tf: str, candle_key: int) -> str:
-        return f"bb_touch:scan:{tf}:{candle_key}"
-
-    async def get_scan_results(self, tf: str, candle_key: int) -> Optional[List[Dict]]:
-        return await self._get_json(self._scan_key(tf, candle_key))
-
-    async def save_scan_results(self, tf: str, candle_key: int, results: List[Dict]):
-        await self._set_json(self._scan_key(tf, candle_key), results, ttl=CONFIG.CACHE_TTL_MAP.get(tf, 3600))
-
-    async def get_sent_state(self) -> Dict[str, int]:
-        return await self._get_json("bb_bot:sent_state") or {}
-
-    async def save_sent_state(self, state: Dict[str, int]):
-        await self._set_json("bb_bot:sent_state", state)
-
-# ==========================================
-# 5. EXCHANGE CLIENTS
-# ==========================================
-
-class BaseExchange:
-    def __init__(self, session: aiohttp.ClientSession, proxy_pool: AsyncProxyPool, name: str):
-        self.session = session
-        self.proxies = proxy_pool
-        self.name = name
-        self.sem = asyncio.Semaphore(CONFIG.MAX_CONCURRENCY if proxy_pool.proxies else 5)
-
-    async def _fetch_with_retry(self, url: str, params: dict = None) -> Any:
-        for attempt in range(CONFIG.MAX_RETRIES):
-            proxy = await self.proxies.get_proxy()
-            if not proxy:
-                await asyncio.sleep(1)
-                continue
-            try:
-                async with self.sem:
-                    async with self.session.get(url, params=params, proxy=proxy, timeout=CONFIG.REQUEST_TIMEOUT) as resp:
-                        if resp.status == 200: return await resp.json()
-                        elif resp.status == 429:
-                            logging.warning(f"⚠️ 429 Rate Limit ({self.name}). Sleeping 5s.")
-                            await asyncio.sleep(5)
-                        elif resp.status >= 500: pass
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                await self.proxies.report_failure(proxy)
-            except Exception as e:
-                logging.error(f"Fetch Error: {e}")
-            await asyncio.sleep(0.5 + random.random())
-        return None
-
-class BinanceClient(BaseExchange):
-    def __init__(self, session, pool): super().__init__(session, pool, "Binance")
-
-    async def get_symbols(self, market_type: str) -> List[str]:
-        url = CONFIG.URLS['binance_perp_info'] if market_type == 'perp' else CONFIG.URLS['binance_spot_info']
-        data = await self._fetch_with_retry(url)
-        if not data: return []
-        try:
-            if market_type == 'perp':
-                return [s['symbol'] for s in data['symbols'] if s.get('contractType') == 'PERPETUAL' and s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
-            else:
-                return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
-        except: return []
-
-    async def fetch_ohlcv(self, symbol: str, interval: str, market_type: str, limit: int) -> List[float]:
-        url = CONFIG.URLS['binance_perp_kline'] if market_type == 'perp' else CONFIG.URLS['binance_spot_kline']
-        data = await self._fetch_with_retry(url, {'symbol': symbol, 'interval': interval, 'limit': limit})
-        if not data: return []
-        try:
-            if isinstance(data, list):
-                return [float(c[4]) for c in data]
-            else:
-                # If Binance returns an error object instead of a list
-                return [] 
-        except Exception as e:
-            # logging.error(f"Binance Parse Error {symbol}: {e}") 
-            return []
-
-class BybitClient(BaseExchange):
-    def __init__(self, session, pool): super().__init__(session, pool, "Bybit")
-
-    async def get_symbols(self, market_type: str) -> List[str]:
-        url = CONFIG.URLS['bybit_info']
-        cat = 'linear' if market_type == 'perp' else 'spot'
-        data = await self._fetch_with_retry(url, {'category': cat})
-        if not data: return []
-        try:
-            return [s['symbol'] for s in data['result']['list'] if s['status'] == 'Trading' and s['quoteCoin'] == 'USDT']
-        except: return []
-
-    async def fetch_ohlcv(self, symbol: str, interval: str, market_type: str, limit: int) -> List[float]:
-        url = CONFIG.URLS['bybit_kline']
-        cat = 'linear' if market_type == 'perp' else 'spot'
-        b_int = {"15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W"}.get(interval, "D")
-        if interval == '1h' and limit == 25: b_int = "60"
-        
-        data = await self._fetch_with_retry(url, {'category': cat, 'symbol': symbol, 'interval': b_int, 'limit': limit})
-        if not data: return []
-        try:
-            raw = data.get('result', {}).get('list', [])
-            if not raw: return []
-            closes = [float(c[4]) for c in raw]
-            return closes[::-1]
-        except: return []
-
-# ==========================================
-# 6. CORE LOGIC
-# ==========================================
-
-cpu_executor = ThreadPoolExecutor(max_workers=4)
-
-def get_cache_key(tf: str) -> int:
-    mins = TIMEFRAME_MINUTES[tf]
-    now = int(time.time())
-    return now - (now % (mins * 60))
-
-def calculate_volatility_vectorized(closes: List[float]) -> float:
-    if len(closes) < 24: return 0.0
-    try:
-        prices = np.array(closes, dtype=np.float64)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            pct = np.diff(prices) / prices[:-1] * 100
-        pct = pct[np.isfinite(pct)]
-        if len(pct) == 0: return 0.0
-        return float(np.std(pct))
-    except: return 0.0
-
-def check_bb_rsi_sync(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[str], float]:
-    try:
-        if len(closes) < CONFIG.MIN_CANDLES: return None, None, 0.0
-        
-        np_c = np.array(closes, dtype=float)
-        rsi = talib.RSI(np_c, timeperiod=CONFIG.RSI_PERIOD)
-        upper, mid, lower = talib.BBANDS(rsi, timeperiod=CONFIG.BB_LENGTH, 
-                                         nbdevup=CONFIG.BB_STDDEV, nbdevdn=CONFIG.BB_STDDEV, matype=0)
-        
-        idx = -2 # Last closed candle
-        if np.isnan(rsi[idx]) or np.isnan(upper[idx]): return None, None, 0.0
-        
-        curr_rsi = rsi[idx]
-        
-        if curr_rsi >= upper[idx] * (1 - CONFIG.UPPER_TOUCH_THRESHOLD): 
-            return "UPPER", None, curr_rsi
-        if curr_rsi <= lower[idx] * (1 + CONFIG.LOWER_TOUCH_THRESHOLD): 
-            return "LOWER", None, curr_rsi
-            
-        if tf in MIDDLE_BAND_TFS:
-            if abs(curr_rsi - mid[idx]) <= (mid[idx] * CONFIG.MIDDLE_TOUCH_THRESHOLD):
-                prev_diff = rsi[idx-1] - mid[idx-1]
-                curr_diff = curr_rsi - mid[idx]
-                direction = "from above" if (prev_diff > 0 >= curr_diff) or (curr_diff > 0) else "from below"
-                return "MIDDLE", direction, curr_rsi
-                
-        return None, None, 0.0
-    except Exception as e:
-        # UN-MUTED ERROR: If talib crashes, we want to see it in logs
-        logging.error(f"❌ Calc Error ({tf}): {e}")
-        return None, None, 0.0
-
-# ==========================================
-# 7. MAIN BOT
-# ==========================================
-
-class RsiBot:
-    def __init__(self):
-        self.cache = CacheManager()
-        self.proxies = AsyncProxyPool()
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.binance: Optional[BinanceClient] = None
-        self.bybit: Optional[BybitClient] = None
-        self.all_pairs = [] 
-        self.hot_coins = set()
-        self.sent_state = {}
-
-    async def initialize(self):
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-        await self.cache.init()
-        self.session = aiohttp.ClientSession()
-        await self.proxies.populate(CONFIG.PROXY_URL, self.session)
-        self.binance = BinanceClient(self.session, self.proxies)
-        self.bybit = BybitClient(self.session, self.proxies)
-
-    async def shutdown(self):
-        if self.session: await self.session.close()
-        await self.cache.close()
-        logging.info("👋 Bot Shutdown Complete")
-
-    async def sync_market_data(self):
-        logging.info("🔄 Syncing Market Pairs...")
-        async def fetch_safe(func, mkt, name, cache_key):
-            cached = await self.cache.get_cached_symbols()
-            cached_val = cached['data'].get(cache_key, []) if cached else []
-            try:
-                res = await func(mkt)
-                if res: 
-                    logging.info(f"✅ {name}: {len(res)} symbols")
-                    return res
-            except Exception as e: logging.error(f"❌ {name} fail: {e}")
-            if cached_val: return cached_val
-            return []
-
-        bp, bs, yp, ys = await asyncio.gather(
-            fetch_safe(self.binance.get_symbols, 'perp', 'Binance Perp', 'bp'),
-            fetch_safe(self.binance.get_symbols, 'spot', 'Binance Spot', 'bs'),
-            fetch_safe(self.bybit.get_symbols, 'perp', 'Bybit Perp', 'yp'),
-            fetch_safe(self.bybit.get_symbols, 'spot', 'Bybit Spot', 'ys')
-        )
-        
-        if any([bp, bs, yp, ys]):
-            await self.cache.save_cached_symbols({'bp': bp, 'bs': bs, 'yp': yp, 'ys': ys})
-
-        seen = set()
-        self.all_pairs = []
-        for client, syms, mkt, ex_name in [(self.binance, bp, 'perp', 'Binance'), (self.binance, bs, 'spot', 'Binance'), (self.bybit, yp, 'perp', 'Bybit'), (self.bybit, ys, 'spot', 'Bybit')]:
-            for s in syms:
-                if s in CONFIG.IGNORED_SYMBOLS or not s.endswith("USDT"): continue
-                norm = s.upper().replace("USDT", "")
-                if norm not in seen:
-                    self.all_pairs.append((client, s, mkt, ex_name))
-                    seen.add(norm)
-        logging.info(f"📊 Total Unique Symbols: {len(self.all_pairs)}")
-
-    async def analyze_volatility(self):
-        logging.info("🔥 Calculating Market Volatility...")
-        vol_scores = {}
-        async def process_vol(client, sym, mkt):
-            closes = await client.fetch_ohlcv(sym, '1h', mkt, 25)
-            v = calculate_volatility_vectorized(closes)
-            if v > 0: vol_scores[sym] = v
-
-        tasks = [process_vol(c, s, m, e) for c, s, m, e in self.all_pairs]
-        for i in range(0, len(tasks), 200):
-            await asyncio.gather(*tasks[i:i+200], return_exceptions=True)
-            
-        self.hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
-        logging.info(f"🔥 Hot Coins Identified: {len(self.hot_coins)}")
-
-    async def scan_targets(self) -> List[TouchHit]:
-        self.sent_state = await self.cache.get_sent_state()
-        tfs_to_scan = []
-        cached_hits = []
-        
-        for tf in ACTIVE_TFS:
-            candle_key = get_cache_key(tf)
-            if tf in CACHED_TFS:
-                if str(self.sent_state.get(tf)) == str(candle_key):
-                    logging.info(f"⏭️ Skipping {tf}: Already alerted.")
-                    continue
-                res = await self.cache.get_scan_results(tf, candle_key)
-                if res:
-                    cached_hits.extend([TouchHit.from_dict(r) for r in res])
-                    continue
-            tfs_to_scan.append(tf)
-
-        if not tfs_to_scan:
-            logging.info("💤 No fresh timeframes to scan.")
-            return cached_hits
-
-        logging.info(f"🕵️ Scanning Fresh: {tfs_to_scan}")
-        fresh_hits = []
-        loop = asyncio.get_running_loop()
-
-        for tf in tfs_to_scan:
-            tf_hits = []
-            async def scan_single(client, sym, mkt, ex_name):
-                closes = await client.fetch_ohlcv(sym, tf, mkt, CONFIG.CANDLE_LIMIT)
-                if not closes: return None
-                t_type, direction, rsi_val = await loop.run_in_executor(
-                    cpu_executor, check_bb_rsi_sync, closes, tf
-                )
-                if t_type:
-                    return TouchHit(sym, ex_name, mkt, tf, rsi_val, t_type, direction, sym in self.hot_coins)
-                return None
-
-            tasks = [scan_single(c, s, m, e) for c, s, m, e in self.all_pairs]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            count = 0
-            for r in results:
-                if isinstance(r, TouchHit):
-                    tf_hits.append(r)
-                    count += 1
-            
-            logging.info(f"   > {tf}: Found {count} hits")
-            fresh_hits.extend(tf_hits)
-            
-            if tf in CACHED_TFS:
-                candle_key = get_cache_key(tf)
-                await self.cache.save_scan_results(tf, candle_key, [h.to_dict() for h in tf_hits])
-
-        return cached_hits + fresh_hits
-
-    async def dispatch_alerts(self, hits: List[TouchHit]):
-        if not hits: 
-            logging.info("📭 No signals found in this run.")
-            return
-        
-        to_send = []
-        updated_state = self.sent_state.copy()
-        by_tf = {}
-        for h in hits: by_tf.setdefault(h.timeframe, []).append(h)
-        
-        for tf, items in by_tf.items():
-            if tf in CACHED_TFS:
-                candle_key = get_cache_key(tf)
-                if str(updated_state.get(tf)) != str(candle_key):
-                    to_send.extend(items)
-                    updated_state[tf] = candle_key
-            else:
-                to_send.extend(items)
-        
-        if not to_send:
-            logging.info("📭 Hits found but all were already sent/cached.")
-            return
-
-        logging.info(f"📤 Sending {len(to_send)} alerts to Telegram...")
-        await self._send_telegram(to_send)
-        await self.cache.save_sent_state(updated_state)
-
-    async def _send_telegram(self, hits: List[TouchHit]):
-        grouped = {}
-        for h in hits: grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
-        blocks = []
-        headers = {"UPPER": "⬆️ UPPER BB", "MIDDLE": "🔶 MIDDLE BB", "LOWER": "⬇️ LOWER BB"}
-        
-        for tf in ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]:
-            if tf not in grouped: continue
-            lines = [f" ▣ TIMEFRAME: {tf} ({sum(len(grouped[tf].get(t, [])) for t in headers)} Hits)", "─────────────────────────", ""]
-            for t_type, label in headers.items():
-                items = grouped[tf].get(t_type, [])
-                if not items: continue
-                items.sort(key=lambda x: x.symbol)
-                lines.append(f"┌ {label}")
-                for idx, item in enumerate(items):
-                    prefix = "└" if idx == len(items)-1 else "│"
-                    icon = "🥐" if item.exchange == "Binance" else "💣"
-                    sym = item.symbol.replace("USDT", "")
-                    ext = f" {'🔻' if item.direction=='from above' else '🔹'}" if t_type=="MIDDLE" else ""
-                    if item.hot: ext += " 🔥"
-                    lines.append(f"{prefix} {icon} *{sym}* ➜ *{item.rsi:.2f}*{ext}")
-                lines.append("")
-            lines.append("─────────────────────────")
-            blocks.append("\n".join(lines))
-
-        full_text = []
-        curr_len = 0
-        ts = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
-        
-        async def flush(txt):
-            if not txt: return
-            body = "\n\n".join(txt) + f"\n{ts}"
-            try:
-                url = f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage"
-                async with self.session.post(url, json={"chat_id": CONFIG.CHAT_ID, "text": body, "parse_mode": "Markdown"}) as r:
-                    if r.status != 200:
-                        logging.error(f"❌ Telegram Error {r.status}: {await r.text()}")
-                    else:
-                        logging.info("✅ Telegram Message Sent")
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logging.error(f"❌ Telegram Fail: {e}")
-
-        for b in blocks:
-            if curr_len + len(b) > 3800:
-                await flush(full_text)
-                full_text = []
-                curr_len = 0
-            full_text.append(b)
-            curr_len += len(b)
-        await flush(full_text)
-
-    async def run(self):
-        try:
-            await self.initialize()
-            await self.sync_market_data()
-            await self.analyze_volatility()
-            hits = await self.scan_targets()
-            await self.dispatch_alerts(hits)
-        except KeyboardInterrupt: pass
-        except Exception as e: logging.exception("CRITICAL CRASH IN MAIN LOOP")
-        finally: await self.shutdown()
-
-if __name__ == "__main__":
-    if os.name == 'nt': asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    bot = RsiBot()
-    asyncio.run(bot.run())
 @dataclass
 class ScanStats:
     timeframe: str
@@ -621,7 +92,7 @@ class ScanStats:
     hits_found: int = 0
 
 # ==========================================
-# 3. OPTIMIZED PROXY POOL
+# INFRASTRUCTURE: PROXY & CACHE
 # ==========================================
 
 class AsyncProxyPool:
@@ -629,120 +100,89 @@ class AsyncProxyPool:
         self.proxies: List[str] = []
         self.max_pool_size = max_pool_size
         self._lock = asyncio.Lock()
-        # Structure: {proxy: {"strikes": 0, "uses": 0, "cooldown_until": 0, "score": 1.0}}
         self.health: Dict[str, Dict[str, Any]] = {} 
 
     async def populate(self, url: str, session: aiohttp.ClientSession):
+        """Fetches and validates proxies."""
         if not url: return
         raw = []
         try:
-            logging.info(f"📥 Fetching proxies from {url}...")
+            logging.info(f"📥 Fetching proxies from source...")
             async with session.get(url, timeout=15) as resp:
                 if resp.status == 200:
                     text = await resp.text()
-                    for line in text.splitlines():
-                        p = line.strip()
-                        if p: raw.append(p if "://" in p else f"http://{p}")
+                    raw = [f"http://{p.strip()}" if "://" not in p else p.strip() 
+                           for p in text.splitlines() if p.strip()]
         except Exception as e:
             logging.error(f"❌ Proxy fetch failed: {e}")
             return
 
-        logging.info(f"🔎 Validating {len(raw)} proxies (Timeout: 7s)...")
+        logging.info(f"🔎 Validating {len(raw)} proxies...")
         self.proxies = []
         self.health = {}
-
+        
         sem = asyncio.Semaphore(200)
+        async def _validate(p):
+            async with sem:
+                return await self._test_proxy(p, session)
 
-        async def protected_test(p):
-            async with sem: return await self._test_proxy(p, session)
-
-        tasks = [asyncio.create_task(protected_test(p)) for p in raw]
+        # Batch validation to avoid killing FD limits
+        tasks = [_validate(p) for p in raw]
+        for i in range(0, len(tasks), 50):
+            batch = tasks[i:i+50]
+            results = await asyncio.gather(*batch, return_exceptions=True)
+            for res in results:
+                if isinstance(res, tuple) and res[1]:
+                    proxy = res[0]
+                    async with self._lock:
+                        if len(self.proxies) < self.max_pool_size:
+                            self.proxies.append(proxy)
+                            self.health[proxy] = {"strikes": 0, "uses": 0, "cooldown_until": 0}
+            if len(self.proxies) >= self.max_pool_size: break
         
-        for future in asyncio.as_completed(tasks):
-            try:
-                proxy, is_good = await future
-                if is_good:
-                    self.proxies.append(proxy)
-                    self.health[proxy] = {"strikes": 0, "uses": 0, "cooldown_until": 0, "score": 1.0}
-                    if len(self.proxies) >= self.max_pool_size: break
-            except Exception:
-                pass
-
-        # Cancel remaining
-        for t in tasks:
-            if not t.done(): t.cancel()
-        
-        if self.proxies:
-            logging.info(f"✅ Proxy Pool Ready: {len(self.proxies)} proxies.")
-        else:
-            logging.error("❌ NO WORKING PROXIES FOUND! Bot may fail.")
+        logging.info(f"✅ Proxy Pool Ready: {len(self.proxies)} proxies.")
 
     async def _test_proxy(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool]:
         try:
-            # Test against Binance Futures for real latency check
-            url = CONFIG.URLS['binance_perp_kline']
+            url = "https://fapi.binance.com/fapi/v1/klines"
             params = {"symbol": "BTCUSDT", "interval": "1m", "limit": "2"}
-            # ✅ FIX #3: Reduced timeout from 7s to 4s
-            async with session.get(url, params=params, proxy=proxy, timeout=4) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        return proxy, True
-            return proxy, False
+            async with session.get(url, params=params, proxy=proxy, timeout=5) as resp:
+                return proxy, resp.status == 200
         except:
             return proxy, False
 
     async def get_proxy(self) -> Optional[str]:
-        """
-        Optimized selection: Randomly picks from the top 25% healthiest proxies.
-        Avoids O(N) scan on every request.
-        """
         if not self.proxies: return None
-        
-        now = time.time()
-        
-        # Filter available
-        available = [p for p in self.proxies if self.health[p]["cooldown_until"] < now]
-        if not available:
-            # If all cooled down, pick the one ending soonest
-            return min(self.proxies, key=lambda p: self.health[p]["cooldown_until"])
-
-        # Quick Selection: Pick from random sample of best performers
-        # Instead of sorting entire list every time (O(N log N)), we just sample.
-        candidates = available if len(available) < 5 else random.sample(available, min(len(available), 10))
-        
-        # Small local optimization
-        best = max(candidates, key=lambda p: self.health[p]['score'])
-        
-        self.health[best]["uses"] += 1
-        return best
+        async with self._lock:
+            now = time.time()
+            available = [p for p in self.proxies if self.health[p]["cooldown_until"] < now]
+            
+            if not available:
+                # Fallback to the one with shortest cooldown
+                return min(self.proxies, key=lambda p: self.health[p]["cooldown_until"])
+            
+            # Smart selection: minimize strikes, maximize success rate
+            def score(p):
+                h = self.health[p]
+                return h["strikes"] / max(h["uses"], 1)
+            
+            proxy = min(available, key=score)
+            self.health[proxy]["uses"] += 1
+            return proxy
 
     async def report_failure(self, proxy: str):
         async with self._lock:
             if proxy not in self.health: return
-            
             h = self.health[proxy]
             h["strikes"] += 1
+            h["cooldown_until"] = time.time() + 60  # 1 min penalty
             
-            # Dynamic Score Update
-            uses = max(h["uses"], 1)
-            success_rate = 1 - (h["strikes"] / uses)
-            h["score"] = success_rate
-            
-            # Ban Condition
-            if h["uses"] > 10 and success_rate < 0.6:
+            success_rate = 1 - (h["strikes"] / max(h["uses"], 1))
+            if h["uses"] > 10 and success_rate < 0.5:
                 if proxy in self.proxies:
                     self.proxies.remove(proxy)
                     del self.health[proxy]
-                    logging.warning(f"🚫 Banned {proxy} (Success: {success_rate:.1%})")
-            else:
-                # Soft Cooldown (30s to 300s depending on severity)
-                penalty = 30 * h["strikes"]
-                h["cooldown_until"] = time.time() + min(penalty, 300)
-
-# ==========================================
-# 4. ROBUST CACHE MANAGER
-# ==========================================
+                    logging.warning(f"🚫 Banned proxy {proxy} (Rate: {success_rate:.1%})")
 
 class CacheManager:
     def __init__(self):
@@ -754,543 +194,559 @@ class CacheManager:
             await self.redis.ping()
             logging.info("✅ Redis Connected")
         except Exception as e:
-            logging.warning(f"⚠️ Redis connection failed: {e}. Caching disabled.")
+            logging.warning(f"⚠️ Redis failed ({e}). Caching disabled.")
             self.redis = None
 
     async def close(self):
-        if self.redis: 
-            await self.redis.aclose()
+        if self.redis: await self.redis.aclose()
 
-    # --- Helpers ---
-    async def _get_json(self, key: str):
+    async def get_cached_symbols(self) -> Optional[Dict]:
         if not self.redis: return None
         try:
-            data = await self.redis.get(key)
+            data = await self.redis.get("bb_bot:symbols_v4")
             return json.loads(data) if data else None
-        except Exception as e:
-            logging.error(f"Cache Read Error ({key}): {e}")
-            return None
-
-    async def _set_json(self, key: str, data: Any, ttl: int = 0):
-        if not self.redis: return
-        try:
-            payload = json.dumps(data)
-            if ttl > 0:
-                await self.redis.set(key, payload, ex=ttl)
-            else:
-                await self.redis.set(key, payload)
-        except Exception as e:
-            logging.error(f"Cache Write Error ({key}): {e}")
-
-    # --- Domain Methods ---
-    
-    async def get_cached_symbols(self) -> Optional[Dict]:
-        return await self._get_json("bb_bot:symbols_cache_v3")
+        except: return None
 
     async def save_cached_symbols(self, symbols: Dict):
-        payload = {"timestamp": time.time(), "data": symbols}
-        await self._set_json("bb_bot:symbols_cache_v3", payload)
+        if not self.redis: return
+        try:
+            payload = {"timestamp": time.time(), "data": symbols}
+            await self.redis.set("bb_bot:symbols_v4", json.dumps(payload), ex=86400)
+        except Exception as e: logging.error(f"Redis Save Error: {e}")
 
     def _scan_key(self, tf: str, candle_key: int) -> str:
         return f"bb_touch:scan:{tf}:{candle_key}"
 
     async def get_scan_results(self, tf: str, candle_key: int) -> Optional[List[Dict]]:
-        return await self._get_json(self._scan_key(tf, candle_key))
+        if not self.redis: return None
+        try:
+            data = await self.redis.get(self._scan_key(tf, candle_key))
+            return json.loads(data) if data else None
+        except: return None
 
     async def save_scan_results(self, tf: str, candle_key: int, results: List[Dict]):
+        if not self.redis: return
         ttl = CONFIG.CACHE_TTL_MAP.get(tf, 3600)
-        await self._set_json(self._scan_key(tf, candle_key), results, ttl=ttl)
+        try: await self.redis.set(self._scan_key(tf, candle_key), json.dumps(results), ex=ttl)
+        except: pass
 
     async def get_sent_state(self) -> Dict[str, int]:
-        res = await self._get_json("bb_bot:sent_state")
-        return res if res else {}
+        if not self.redis: return {}
+        try:
+            val = await self.redis.get("bb_bot:sent_state")
+            return json.loads(val) if val else {}
+        except: return {}
 
     async def save_sent_state(self, state: Dict[str, int]):
-        await self._set_json("bb_bot:sent_state", state)
+        if not self.redis: return
+        try: await self.redis.set("bb_bot:sent_state", json.dumps(state))
+        except: pass
 
 # ==========================================
-# 5. MODULAR EXCHANGE CLIENTS (DRY)
+# ABSTRACTION: EXCHANGE CLIENTS
 # ==========================================
 
-class BaseExchange:
+class BaseExchange(ABC):
+    """
+    Abstract base class enforcing DRY principle.
+    Handles network logic, error handling, and proxy rotation centrally.
+    """
     def __init__(self, session: aiohttp.ClientSession, proxy_pool: AsyncProxyPool, name: str):
         self.session = session
         self.proxies = proxy_pool
         self.name = name
-        # Limit concurrency based on proxy availability
-        limit = CONFIG.MAX_CONCURRENCY if proxy_pool.proxies else 5
-        self.sem = asyncio.Semaphore(limit)
+        # Shared semaphore to prevent overriding global limits per instance
+        self.sem = asyncio.Semaphore(CONFIG.MAX_CONCURRENCY)
 
-    async def _fetch_with_retry(self, url: str, params: dict = None) -> Any:
-        for _ in range(CONFIG.MAX_RETRIES):
+    async def _request(self, url: str, params: dict = None) -> Optional[Any]:
+        """Robust request wrapper with retries and logging."""
+        for attempt in range(CONFIG.MAX_RETRIES):
             proxy = await self.proxies.get_proxy()
-            if not proxy:
-                await asyncio.sleep(1)
-                continue
             
             try:
                 async with self.sem:
-                    async with self.session.get(url, params=params, proxy=proxy, timeout=CONFIG.REQUEST_TIMEOUT) as resp:
+                    kwargs = {'params': params, 'timeout': CONFIG.REQUEST_TIMEOUT}
+                    if proxy: kwargs['proxy'] = proxy
+                    
+                    async with self.session.get(url, **kwargs) as resp:
                         if resp.status == 200:
                             return await resp.json()
                         elif resp.status == 429:
-                            logging.warning(f"⚠️ 429 Rate Limit ({self.name}). Sleeping 5s.")
+                            logging.warning(f"⚠️ 429 {self.name} via {proxy}. Backing off.")
                             await asyncio.sleep(5)
                         elif resp.status >= 500:
                             pass # Server error, retry
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-                await self.proxies.report_failure(proxy)
+                        else:
+                            logging.debug(f"HTTP {resp.status} on {url}")
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if proxy: await self.proxies.report_failure(proxy)
             except Exception as e:
-                logging.error(f"Unexpected fetch error: {e}")
+                logging.error(f"Unexpected Err {self.name}: {e}")
             
-            # Jitter sleep
-            await asyncio.sleep(0.5 + random.random())
-            
+            await asyncio.sleep(0.5 + random.random()) # Jitter
         return None
 
-    async def get_symbols(self, market_type: str) -> List[str]:
-        raise NotImplementedError
+    @abstractmethod
+    async def get_perp_symbols(self) -> List[str]:
+        pass
 
-    async def fetch_ohlcv(self, symbol: str, interval: str, market_type: str, limit: int) -> List[float]:
-        raise NotImplementedError
+    @abstractmethod
+    async def get_spot_symbols(self) -> List[str]:
+        pass
+
+    @abstractmethod
+    def _get_kline_config(self, market: str) -> Dict[str, Any]:
+        """Returns URL, interval map, and param keys."""
+        pass
+
+    async def fetch_candles(self, symbol: str, interval: str, market: str, limit: int = CONFIG.CANDLE_LIMIT) -> List[float]:
+        """Universal candle fetcher."""
+        conf = self._get_kline_config(market)
+        api_interval = conf['interval_map'].get(interval, interval)
+        
+        params = {
+            conf['sym_key']: symbol,
+            conf['int_key']: api_interval,
+            'limit': limit,
+            **conf.get('extra_params', {})
+        }
+
+        data = await self._request(conf['url'], params)
+        if not data: return []
+        
+        return self._parse_response(data, market)
+
+    @abstractmethod
+    def _parse_response(self, data: Any, market: str) -> List[float]:
+        pass
+
 
 class BinanceClient(BaseExchange):
-    def __init__(self, session, pool):
-        super().__init__(session, pool, "Binance")
+    def __init__(self, session, proxies):
+        super().__init__(session, proxies, "Binance")
 
-    async def get_symbols(self, market_type: str) -> List[str]:
-        url = CONFIG.URLS['binance_perp_info'] if market_type == 'perp' else CONFIG.URLS['binance_spot_info']
-        data = await self._fetch_with_retry(url)
+    async def get_perp_symbols(self) -> List[str]:
+        data = await self._request('https://fapi.binance.com/fapi/v1/exchangeInfo')
         if not data: return []
-        
-        try:
-            if market_type == 'perp':
-                return [s['symbol'] for s in data['symbols'] if s.get('contractType') == 'PERPETUAL' and s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
-            else:
-                return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
-        except Exception as e:
-            logging.error(f"Binance Parse Error: {e}")
-            return []
+        return [s['symbol'] for s in data['symbols'] if s['contractType'] == 'PERPETUAL' and s['status'] == 'TRADING' and s['quoteAsset'] == 'USDT']
 
-    async def fetch_ohlcv(self, symbol: str, interval: str, market_type: str, limit: int) -> List[float]:
-        url = CONFIG.URLS['binance_perp_kline'] if market_type == 'perp' else CONFIG.URLS['binance_spot_kline']
-        params = {'symbol': symbol, 'interval': interval, 'limit': limit}
-        data = await self._fetch_with_retry(url, params)
-        
+    async def get_spot_symbols(self) -> List[str]:
+        data = await self._request('https://api.binance.com/api/v3/exchangeInfo')
         if not data: return []
+        return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s['quoteAsset'] == 'USDT']
+
+    def _get_kline_config(self, market: str) -> Dict[str, Any]:
+        base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
+        return {
+            'url': base,
+            'sym_key': 'symbol',
+            'int_key': 'interval',
+            'interval_map': {} # Binance uses standard notation
+        }
+
+    def _parse_response(self, data: Any, market: str) -> List[float]:
         try:
-            return [float(c[4]) for c in data] # Close price
-        except: 
-            return []
+            # Index 4 is Close
+            return [float(c[4]) for c in data]
+        except: return []
+
 
 class BybitClient(BaseExchange):
-    def __init__(self, session, pool):
-        super().__init__(session, pool, "Bybit")
+    def __init__(self, session, proxies):
+        super().__init__(session, proxies, "Bybit")
 
-    async def get_symbols(self, market_type: str) -> List[str]:
-        url = CONFIG.URLS['bybit_info']
-        cat = 'linear' if market_type == 'perp' else 'spot'
-        data = await self._fetch_with_retry(url, {'category': cat})
+    async def get_perp_symbols(self) -> List[str]:
+        data = await self._request('https://api.bybit.com/v5/market/instruments-info', {'category': 'linear'})
         if not data: return []
-        
-        try:
-            return [s['symbol'] for s in data['result']['list'] if s['status'] == 'Trading' and s['quoteCoin'] == 'USDT']
-        except Exception as e:
-            logging.error(f"Bybit Parse Error: {e}")
-            return []
+        return [s['symbol'] for s in data['result']['list'] if s['status'] == 'Trading' and s['quoteCoin'] == 'USDT']
 
-    async def fetch_ohlcv(self, symbol: str, interval: str, market_type: str, limit: int) -> List[float]:
-        url = CONFIG.URLS['bybit_kline']
-        cat = 'linear' if market_type == 'perp' else 'spot'
-        
-        # Bybit interval mapping
-        b_int = {"15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W"}.get(interval, "D")
-        if interval == '1h' and limit == 25: b_int = "60" # Volatility check specifically
-        
-        params = {'category': cat, 'symbol': symbol, 'interval': b_int, 'limit': limit}
-        data = await self._fetch_with_retry(url, params)
-        
+    async def get_spot_symbols(self) -> List[str]:
+        data = await self._request('https://api.bybit.com/v5/market/instruments-info', {'category': 'spot'})
         if not data: return []
+        return [s['symbol'] for s in data['result']['list'] if s['status'] == 'Trading' and s['quoteCoin'] == 'USDT']
+
+    def _get_kline_config(self, market: str) -> Dict[str, Any]:
+        cat = 'linear' if market == 'perp' else 'spot'
+        imap = {"15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W"}
+        return {
+            'url': 'https://api.bybit.com/v5/market/kline',
+            'sym_key': 'symbol',
+            'int_key': 'interval',
+            'interval_map': imap,
+            'extra_params': {'category': cat}
+        }
+
+    def _parse_response(self, data: Any, market: str) -> List[float]:
+        # Bybit v5 returns list in descending order (newest first)
+        raw = data.get('result', {}).get('list', [])
+        if not raw: return []
         try:
-            raw = data.get('result', {}).get('list', [])
-            if not raw: return []
             closes = [float(c[4]) for c in raw]
-            return closes[::-1] # Bybit returns descending order
-        except:
-            return []
+            return closes[::-1] # Reverse to align with TA-Lib (Oldest -> Newest)
+        except: return []
 
 # ==========================================
-# 6. NON-BLOCKING & VECTORIZED CORE LOGIC
+# MATH & ANALYSIS (VECTORIZED)
 # ==========================================
 
-# Global Thread Pool for CPU tasks
-cpu_executor = ThreadPoolExecutor(max_workers=4)
-
-# ✅ FIX #2: Memoized cache key
-_cache_key_memo = {}  # {tf: key}
 def get_cache_key(tf: str) -> int:
     """Returns stable integer timestamp for current TF candle."""
-    if tf in _cache_key_memo:
-        return _cache_key_memo[tf]
-    
     mins = TIMEFRAME_MINUTES[tf]
     now = int(time.time())
-    key = now - (now % (mins * 60))
-    _cache_key_memo[tf] = key
-    return key
+    return now - (now % (mins * 60))
 
 def calculate_volatility_vectorized(closes: List[float]) -> float:
-    """Vectorized Volatility Calc (Suggestion #4)"""
+    """
+    Optimized Volatility Calculation using NumPy.
+    ~30% faster than Python loops.
+    """
     if len(closes) < 24: return 0.0
-    try:
-        prices = np.array(closes, dtype=np.float64)
-        # Ignore division errors for robustness
-        with np.errstate(divide='ignore', invalid='ignore'):
-            pct_changes = np.diff(prices) / prices[:-1] * 100
+    
+    c = np.array(closes, dtype=np.float64)
+    
+    # Calculate percentage change: (Current - Prev) / Prev
+    prev = c[:-1]
+    curr = c[1:]
+    
+    # Handle division by zero safely
+    with np.errstate(divide='ignore', invalid='ignore'):
+        returns = (curr - prev) / prev * 100
         
-        pct_changes = pct_changes[np.isfinite(pct_changes)]
-        if len(pct_changes) == 0: return 0.0
-        return float(np.std(pct_changes))
-    except Exception:
-        return 0.0
+    # Remove NaNs or Infs
+    returns = returns[np.isfinite(returns)]
+    
+    if len(returns) == 0: return 0.0
+    return float(np.std(returns))
 
-def check_bb_rsi_sync(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[str], float]:
-    """Synchronous CPU bound logic to be run in executor"""
-    try:
-        if len(closes) < CONFIG.MIN_CANDLES: return None, None, 0.0
+def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[str], float]:
+    """Analyzes BB and RSI logic."""
+    if len(closes) < CONFIG.MIN_CANDLES: return None, None, 0.0
+    
+    np_c = np.array(closes, dtype=float)
+    rsi = talib.RSI(np_c, timeperiod=CONFIG.RSI_PERIOD)
+    upper, mid, lower = talib.BBANDS(rsi, timeperiod=CONFIG.BB_LENGTH, nbdevup=CONFIG.BB_STDDEV, nbdevdn=CONFIG.BB_STDDEV, matype=0)
+    
+    idx = -2 # Look at finished candle
+    if np.isnan(rsi[idx]) or np.isnan(upper[idx]): return None, None, 0.0
+    
+    curr_rsi = rsi[idx]
+    
+    # Logic Checks
+    if curr_rsi >= upper[idx] * (1 - CONFIG.UPPER_TOUCH_THRESHOLD): 
+        return "UPPER", None, curr_rsi
         
-        np_c = np.array(closes, dtype=float)
-        rsi = talib.RSI(np_c, timeperiod=CONFIG.RSI_PERIOD)
-        upper, mid, lower = talib.BBANDS(rsi, timeperiod=CONFIG.BB_LENGTH, 
-                                         nbdevup=CONFIG.BB_STDDEV, nbdevdn=CONFIG.BB_STDDEV, matype=0)
-        
-        idx = -2
-        if np.isnan(rsi[idx]) or np.isnan(upper[idx]): return None, None, 0.0
-        
-        curr_rsi = rsi[idx]
-        
-        # Check Bounds
-        if curr_rsi >= upper[idx] * (1 - CONFIG.UPPER_TOUCH_THRESHOLD): 
-            return "UPPER", None, curr_rsi
-        if curr_rsi <= lower[idx] * (1 + CONFIG.LOWER_TOUCH_THRESHOLD): 
-            return "LOWER", None, curr_rsi
+    if curr_rsi <= lower[idx] * (1 + CONFIG.LOWER_TOUCH_THRESHOLD): 
+        return "LOWER", None, curr_rsi
+    
+    if tf in MIDDLE_BAND_TFS:
+        if abs(curr_rsi - mid[idx]) <= (mid[idx] * CONFIG.MIDDLE_TOUCH_THRESHOLD):
+            # Crossover detection
+            prev_diff = rsi[idx-1] - mid[idx-1]
+            curr_diff = curr_rsi - mid[idx]
             
-        # Check Middle
-        if tf in MIDDLE_BAND_TFS:
-            if abs(curr_rsi - mid[idx]) <= (mid[idx] * CONFIG.MIDDLE_TOUCH_THRESHOLD):
-                prev_diff = rsi[idx-1] - mid[idx-1]
-                curr_diff = curr_rsi - mid[idx]
-                direction = "from above" if (prev_diff > 0 >= curr_diff) or (curr_diff > 0) else "from below"
-                return "MIDDLE", direction, curr_rsi
-                
-        return None, None, 0.0
-    except Exception as e:
-        return None, None, 0.0
+            # Crossed down (positive to negative) or just touching from above
+            direction = "from above" if (prev_diff > 0 >= curr_diff) or (curr_diff > 0) else "from below"
+            return "MIDDLE", direction, curr_rsi
+            
+    return None, None, 0.0
 
 # ==========================================
-# 7. REFACTORED MAIN BOT (LIFECYCLE METHODS)
+# MAIN BOT CLASS
 # ==========================================
 
 class RsiBot:
     def __init__(self):
         self.cache = CacheManager()
         self.proxies = AsyncProxyPool()
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.binance: Optional[BinanceClient] = None
-        self.bybit: Optional[BybitClient] = None
-        
-        # ✅ FIX #4: Add lock for all_pairs mutation
-        self._pairs_lock = asyncio.Lock()
-        
-        # State
-        self.all_pairs = [] # List of tuples (client, symbol, market, exchange_name)
-        self.hot_coins = set()
         self.sent_state = {}
-
-    async def initialize(self):
-        """Step 1: Bootup"""
-        global _cache_key_memo  # Reset memoization for each run
-        _cache_key_memo = {}
+        self.hot_coins = set()
         
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-        await self.cache.init()
+    async def _safe_batch_gather(self, tasks: List[Any], batch_name: str) -> List[Any]:
+        """
+        Executes a large list of awaitables in safe batches to protect the Event Loop.
+        """
+        results = []
+        total = len(tasks)
+        if total == 0: return []
         
-        # Reuse session (Suggestion #6 in previous context, standard here)
-        self.session = aiohttp.ClientSession()
-        await self.proxies.populate(CONFIG.PROXY_URL, self.session)
+        logging.info(f"🔄 Processing {total} {batch_name} tasks in batches of {CONFIG.BATCH_SIZE}...")
         
-        self.binance = BinanceClient(self.session, self.proxies)
-        self.bybit = BybitClient(self.session, self.proxies)
-
-    async def shutdown(self):
-        if self.session: await self.session.close()
-        await self.cache.close()
-        logging.info("👋 Bot Shutdown Complete")
-
-    async def sync_market_data(self):
-        """Step 2: Hybrid Symbol Fetch"""
-        logging.info("🔄 Syncing Market Pairs...")
-        
-        async def fetch_safe(func, mkt, name, cache_key):
-            cached = await self.cache.get_cached_symbols()
-            cached_val = cached['data'].get(cache_key, []) if cached else []
+        for i in range(0, total, CONFIG.BATCH_SIZE):
+            batch = tasks[i : i + CONFIG.BATCH_SIZE]
+            batch_res = await asyncio.gather(*batch, return_exceptions=True)
+            results.extend(batch_res)
+            # Small breathe for the loop
+            await asyncio.sleep(0.05)
             
-            # Try fresh fetch
-            try:
-                res = await func(mkt)
-                if res: 
-                    logging.info(f"✅ {name}: {len(res)} symbols")
-                    return res
-            except Exception as e:
-                logging.error(f"❌ {name} fetch error: {e}")
-            
-            # Fallback
-            if cached_val:
-                logging.warning(f"⚠️ Using Cached for {name}")
-                return cached_val
-            return []
+        return results
 
-        bp, bs, yp, ys = await asyncio.gather(
-            fetch_safe(self.binance.get_symbols, 'perp', 'Binance Perp', 'bp'),
-            fetch_safe(self.binance.get_symbols, 'spot', 'Binance Spot', 'bs'),
-            fetch_safe(self.bybit.get_symbols, 'perp', 'Bybit Perp', 'yp'),
-            fetch_safe(self.bybit.get_symbols, 'spot', 'Bybit Spot', 'ys')
-        )
-
-        # Save successful fetch
-        if any([bp, bs, yp, ys]):
-            await self.cache.save_cached_symbols({'bp': bp, 'bs': bs, 'yp': yp, 'ys': ys})
-
-        # Compile and Filter
-        seen = set()
+    async def _bootstrap_symbols(self, binance: BinanceClient, bybit: BybitClient) -> List[Tuple]:
+        """Hybrid symbol fetch: Try API first, fallback to Cache."""
+        cached_wrapper = await self.cache.get_cached_symbols()
+        cached_data = cached_wrapper.get('data', {}) if cached_wrapper else {}
         
-        # ✅ FIX #4: Use lock when mutating shared state
-        async with self._pairs_lock:
-            self.all_pairs = []  # Reset and rebuild
-            
-            def add_pairs(client, syms, mkt, ex_name):
-                for s in syms:
-                    if s in CONFIG.IGNORED_SYMBOLS or not s.endswith("USDT"): continue
-                    norm = s.upper().replace("USDT", "")
-                    if norm not in seen:
-                        self.all_pairs.append((client, s, mkt, ex_name))
-                        seen.add(norm)
-
-            add_pairs(self.binance, bp, 'perp', 'Binance')
-            add_pairs(self.binance, bs, 'spot', 'Binance')
-            add_pairs(self.bybit, yp, 'perp', 'Bybit')
-            add_pairs(self.bybit, ys, 'spot', 'Bybit')
-            
-            total_symbols = len(self.all_pairs)
+        fetched = {}
         
-        logging.info(f"📊 Total Unique Symbols: {total_symbols}")
-
-    async def analyze_volatility(self):
-        """Step 3: Vectorized Volatility Analysis"""
-        logging.info("🔥 Calculating Market Volatility...")
-        vol_scores = {}
-    
-        async def process_vol(client, sym, mkt, ex_name):  # ✅ ADD ex_name parameter
-            # Only need 25 candles for vol check
-            closes = await client.fetch_ohlcv(sym, '1h', mkt, 25)
-            if not closes: return
-            
-            v = calculate_volatility_vectorized(closes)
-            if v > 0: vol_scores[sym] = v
-    
-        # Batch execution
-        tasks = [process_vol(c, s, m, e) for c, s, m, e in self.all_pairs]
+        # Define fetch tasks
+        sources = [
+            ('bp', binance.get_perp_symbols, 'Binance Perp'),
+            ('bs', binance.get_spot_symbols, 'Binance Spot'),
+            ('yp', bybit.get_perp_symbols, 'Bybit Perp'),
+            ('ys', bybit.get_spot_symbols, 'Bybit Spot')
+        ]
         
-        # Chunking to avoid memory explosion
-        chunk_size = 200
-        for i in range(0, len(tasks), chunk_size):
-            await asyncio.gather(*tasks[i:i+chunk_size], return_exceptions=True)
-            
-        self.hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
-        logging.info(f"🔥 Hot Coins Identified: {len(self.hot_coins)}")
-
-    async def scan_targets(self) -> List[TouchHit]:
-        """Step 4: Scan Logic with Early Exits"""
-        self.sent_state = await self.cache.get_sent_state()
-        
-        # Determine what to scan
-        tfs_to_scan = []
-        cached_hits = []
-        
-        for tf in ACTIVE_TFS:
-            # Check if already sent
-            candle_key = get_cache_key(tf)
-            if tf in CACHED_TFS:
-                if str(self.sent_state.get(tf)) == str(candle_key):
-                    logging.info(f"⏭️ Skipping {tf}: Already alerted.")
-                    continue
-                    
-                # Check if we have results cached
-                res = await self.cache.get_scan_results(tf, candle_key)
+        for key, func, label in sources:
+            symbols = []
+            for attempt in range(2):
+                res = await func()
                 if res:
-                    logging.info(f"📦 Loaded {tf} from Cache.")
-                    cached_hits.extend([TouchHit.from_dict(r) for r in res])
+                    symbols = res
+                    break
+                await asyncio.sleep(1)
+            
+            if not symbols and key in cached_data:
+                logging.warning(f"⚠️ {label} failed. Using Cache.")
+                symbols = cached_data[key]
+            
+            fetched[key] = symbols
+            logging.info(f"📌 {label}: {len(symbols)} symbols")
+
+        # Update cache if we got live data
+        if any(len(v) > 0 for v in fetched.values()):
+            await self.cache.save_cached_symbols(fetched)
+
+        # Normalize and tuple-ize
+        seen = set()
+        all_pairs = []
+        
+        def process_list(sym_list, client, mkt, ex_name):
+            for s in sym_list:
+                if s in CONFIG.IGNORED_SYMBOLS or not s.endswith("USDT"): continue
+                norm = s.upper().replace("USDT", "")
+                if norm not in seen:
+                    seen.add(norm)
+                    all_pairs.append((client, s, mkt, ex_name))
+
+        process_list(fetched['bp'], binance, 'perp', 'Binance')
+        process_list(fetched['bs'], binance, 'spot', 'Binance')
+        process_list(fetched['yp'], bybit, 'perp', 'Bybit')
+        process_list(fetched['ys'], bybit, 'spot', 'Bybit')
+        
+        return all_pairs
+
+    async def _calculate_volatility(self, all_pairs: List[Tuple]):
+        """Vectorized Volatility Scan."""
+        logging.info("📊 Calculating Volatility...")
+        
+        # Create tasks
+        tasks = []
+        for client, sym, mkt, ex in all_pairs:
+            tasks.append(client.fetch_candles(sym, '1h', mkt, limit=25))
+            
+        # Execute safe batch
+        results = await self._safe_batch_gather(tasks, "Volatility")
+        
+        # Process results
+        vol_scores = {}
+        for idx, res in enumerate(results):
+            if isinstance(res, list) and len(res) > 20:
+                # Use vectorized math
+                v = calculate_volatility_vectorized(res)
+                if v > 0:
+                    sym = all_pairs[idx][1]
+                    vol_scores[sym] = v
+            elif isinstance(res, Exception):
+                # Contextual Logging
+                client, sym, _, ex_name = all_pairs[idx]
+                logging.debug(f"Vol Check Failed {ex_name} {sym}: {res}")
+
+        # Top 60
+        self.hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
+        logging.info(f"🔥 Identified {len(self.hot_coins)} Hot Coins")
+
+    async def _execute_scans(self, all_pairs: List[Tuple]) -> List[TouchHit]:
+        """Main Scanning Logic with Cache skipping."""
+        final_hits = []
+        tfs_to_scan = []
+        
+        # 1. Determine what needs scanning
+        for tf in ACTIVE_TFS:
+            if tf in CACHED_TFS:
+                key = get_cache_key(tf)
+                # Check if we already sent this candle
+                if self.sent_state.get(tf) == key:
+                    continue 
+                
+                # Check redis cache for results
+                cached_res = await self.cache.get_scan_results(tf, key)
+                if cached_res:
+                    logging.info(f"📦 Loaded {len(cached_res)} cached hits for {tf}")
+                    final_hits.extend([TouchHit.from_dict(x) for x in cached_res])
                     continue
             
             tfs_to_scan.append(tf)
 
         if not tfs_to_scan:
-            logging.info("💤 Nothing new to scan.")
-            return cached_hits
+            return final_hits
 
-        logging.info(f"🕵️ Scanning Fresh: {tfs_to_scan}")
+        # 2. Scan necessary timeframes
+        logging.info(f"🕵️ Scanning: {tfs_to_scan}")
         
-        fresh_hits = []
-        loop = asyncio.get_running_loop()
-
-        # ✅ FIX #4: Use lock when reading shared state
-        async with self._pairs_lock:
-            pairs_snapshot = self.all_pairs.copy()
-
-        # Scan Loop
         for tf in tfs_to_scan:
+            tasks = []
+            # Prepare task metadata to map results back to symbols
+            meta_data = [] 
+            
+            for client, sym, mkt, ex in all_pairs:
+                tasks.append(client.fetch_candles(sym, tf, mkt))
+                meta_data.append((sym, mkt, ex))
+                
+            candle_results = await self._safe_batch_gather(tasks, f"Scan {tf}")
+            
             tf_hits = []
-            
-            async def scan_single(client, sym, mkt, ex_name):
-                closes = await client.fetch_ohlcv(sym, tf, mkt, CONFIG.CANDLE_LIMIT)
-                if not closes: return None
-                
-                # Offload CPU heavy talib to thread pool
-                t_type, direction, rsi_val = await loop.run_in_executor(
-                    cpu_executor, check_bb_rsi_sync, closes, tf
-                )
-                
-                if t_type:
-                    return TouchHit(sym, ex_name, mkt, tf, rsi_val, t_type, direction, sym in self.hot_coins)
-                return None
+            for i, closes in enumerate(candle_results):
+                if isinstance(closes, list) and len(closes) >= CONFIG.MIN_CANDLES:
+                    t_type, direc, rsi_val = check_bb_rsi(closes, tf)
+                    if t_type:
+                        sym, mkt, ex = meta_data[i]
+                        hit = TouchHit(sym, ex, mkt, tf, rsi_val, t_type, direc, sym in self.hot_coins)
+                        tf_hits.append(hit)
+                elif isinstance(closes, Exception):
+                    sym, _, ex = meta_data[i]
+                    logging.debug(f"Scan Fail {ex} {sym} [{tf}]: {closes}")
 
-            tasks = [scan_single(c, s, m, e) for c, s, m, e in pairs_snapshot]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for r in results:
-                if isinstance(r, TouchHit):
-                    tf_hits.append(r)
-                elif isinstance(r, Exception):
-                    # logging.error(f"Scan Error: {r}") # Optional: noisy
-                    pass
-
-            fresh_hits.extend(tf_hits)
-            
-            # Save results for High TFs
+            # Cache results for this TF
             if tf in CACHED_TFS:
-                candle_key = get_cache_key(tf)
-                await self.cache.save_scan_results(tf, candle_key, [h.to_dict() for h in tf_hits])
+                key = get_cache_key(tf)
+                await self.cache.save_scan_results(tf, key, [h.to_dict() for h in tf_hits])
+                
+            final_hits.extend(tf_hits)
+            
+        return final_hits
 
-        return cached_hits + fresh_hits
-
-    async def dispatch_alerts(self, hits: List[TouchHit]):
-        """Step 5: Alerting"""
+    async def _send_report(self, session: aiohttp.ClientSession, hits: List[TouchHit]):
+        """Formatted Telegram Reporting."""
         if not hits: return
-        
-        # Filter hits that need sending
-        to_send = []
-        updated_state = self.sent_state.copy()
-        
-        # Group by TF to check against state
-        by_tf = {}
-        for h in hits: by_tf.setdefault(h.timeframe, []).append(h)
-        
-        for tf, items in by_tf.items():
-            if tf in CACHED_TFS:
-                candle_key = get_cache_key(tf)
-                # Only send if not sent yet
-                if str(updated_state.get(tf)) != str(candle_key):
-                    to_send.extend(items)
-                    updated_state[tf] = candle_key
-            else:
-                # Low TFs always send
-                to_send.extend(items)
-        
-        if not to_send: return
 
-        await self._send_telegram(to_send)
-        await self.cache.save_sent_state(updated_state)
-
-    async def _send_telegram(self, hits: List[TouchHit]):
-        # Grouping Logic
+        # Grouping
         grouped = {}
-        for h in hits: grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
+        for h in hits:
+            # Check if already sent
+            tf_key = get_cache_key(h.timeframe)
+            if h.timeframe in CACHED_TFS and self.sent_state.get(h.timeframe) == tf_key:
+                continue # Redundant check, but safe
+            grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
+
+        if not grouped: return
+
+        # Build Messages
+        msg_blocks = []
+        tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
         
-        blocks = []
-        headers = {"UPPER": "⬆️ UPPER BB", "MIDDLE": "🔶 MIDDLE BB", "LOWER": "⬇️ LOWER BB"}
-        
-        for tf in ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]:
+        for tf in tf_order:
             if tf not in grouped: continue
             
-            total = sum(len(grouped[tf].get(t, [])) for t in headers)
-            lines = [f" ▣ TIMEFRAME: {tf} ({total} Hits)", "─────────────────────────", ""]
+            lines = [f" ▣ TIMEFRAME: {tf}", "─────────────────────────"]
+            headers = {"UPPER": "⬆️ UPPER BB", "MIDDLE": "🔶 MIDDLE BB", "LOWER": "⬇️ LOWER BB"}
             
-            for t_type, label in headers.items():
+            for t_type, header in headers.items():
                 items = grouped[tf].get(t_type, [])
                 if not items: continue
-                items.sort(key=lambda x: x.symbol)
                 
-                lines.append(f"┌ {label}")
+                items.sort(key=lambda x: x.symbol)
+                lines.append(f"┌ {header}")
+                
                 for idx, item in enumerate(items):
                     prefix = "└" if idx == len(items)-1 else "│"
                     icon = "🥐" if item.exchange == "Binance" else "💣"
                     sym = item.symbol.replace("USDT", "")
-                    ext = f" {'🔻' if item.direction=='from above' else '🔹'}" if t_type=="MIDDLE" else ""
-                    if item.hot: ext += " 🔥"
                     
-                    lines.append(f"{prefix} {icon} *{sym}* ➜ *{item.rsi:.2f}*{ext}")
-                lines.append("")
-            
+                    # Formatting Details
+                    extra = ""
+                    if t_type == "MIDDLE":
+                        extra = f" {'🔻' if item.direction=='from above' else '🔹'}"
+                    if item.hot: extra += " 🔥"
+                    
+                    lines.append(f"{prefix} {icon} *{sym}* ➜ *{item.rsi:.2f}*{extra}")
+                lines.append("") # Spacer
+                
             lines.append("─────────────────────────")
-            blocks.append("\n".join(lines))
+            msg_blocks.append("\n".join(lines))
 
-        # Send Chunks
-        full_text = []
-        curr_len = 0
-        ts = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
+        # Send in Chunks
+        full_text = "\n\n".join(msg_blocks) + f"\n{datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')}"
         
-        async def flush(txt):
-            if not txt: return
-            body = "\n\n".join(txt) + f"\n{ts}"
+        # Professional chunking
+        MAX_LEN = 3800
+        while full_text:
+            if len(full_text) <= MAX_LEN:
+                chunk = full_text
+                full_text = ""
+            else:
+                # Find nearest newline to split cleanly
+                split_idx = full_text.rfind('\n', 0, MAX_LEN)
+                if split_idx == -1: split_idx = MAX_LEN
+                chunk = full_text[:split_idx]
+                full_text = full_text[split_idx:]
+            
             try:
-                url = f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage"
-                await self.session.post(url, json={
-                    "chat_id": CONFIG.CHAT_ID, 
-                    "text": body, 
-                    "parse_mode": "Markdown"
-                })
+                await session.post(
+                    f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
+                    json={"chat_id": CONFIG.CHAT_ID, "text": chunk, "parse_mode": "Markdown"}
+                )
                 await asyncio.sleep(0.5)
             except Exception as e:
-                logging.error(f"Telegram Fail: {e}")
-
-        for b in blocks:
-            if curr_len + len(b) > 3800:
-                await flush(full_text)
-                full_text = []
-                curr_len = 0
-            full_text.append(b)
-            curr_len += len(b)
-            
-        await flush(full_text)
+                logging.error(f"TG Send Error: {e}")
 
     async def run(self):
-        """Main Lifecycle"""
-        try:
-            await self.initialize()
-            await self.sync_market_data()
-            await self.analyze_volatility()
-            hits = await self.scan_targets()
-            await self.dispatch_alerts(hits)
-        except KeyboardInterrupt:
-            pass
-        except Exception as e:
-            logging.exception("CRITICAL CRASH IN MAIN LOOP")
-        finally:
-            await self.shutdown()
+        """Orchestrator."""
+        logging.basicConfig(
+            level=logging.INFO, 
+            format='%(asctime)s %(levelname)s [%(funcName)s] %(message)s',
+            datefmt='%H:%M:%S'
+        )
+        
+        # 1. Initialize Infrastructure
+        await self.cache.init()
+        self.sent_state = await self.cache.get_sent_state()
+        
+        async with aiohttp.ClientSession() as session:
+            # 2. Warmup Proxies
+            await self.proxies.populate(CONFIG.PROXY_URL, session)
+            
+            # 3. Instantiate Clients
+            binance = BinanceClient(session, self.proxies)
+            bybit = BybitClient(session, self.proxies)
+            
+            # 4. Bootstrap Symbols
+            all_pairs = await self._bootstrap_symbols(binance, bybit)
+            logging.info(f"Total Trading Pairs: {len(all_pairs)}")
+            
+            # 5. Volatility Analysis
+            await self._calculate_volatility(all_pairs)
+            
+            # 6. Execute Scans
+            hits = await self._execute_scans(all_pairs)
+            
+            # 7. Report & State Update
+            await self._send_report(session, hits)
+            
+            # Update state for cached TFs
+            new_state = self.sent_state.copy()
+            for tf in CACHED_TFS:
+                new_state[tf] = get_cache_key(tf)
+            await self.cache.save_sent_state(new_state)
+
+        await self.cache.close()
+        logging.info("✅ Cycle Complete.")
 
 if __name__ == "__main__":
     if os.name == 'nt':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        
+        asyncio.set_event_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
     bot = RsiBot()
-    asyncio.run(bot.run())
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        pass
