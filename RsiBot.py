@@ -165,7 +165,8 @@ class AsyncProxyPool:
             # Test against Binance Futures for real latency check
             url = CONFIG.URLS['binance_perp_kline']
             params = {"symbol": "BTCUSDT", "interval": "1m", "limit": "2"}
-            async with session.get(url, params=params, proxy=proxy, timeout=7) as resp:
+            # ✅ FIX #3: Reduced timeout from 7s to 4s
+            async with session.get(url, params=params, proxy=proxy, timeout=4) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if isinstance(data, list) and len(data) > 0:
@@ -333,7 +334,7 @@ class BaseExchange:
     async def get_symbols(self, market_type: str) -> List[str]:
         raise NotImplementedError
 
-    async def fetch_candles(self, symbol: str, interval: str, limit: int) -> List[float]:
+    async def fetch_ohlcv(self, symbol: str, interval: str, market_type: str, limit: int) -> List[float]:
         raise NotImplementedError
 
 class BinanceClient(BaseExchange):
@@ -354,14 +355,6 @@ class BinanceClient(BaseExchange):
             logging.error(f"Binance Parse Error: {e}")
             return []
 
-    async def fetch_candles(self, symbol: str, interval: str, limit: int) -> List[float]:
-        # Decide endpoint based on symbol (rough heuristic or strict market type passing required)
-        # For this bot, we'll assume calling method knows the URL or we pass market type.
-        # To keep signature simple, we will assume Caller knows market type is needed. 
-        # NOTE: To fix the architecture perfectly, fetch_candles should take 'market_type'.
-        pass 
-
-    # Improved Signature to handle Spot/Perp URLs correctly
     async def fetch_ohlcv(self, symbol: str, interval: str, market_type: str, limit: int) -> List[float]:
         url = CONFIG.URLS['binance_perp_kline'] if market_type == 'perp' else CONFIG.URLS['binance_spot_kline']
         params = {'symbol': symbol, 'interval': interval, 'limit': limit}
@@ -416,10 +409,18 @@ class BybitClient(BaseExchange):
 # Global Thread Pool for CPU tasks
 cpu_executor = ThreadPoolExecutor(max_workers=4)
 
+# ✅ FIX #2: Memoized cache key
+_cache_key_memo = {}  # {tf: key}
 def get_cache_key(tf: str) -> int:
+    """Returns stable integer timestamp for current TF candle."""
+    if tf in _cache_key_memo:
+        return _cache_key_memo[tf]
+    
     mins = TIMEFRAME_MINUTES[tf]
     now = int(time.time())
-    return now - (now % (mins * 60))
+    key = now - (now % (mins * 60))
+    _cache_key_memo[tf] = key
+    return key
 
 def calculate_volatility_vectorized(closes: List[float]) -> float:
     """Vectorized Volatility Calc (Suggestion #4)"""
@@ -481,6 +482,9 @@ class RsiBot:
         self.binance: Optional[BinanceClient] = None
         self.bybit: Optional[BybitClient] = None
         
+        # ✅ FIX #4: Add lock for all_pairs mutation
+        self._pairs_lock = asyncio.Lock()
+        
         # State
         self.all_pairs = [] # List of tuples (client, symbol, market, exchange_name)
         self.hot_coins = set()
@@ -488,6 +492,9 @@ class RsiBot:
 
     async def initialize(self):
         """Step 1: Bootup"""
+        global _cache_key_memo  # Reset memoization for each run
+        _cache_key_memo = {}
+        
         logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
         await self.cache.init()
         
@@ -539,22 +546,27 @@ class RsiBot:
 
         # Compile and Filter
         seen = set()
-        self.all_pairs = []
         
-        def add_pairs(client, syms, mkt, ex_name):
-            for s in syms:
-                if s in CONFIG.IGNORED_SYMBOLS or not s.endswith("USDT"): continue
-                norm = s.upper().replace("USDT", "")
-                if norm not in seen:
-                    self.all_pairs.append((client, s, mkt, ex_name))
-                    seen.add(norm)
+        # ✅ FIX #4: Use lock when mutating shared state
+        async with self._pairs_lock:
+            self.all_pairs = []  # Reset and rebuild
+            
+            def add_pairs(client, syms, mkt, ex_name):
+                for s in syms:
+                    if s in CONFIG.IGNORED_SYMBOLS or not s.endswith("USDT"): continue
+                    norm = s.upper().replace("USDT", "")
+                    if norm not in seen:
+                        self.all_pairs.append((client, s, mkt, ex_name))
+                        seen.add(norm)
 
-        add_pairs(self.binance, bp, 'perp', 'Binance')
-        add_pairs(self.binance, bs, 'spot', 'Binance')
-        add_pairs(self.bybit, yp, 'perp', 'Bybit')
-        add_pairs(self.bybit, ys, 'spot', 'Bybit')
+            add_pairs(self.binance, bp, 'perp', 'Binance')
+            add_pairs(self.binance, bs, 'spot', 'Binance')
+            add_pairs(self.bybit, yp, 'perp', 'Bybit')
+            add_pairs(self.bybit, ys, 'spot', 'Bybit')
+            
+            total_symbols = len(self.all_pairs)
         
-        logging.info(f"📊 Total Unique Symbols: {len(self.all_pairs)}")
+        logging.info(f"📊 Total Unique Symbols: {total_symbols}")
 
     async def analyze_volatility(self):
         """Step 3: Vectorized Volatility Analysis"""
@@ -566,14 +578,11 @@ class RsiBot:
             closes = await client.fetch_ohlcv(sym, '1h', mkt, 25)
             if not closes: return
             
-            # Offload vectorized math (Suggestion #4) to executor (Suggestion #3 logic)
-            # Note: Since numpy is C-optimized and releases GIL often, we can run it directly
-            # OR stick to thread pool for absolute safety. Let's run directly as it's fast.
             v = calculate_volatility_vectorized(closes)
             if v > 0: vol_scores[sym] = v
 
         # Batch execution
-        tasks = [process_vol(c, s, m, e) for c, s, m, e in self.all_pairs] # e is unused here
+        tasks = [process_vol(c, s, m, e) for c, s, m, e in self.all_pairs]
         
         # Chunking to avoid memory explosion
         chunk_size = 200
@@ -617,6 +626,10 @@ class RsiBot:
         fresh_hits = []
         loop = asyncio.get_running_loop()
 
+        # ✅ FIX #4: Use lock when reading shared state
+        async with self._pairs_lock:
+            pairs_snapshot = self.all_pairs.copy()
+
         # Scan Loop
         for tf in tfs_to_scan:
             tf_hits = []
@@ -625,7 +638,7 @@ class RsiBot:
                 closes = await client.fetch_ohlcv(sym, tf, mkt, CONFIG.CANDLE_LIMIT)
                 if not closes: return None
                 
-                # Offload CPU heavy talib to thread pool (Suggestion #3)
+                # Offload CPU heavy talib to thread pool
                 t_type, direction, rsi_val = await loop.run_in_executor(
                     cpu_executor, check_bb_rsi_sync, closes, tf
                 )
@@ -634,7 +647,7 @@ class RsiBot:
                     return TouchHit(sym, ex_name, mkt, tf, rsi_val, t_type, direction, sym in self.hot_coins)
                 return None
 
-            tasks = [scan_single(c, s, m, e) for c, s, m, e in self.all_pairs]
+            tasks = [scan_single(c, s, m, e) for c, s, m, e in pairs_snapshot]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             for r in results:
@@ -744,6 +757,7 @@ class RsiBot:
         await flush(full_text)
 
     async def run(self):
+        """Main Lifecycle"""
         try:
             await self.initialize()
             await self.sync_market_data()
@@ -758,7 +772,6 @@ class RsiBot:
             await self.shutdown()
 
 if __name__ == "__main__":
-    # Windows Fix
     if os.name == 'nt':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         
