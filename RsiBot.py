@@ -570,7 +570,8 @@ class RsiBot:
                     async def scan_one_limited(client, sym, mkt, ex):
                         async with semaphore:
                             closes = await client.fetch_closes(sym, tf, mkt)
-                            if not closes: return None
+                            if not closes: 
+                                return None
                             t_type, direction, rsi_val = check_bb_rsi(closes, tf)
                             if t_type:
                                 return TouchHit(sym, ex, mkt, tf, rsi_val, t_type, direction, sym in hot_coins)
@@ -585,9 +586,10 @@ class RsiBot:
                             result = await coro
                             if result:
                                 tf_hits.append(result)
-                            scanned_count += 1
+                                scanned_count += 1  # ✅ FIX 1: Only count successful scans
                         except Exception as e:
-                            logging.debug(f"Scan error in {tf}: {e}")
+                            # ✅ FIX 2: Log warning with details
+                            logging.warning(f"Scan error in {tf}: {str(e)}")
                     
                     if tf in CACHED_TFS:
                         candle_key = get_cache_key(tf)
@@ -611,6 +613,9 @@ class RsiBot:
                         final_hits.extend(tf_hits)
                         scan_stats[tf].hits_found = len(tf_hits)
                         scan_stats[tf].successful_scans = scanned_count
+                    else:
+                        # ✅ FIX 3: Log exceptions that occurred
+                        logging.error(f"TF scanning failed: {result}")
             
             # 5. MERGE CACHED HITS (no need to cache again)
             final_hits.extend(cached_hits_to_use)
