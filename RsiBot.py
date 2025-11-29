@@ -523,7 +523,7 @@ class RsiBot:
             hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
             logging.info(f"Vol Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot: {len(hot_coins)}")
             
-            # 3. SCAN SETUP WITH EARLY SENT STATE CHECK
+            # 3. PRECISION SCAN SETUP WITH EARLY SENT STATE CHECK
             sent_state = await self.cache.get_sent_state()
             scan_stats = {tf: ScanStats(tf, "Unknown", total_symbols=total_sym_count) for tf in ACTIVE_TFS}
             
@@ -541,7 +541,7 @@ class RsiBot:
                     cached_res = await self.cache.get_scan_results(tf, candle_key)
                     if cached_res is None:
                         tfs_to_scan_fresh.append(tf)
-                        scan_stats[tf].source = "Fresh Scan"
+                        scan_stats[tf].source = "Fresh Scan (New Candle)"
                     else:
                         hits = [TouchHit.from_dict(d) for d in cached_res]
                         cached_hits_to_use.extend(hits)
@@ -552,74 +552,52 @@ class RsiBot:
                     tfs_to_scan_fresh.append(tf)
                     scan_stats[tf].source = "Fresh Scan (Low TF)"
             
-            # 4. EXECUTE FRESH SCANS (TRULY PARALLEL with per-TF caching)
+            # 4. EXECUTE FRESH SCANS (batched by timeframe, ALL SYMBOLS)
             final_hits = []
-            
             if tfs_to_scan_fresh:
-                max_per_tf = max(5, CONFIG.MAX_CONCURRENCY // len(tfs_to_scan_fresh))
-                logging.info(f"Scanning fresh TFs: {tfs_to_scan_fresh} (max {max_per_tf} concurrent per TF)")
+                logging.info(f"Scanning fresh TFs: {tfs_to_scan_fresh} across all symbols...")
                 
-                # Spawn each TF as a separate top-level task
-                tf_tasks = []
-                
-                async def scan_and_cache_tf(tf: str, semaphore: asyncio.Semaphore):
-                    """Scan all symbols for ONE timeframe and cache immediately."""
-                    tf_hits = []
-                    scanned_count = 0
+                for tf in tfs_to_scan_fresh:
+                    tf_tasks = []
+                    # Scan ALL symbols for this TF
+                    async def scan_one(client, sym, mkt, ex):
+                        closes = await client.fetch_closes(sym, tf, mkt)
+                        if not closes: return []
+                        t_type, direction, rsi_val = check_bb_rsi(closes, tf)
+                        if t_type:
+                            return [TouchHit(sym, ex, mkt, tf, rsi_val, t_type, direction, sym in hot_coins)]
+                        return []
                     
-                    async def scan_one_limited(client, sym, mkt, ex):
-                        async with semaphore:
-                            closes = await client.fetch_closes(sym, tf, mkt)
-                            if not closes: 
-                                return None
-                            t_type, direction, rsi_val = check_bb_rsi(closes, tf)
-                            if t_type:
-                                return TouchHit(sym, ex, mkt, tf, rsi_val, t_type, direction, sym in hot_coins)
-                            return None
+                    for client, sym, mkt, ex in all_pairs:
+                        tf_tasks.append(scan_one(client, sym, mkt, ex))
                     
-                    # Create and run all tasks for this TF
-                    scan_tasks = [scan_one_limited(client, sym, mkt, ex) 
-                                 for client, sym, mkt, ex in all_pairs]
+                    results = await asyncio.gather(*tf_tasks, return_exceptions=True)
                     
-                    for coro in asyncio.as_completed(scan_tasks):
-                        try:
-                            result = await coro
-                            if result:
-                                tf_hits.append(result)
-                                scanned_count += 1  # ✅ FIX 1: Only count successful scans
-                        except Exception as e:
-                            # ✅ FIX 2: Log warning with details
-                            logging.warning(f"Scan error in {tf}: {str(e)}")
+                    for result in results:
+                        if isinstance(result, list):
+                            final_hits.extend(result)
+                            scan_stats[tf].hits_found += len(result)
+                    
+                    scan_stats[tf].successful_scans = len([r for r in results if not isinstance(r, Exception)])
                     
                     if tf in CACHED_TFS:
                         candle_key = get_cache_key(tf)
+                        tf_hits = [h for h in final_hits if h.timeframe == tf]
                         await self.cache.save_scan_results(tf, candle_key, [h.to_dict() for h in tf_hits])
-                        logging.info(f"💾 Cached {len(tf_hits)} hits for {tf}")
-                    
-                    return tf, tf_hits, scanned_count
-                
-                # Create semaphore and task for each TF
-                for tf in tfs_to_scan_fresh:
-                    sem = asyncio.Semaphore(max_per_tf)
-                    tf_tasks.append(asyncio.create_task(scan_and_cache_tf(tf, sem)))
-                
-                # Run all TF tasks concurrently
-                tf_results = await asyncio.gather(*tf_tasks, return_exceptions=True)
-                
-                # Process results from all TFs
-                for result in tf_results:
-                    if isinstance(result, tuple):
-                        tf, tf_hits, scanned_count = result
-                        final_hits.extend(tf_hits)
-                        scan_stats[tf].hits_found = len(tf_hits)
-                        scan_stats[tf].successful_scans = scanned_count
-                    else:
-                        # ✅ FIX 3: Log exceptions that occurred
-                        logging.error(f"TF scanning failed: {result}")
             
-            # 5. MERGE CACHED HITS (no need to cache again)
+            # 5. MERGE CACHED
             final_hits.extend(cached_hits_to_use)
-
+            
+            # Summary
+            logging.info("="*60)
+            logging.info(f"{'TF':<5} | {'Source':<25} | {'Success':<15} | {'Hits'}")
+            logging.info("-" * 60)
+            for tf in sorted(ACTIVE_TFS, key=lambda x: ["15m","30m","1h","2h","4h","1d","1w"].index(x)):
+                st = scan_stats[tf]
+                succ_str = "Skipped (Cached/Sent)" if st.source in ["Cached", "Already Sent"] else f"{st.successful_scans}/{st.total_symbols}"
+                logging.info(f"[{tf:<3}] {st.source:<25} | {succ_str:<15} | {st.hits_found}")
+            logging.info("="*60)
+            
             # 6. ALERTING
             hits_to_send = []
             new_state = sent_state.copy()
