@@ -386,67 +386,79 @@ class RsiBot:
         
     async def send_report(self, session: aiohttp.ClientSession, hits: List[TouchHit]):
         if not hits: return
+
+        # 1. Group hits
         grouped = {}
         for h in hits: grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
-        
-        tf_blocks = []
+
+        # 2. Prepare ALL lines first
+        all_lines = []
         tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
-        
+        headers = {"UPPER": "⬆️ UPPER BB", "MIDDLE": "🔶 MIDDLE BB", "LOWER": "⬇️ LOWER BB"}
+
         for tf in tf_order:
             if tf not in grouped: continue
             
             total_hits = sum(len(grouped[tf].get(t, [])) for t in ["UPPER", "MIDDLE", "LOWER"])
-            lines = [
-                f" ▣ TIMEFRAME: {tf} ({total_hits} Hits)",
-                "─────────────────────────",
-                ""
-            ]
-            
-            headers = {"UPPER": "⬆️ UPPER BB", "MIDDLE": "🔶 MIDDLE BB", "LOWER": "⬇️ LOWER BB"}
+            if total_hits == 0: continue
+
+            all_lines.append(f" ▣ TIMEFRAME: {tf} ({total_hits} Hits)")
+            all_lines.append("─────────────────────────")
+
             found = [t for t in ["UPPER", "MIDDLE", "LOWER"] if grouped[tf].get(t)]
-            
             for t in found:
                 items = grouped[tf].get(t, [])
                 items.sort(key=lambda x: x.symbol)
-                lines.append(f"┌ {headers[t]}")
+                
+                all_lines.append(f"┌ {headers[t]}")
                 for idx, item in enumerate(items):
                     prefix = "└" if idx == len(items)-1 else "│"
                     icon = "🥐" if item.exchange == "Binance" else "💣"
                     sym_clean = item.symbol.replace("USDT", "")
-                    ext = f" {'🔻' if item.direction=='from above' else '🔹'}" if t=="MIDDLE" else ""
+                    
+                    ext = ""
+                    if t == "MIDDLE":
+                        ext = f" {'🔻' if item.direction=='from above' else '🔹'}"
                     if item.hot: ext += " 🔥"
-                    lines.append(f"{prefix} {icon} *{sym_clean}* ➜ *{item.rsi:.2f}*{ext}")
-                lines.append("")
+                    
+                    all_lines.append(f"{prefix} {icon} *{sym_clean}* ➜ *{item.rsi:.2f}*{ext}")
+                all_lines.append("") # Spacer
             
-            lines.append("─────────────────────────")
-            tf_blocks.append("\n".join(lines))
+            all_lines.append("─────────────────────────")
+            all_lines.append("") # Block Spacer
 
-        if not tf_blocks: return
+        # 3. Send in Safe Chunks
+        if not all_lines: return
 
         current_msg = []
         current_len = 0
         ts_footer = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
-        
-        for block in tf_blocks:
-            if current_len + len(block) > 3800:
-                full_text = "\n\n".join(current_msg) + f"\n{ts_footer}"
-                try: 
-                    await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage", 
-                                     json={"chat_id": CONFIG.CHAT_ID, "text": full_text, "parse_mode": "Markdown"})
-                    await asyncio.sleep(0.5)
-                except Exception as e: logging.error(f"TG Send Fail: {e}")
-                current_msg = []
-                current_len = 0
+
+        async def flush():
+            nonlocal current_msg, current_len
+            if not current_msg: return
             
-            current_msg.append(block)
-            current_len += len(block)
-        
-        if current_msg:
-            full_text = "\n\n".join(current_msg) + f"\n{ts_footer}"
-            try: 
-                await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage", 
-                                 json={"chat_id": CONFIG.CHAT_ID, "text": full_text, "parse_mode": "Markdown"})
-            except Exception as e: logging.error(f"TG Send Fail: {e}")
+            # Add footer to every message chunk
+            text = "\n".join(current_msg) + f"\n\n{ts_footer}"
+            try:
+                await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
+                                 json={"chat_id": CONFIG.CHAT_ID, "text": text, "parse_mode": "Markdown"})
+                await asyncio.sleep(0.5) # Rate limit safety
+            except Exception as e:
+                logging.error(f"TG Send Fail: {e}")
+            
+            current_msg = []
+            current_len = 0
+
+        for line in all_lines:
+            # 3800 leaves room for footer and overhead
+            if current_len + len(line) + 10 > 3800:
+                await flush()
+            
+            current_msg.append(line)
+            current_len += len(line) + 1
+
+        await flush()
 
     async def fetch_symbols_hybrid(self, binance: BinanceClient, bybit: BybitClient) -> Tuple[List[str], List[str], List[str], List[str]]:
         """Fetches symbols with per-exchange fallback to cache."""
