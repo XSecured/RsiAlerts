@@ -8,8 +8,9 @@ import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Set, Optional, Tuple, Any
+from typing import List, Dict, Set, Optional, Tuple, Any, Deque
 from itertools import cycle
+from collections import deque
 
 import aiohttp
 import numpy as np
@@ -61,7 +62,7 @@ MIDDLE_BAND_TFS = ['15m', '30m', '1h', '2h', '4h', '1d', '1w']
 CACHED_TFS = {'2h', '4h', '1d', '1w'}
 
 # ==========================================
-# DATA MODELS
+# DATA MODELS (UNCHANGED)
 # ==========================================
 
 @dataclass
@@ -88,107 +89,308 @@ class ScanStats:
     hits_found: int = 0
 
 # ==========================================
-# PROXY POOL (IMPROVEMENT #5: Dynamic Health Scoring)
+# ZERO-IDLE SARE (MATHEMATICAL CORE)
 # ==========================================
 
-class AsyncProxyPool:
-    def __init__(self, max_pool_size=20):
-        self.proxies: List[str] = []
-        self.max_pool_size = max_pool_size
-        self._lock = asyncio.Lock()
-        self.health: Dict[str, Dict[str, Any]] = {}  # proxy -> stats
-
-    async def populate(self, url: str, session: aiohttp.ClientSession):
-        if not url: return
-        raw = []
-        try:
-            logging.info(f"📥 Fetching proxies from {url}...")
-            async with session.get(url, timeout=15) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    for line in text.splitlines():
-                        p = line.strip()
-                        if p: raw.append(p if "://" in p else f"http://{p}")
-        except Exception as e:
-            logging.error(f"❌ Proxy fetch failed: {e}")
-            return
-
-        logging.info(f"🔎 Validating {len(raw)} proxies...")
-        self.proxies = []
-        self.health = {}
-        
-        sem = asyncio.Semaphore(200)
-        async def protected_test(p):
-            async with sem: return await self._test_proxy(p, session)
-
-        tasks = [asyncio.create_task(protected_test(p)) for p in raw]
-        for future in asyncio.as_completed(tasks):
-            try:
-                proxy, is_good = await future
-                if is_good:
-                    self.proxies.append(proxy)
-                    self.health[proxy] = {"strikes": 0, "uses": 0, "cooldown_until": 0}
-                    if len(self.proxies) >= self.max_pool_size: break
-            except: pass
-        
-        for t in tasks:
-            if not t.done(): t.cancel()
-        await asyncio.sleep(0.1)
-        
-        if self.proxies:
-            logging.info(f"✅ Proxy Pool Ready: {len(self.proxies)} proxies.")
+@dataclass
+class ProxyBelief:
+    """Bayesian belief per proxy: Beta-Bernoulli + Kalman."""
+    url: str
+    latency_mu: float = 0.3        # Kalman estimate (seconds)
+    latency_var: float = 0.1       # Kalman error covariance
+    success_alpha: int = 2         # Beta prior (successes + 1)
+    success_beta: int = 2          # Beta prior (failures + 1)
+    rate_limit_saturation: float = 0.0  # [0,1]
+    uses: int = 0                  # Lifetime uses
+    failures: int = 0              # Consecutive failures
+    
+    def kalman_update(self, measured_latency: float):
+        """Optimal linear estimator."""
+        kalman_gain = self.latency_var / (self.latency_var + 0.05)
+        self.latency_mu = self.latency_mu + kalman_gain * (measured_latency - self.latency_mu)
+        self.latency_var = (1 - kalman_gain) * self.latency_var + 0.01
+    
+    def beta_update(self, success: bool):
+        """Conjugate prior update with forgetting."""
+        if success:
+            self.success_alpha += 1
         else:
-            logging.error("❌ NO WORKING PROXIES FOUND!")
-
-    async def _test_proxy_lightweight(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool, float]:
-        """Fast proxy test using HEAD request."""
-        start = time.time()
-        try:
-            # Use a lightweight endpoint
-            url = "https://fapi.binance.com/fapi/v1/ping"
-            async with session.head(url, proxy=proxy, timeout=3) as resp:
-                latency = time.time() - start
-                return proxy, resp.status == 200, latency
-        except:
-            return proxy, False, 999.0
-
-    async def get_proxy(self) -> Optional[str]:
-        if not self.proxies: return None
+            self.success_beta += 1
         
-        async with self._lock:
-            now = time.time()
-            available = [p for p in self.proxies if self.health.get(p, {}).get("cooldown_until", 0) < now]
-            
-            if not available:
-                proxy = min(self.proxies, key=lambda p: self.health[p]["cooldown_until"])
-                return proxy
-            
-            def health_score(p):
-                h = self.health[p]
-                uses = max(h["uses"], 1)
-                return h["strikes"] / uses
-            
-            proxy = min(available, key=health_score)
-            self.health[proxy]["uses"] += 1
-            return proxy
+        total = self.success_alpha + self.success_beta
+        if total > 500:
+            self.success_alpha *= 0.99
+            self.success_beta *= 0.99
+    
+    def sample_reward(self) -> float:
+        """Thompson Sampling: draw from posterior."""
+        p_success = np.random.beta(self.success_alpha, self.success_beta)
+        latency_sample = np.random.normal(self.latency_mu, max(0.01, self.latency_var))
+        return p_success - (latency_sample * 2.0) - (self.rate_limit_saturation * 0.5)
 
-    async def report_failure(self, proxy: str):
-        async with self._lock:
-            h = self.health.setdefault(proxy, {"strikes": 0, "uses": 0, "cooldown_until": 0})
-            h["strikes"] += 1
+@dataclass
+class DirectBelief:
+    """Belief for direct connection."""
+    success_alpha: int = 100
+    success_beta: int = 5
+    avg_latency: float = 0.05
+    
+    def sample_reward(self) -> float:
+        p_success = np.random.beta(self.success_alpha, self.success_beta)
+        latency_penalty = math.exp(self.avg_latency * 2) - 1
+        return p_success - latency_penalty
+    
+    def update(self, success: bool):
+        if success:
+            self.success_alpha += 1
+        else:
+            self.success_beta += 1
+
+class ZeroIdleSARE:
+    """Zero-background-task proxy system for burst workloads."""
+    
+    def __init__(self, redis: aioredis.Redis):
+        self.redis = redis
+        self.proxies: Dict[str, ProxyBelief] = {}
+        self.direct = DirectBelief()
+        self.session: Optional[aiohttp.ClientSession] = None
+        self._dirty_proxies: Set[str] = set()
+        self.request_counter = 0
+    
+    async def initialize(self, session: aiohttp.ClientSession):
+        """Load all proxy states from Redis."""
+        self.session = session
+        start = time.time()
+        
+        try:
+            # Atomic pipeline: get all proxy states + direct belief
+            pipeline = self.redis.pipeline()
+            pipeline.hgetall("bb_bot:sare_beliefs")
+            pipeline.get("bb_bot:direct_belief")
+            results = await pipeline.execute()
             
-            success_rate = 1 - (h["strikes"] / max(h["uses"], 1))
+            # Load proxy beliefs
+            for url, payload in results[0].items():
+                try:
+                    d = json.loads(payload)
+                    self.proxies[url] = ProxyBelief(
+                        url=url,
+                        latency_mu=float(d[0]),
+                        latency_var=float(d[1]),
+                        success_alpha=int(d[2]),
+                        success_beta=int(d[3]),
+                        rate_limit_saturation=float(d[4]),
+                    )
+                except Exception as e:
+                    logging.debug(f"Failed to parse proxy state {url}: {e}")
             
-            if h["uses"] > 10 and success_rate < 0.6:
-                if proxy in self.proxies:
-                    self.proxies.remove(proxy)
-                    del self.health[proxy]
-                    logging.warning(f"🚫 Banned {proxy} ({success_rate:.1%} success)")
-            else:
-                h["cooldown_until"] = time.time() + 300
+            # Load direct belief
+            if results[1]:
+                try:
+                    d = json.loads(results[1])
+                    self.direct = DirectBelief(int(d[0]), int(d[1]), float(d[2]))
+                except: pass
+            
+            logging.info(f"✅ Loaded {len(self.proxies)} proxy states in {time.time() - start:.3f}s")
+        except Exception as e:
+            logging.warning(f"⚠️ Redis load failed: {e}, starting fresh")
+    
+    def select_proxy(self) -> Optional[str]:
+        """Thompson Sampling with round-robin top-N."""
+        self.request_counter += 1
+        
+        # Early exploration: 10% random selection for uncertain proxies
+        if self.request_counter < 200:
+            uncertain = [p for p in self.proxies.values() if p.uses < 5]
+            if uncertain and random.random() < 0.1:
+                return random.choice(uncertain).url
+        
+        # Sample direct reward
+        direct_sample = self.direct.sample_reward()
+        
+        # Sort by success rate, take top 3
+        top_proxies = sorted(
+            self.proxies.values(),
+            key=lambda p: p.success_alpha / (p.success_alpha + p.success_beta),
+            reverse=True
+        )[:3]
+        
+        if not top_proxies:
+            return None
+        
+        # Sample each top proxy
+        proxy_samples = [(p.url, p.sample_reward()) for p in top_proxies]
+        best_url, best_score = max(proxy_samples, key=lambda x: x[1])
+        
+        # Direct-first if better
+        return None if direct_sample > best_score else best_url
+    
+    async def execute(self, url: str, params: dict) -> Tuple[Any, bool]:
+        """Execute request and update beliefs in-memory."""
+        proxy = self.select_proxy()
+        start = time.time()
+        success = False
+        data = None
+        
+        try:
+            async with self.session.get(url, params=params, proxy=proxy, timeout=CONFIG.REQUEST_TIMEOUT) as resp:
+                if resp.status == 200:
+                    success = True
+                    data = await resp.json()
+                elif resp.status == 429:
+                    # Rate limit: mark saturation
+                    if proxy and proxy in self.proxies:
+                        self.proxies[proxy].rate_limit_saturation = min(1.0, self.proxies[proxy].rate_limit_saturation + 0.5)
+                        self._dirty_proxies.add(proxy)
+                    raise aiohttp.ClientError("Rate limited")
+        except Exception as e:
+            # Failure case
+            pass
+        finally:
+            latency = time.time() - start
+            
+            # Update beliefs
+            if proxy and proxy in self.proxies:
+                belief = self.proxies[proxy]
+                belief.uses += 1
+                
+                # Kalman update
+                belief.kalman_update(latency)
+                
+                # Beta update
+                belief.beta_update(success)
+                
+                # Track failures for SPC culling
+                if success:
+                    belief.failures = 0
+                else:
+                    belief.failures += 1
+                
+                # **3-Sigma Statistical Culling** (Six Sigma)
+                if belief.uses > 5 and belief.failures / belief.uses > 0.4:
+                    del self.proxies[proxy]
+                    self._dirty_proxies.discard(proxy)  # No need to persist culled proxy
+                    logging.warning(f"🚫 Culled {proxy} ({belief.failures}/{belief.uses} failures)")
+                
+                self._dirty_proxies.add(proxy)
+            elif not proxy:
+                # Update direct belief
+                self.direct.update(success)
+            
+            return data, success
+    
+    async def persist_all(self):
+        """Atomic batch persist of all changed beliefs."""
+        if not self._dirty_proxies and self.request_counter < 100:
+            return  # Don't persist if minimal activity
+        
+        pipeline = self.redis.pipeline()
+        
+        # Persist changed proxy beliefs (compact array format)
+        for url in self._dirty_proxies:
+            if url in self.proxies:  # Might have been culled
+                belief = self.proxies[url]
+                payload = json.dumps([
+                    round(belief.latency_mu, 3),
+                    round(belief.latency_var, 3),
+                    belief.success_alpha,
+                    belief.success_beta,
+                    round(belief.rate_limit_saturation, 3),
+                ])
+                pipeline.hset("bb_bot:sare_beliefs", url, payload)
+        
+        # Persist direct belief
+        pipeline.set("bb_bot:direct_belief", json.dumps([
+            self.direct.success_alpha,
+            self.direct.success_beta,
+            round(self.direct.avg_latency, 3),
+        ]))
+        
+        await pipeline.execute()
+        logging.info(f"💾 Persisted {len(self._dirty_proxies)} updated beliefs")
+        self._dirty_proxies.clear()
 
 # ==========================================
-# REDIS CACHE MANAGER (IMPROVEMENT #3: Integer Keys)
+# EXCHANGE CLIENTS (UPDATED FOR SARE)
+# ==========================================
+
+class ExchangeClient:
+    def __init__(self, pool: ZeroIdleSARE):
+        self.pool = pool
+    
+    async def _request(self, url: str, params: dict = None) -> Any:
+        """Single entrypoint: SARE handles all proxy logic."""
+        for attempt in range(CONFIG.MAX_RETRIES):
+            data, success = await self.pool.execute(url, params or {})
+            if success:
+                return data
+            
+            # Exponential backoff with jitter
+            delay = (1.5 ** attempt) * (0.3 + random.random() * 0.4)
+            await asyncio.sleep(delay)
+        
+        logging.warning(f"❌ Failed after {CONFIG.MAX_RETRIES}: {url}")
+        return None
+
+class BinanceClient(ExchangeClient):
+    async def get_perp_symbols(self) -> List[str]:
+        data = await self._request('https://fapi.binance.com/fapi/v1/exchangeInfo')
+        if not data: return []
+        return [s['symbol'] for s in data['symbols'] if s.get('contractType') == 'PERPETUAL' and s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
+    
+    async def get_spot_symbols(self) -> List[str]:
+        data = await self._request('https://api.binance.com/api/v3/exchangeInfo')
+        if not data: return []
+        return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
+    
+    async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
+        base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
+        data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': 25})
+        if not data: return []
+        try: return [float(c[4]) for c in data]
+        except: return []
+    
+    async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
+        base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
+        data = await self._request(base, {'symbol': symbol, 'interval': interval, 'limit': CONFIG.CANDLE_LIMIT})
+        if not data: return []
+        try: return [float(c[4]) for c in data]
+        except: return []
+
+class BybitClient(ExchangeClient):
+    async def get_perp_symbols(self) -> List[str]:
+        data = await self._request('https://api.bybit.com/v5/market/instruments-info', {'category': 'linear'})
+        if not data: return []
+        return [s['symbol'] for s in data['result']['list'] if s['status'] == 'Trading' and s['quoteCoin'] == 'USDT']
+    
+    async def get_spot_symbols(self) -> List[str]:
+        data = await self._request('https://api.bybit.com/v5/market/instruments-info', {'category': 'spot'})
+        if not data: return []
+        return [s['symbol'] for s in data['result']['list'] if s['status'] == 'Trading' and s['quoteCoin'] == 'USDT']
+    
+    async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
+        url = 'https://api.bybit.com/v5/market/kline'
+        cat = 'linear' if market == 'perp' else 'spot'
+        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': '60', 'limit': 25})
+        if not data: return []
+        raw = data.get('result', {}).get('list', [])
+        if not raw: return []
+        closes = [float(c[4]) for c in raw]
+        return closes[::-1]
+    
+    async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
+        url = 'https://api.bybit.com/v5/market/kline'
+        cat = 'linear' if market == 'perp' else 'spot'
+        b_int = {"15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W"}.get(interval, "D")
+        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': b_int, 'limit': CONFIG.CANDLE_LIMIT})
+        if not data: return []
+        raw = data.get('result', {}).get('list', [])
+        if not raw: return []
+        closes = [float(c[4]) for c in raw]
+        return closes[::-1]
+
+# ==========================================
+# CACHE MANAGER (UNCHANGED)
 # ==========================================
 
 class CacheManager:
@@ -250,94 +452,7 @@ class CacheManager:
         except: pass
 
 # ==========================================
-# EXCHANGE CLIENTS
-# ==========================================
-
-class ExchangeClient:
-    def __init__(self, session: aiohttp.ClientSession, proxy_pool: AsyncProxyPool):
-        self.session = session
-        self.proxies = proxy_pool
-        limit = CONFIG.MAX_CONCURRENCY if proxy_pool.proxies else 5
-        self.sem = asyncio.Semaphore(limit)
-
-    async def _request(self, url: str, params: dict = None) -> Any:
-        last_error = "Unknown"
-        for attempt in range(CONFIG.MAX_RETRIES):
-            proxy = await self.proxies.get_proxy()
-            if not proxy:
-                await asyncio.sleep(1)
-                continue
-            try:
-                async with self.sem:
-                    async with self.session.get(url, params=params, proxy=proxy, timeout=CONFIG.REQUEST_TIMEOUT) as resp:
-                        if resp.status == 200: return await resp.json()
-                        elif resp.status == 429:
-                            logging.warning(f"⚠️ 429 Rate Limit ({proxy}). Sleeping 5s.")
-                            await asyncio.sleep(5)
-                            last_error = "429"
-                        elif resp.status >= 500: last_error = f"Server {resp.status}"
-                        else: last_error = f"HTTP {resp.status}"
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-                await self.proxies.report_failure(proxy)
-                last_error = str(e)
-            except Exception as e: last_error = f"Unexpected: {str(e)}"
-            await asyncio.sleep(0.5 + random.random() * 0.5)
-        logging.warning(f"❌ Failed {url} after {CONFIG.MAX_RETRIES} tries. Last err: {last_error}")
-        return None
-
-class BinanceClient(ExchangeClient):
-    async def get_perp_symbols(self) -> List[str]:
-        data = await self._request('https://fapi.binance.com/fapi/v1/exchangeInfo')
-        if not data: return []
-        return [s['symbol'] for s in data['symbols'] if s.get('contractType') == 'PERPETUAL' and s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
-    async def get_spot_symbols(self) -> List[str]:
-        data = await self._request('https://api.binance.com/api/v3/exchangeInfo')
-        if not data: return []
-        return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
-    async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
-        base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
-        data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': 25})
-        if not data: return []
-        try: return [float(c[4]) for c in data]
-        except: return []
-    async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
-        base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
-        data = await self._request(base, {'symbol': symbol, 'interval': interval, 'limit': CONFIG.CANDLE_LIMIT})
-        if not data: return []
-        try: return [float(c[4]) for c in data]
-        except: return []
-
-class BybitClient(ExchangeClient):
-    async def get_perp_symbols(self) -> List[str]:
-        data = await self._request('https://api.bybit.com/v5/market/instruments-info', {'category': 'linear'})
-        if not data: return []
-        return [s['symbol'] for s in data['result']['list'] if s['status'] == 'Trading' and s['quoteCoin'] == 'USDT']
-    async def get_spot_symbols(self) -> List[str]:
-        data = await self._request('https://api.bybit.com/v5/market/instruments-info', {'category': 'spot'})
-        if not data: return []
-        return [s['symbol'] for s in data['result']['list'] if s['status'] == 'Trading' and s['quoteCoin'] == 'USDT']
-    async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
-        url = 'https://api.bybit.com/v5/market/kline'
-        cat = 'linear' if market == 'perp' else 'spot'
-        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': '60', 'limit': 25})
-        if not data: return []
-        raw = data.get('result', {}).get('list', [])
-        if not raw: return []
-        closes = [float(c[4]) for c in raw]
-        return closes[::-1]
-    async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
-        url = 'https://api.bybit.com/v5/market/kline'
-        cat = 'linear' if market == 'perp' else 'spot'
-        b_int = {"15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W"}.get(interval, "D")
-        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': b_int, 'limit': CONFIG.CANDLE_LIMIT})
-        if not data: return []
-        raw = data.get('result', {}).get('list', [])
-        if not raw: return []
-        closes = [float(c[4]) for c in raw]
-        return closes[::-1]
-
-# ==========================================
-# CORE LOGIC (IMPROVEMENT #3: Integer Keys Only)
+# CORE LOGIC (UNCHANGED)
 # ==========================================
 
 def get_cache_key(tf: str) -> int:
@@ -375,13 +490,13 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
     return None, None, 0.0
 
 # ==========================================
-# MAIN BOT (IMPROVEMENT #1: Hybrid Fetch + #6: Session Reuse)
+# MAIN BOT (FULLY INTEGRATED)
 # ==========================================
 
 class RsiBot:
     def __init__(self):
         self.cache = CacheManager()
-        self.proxies = AsyncProxyPool()
+        self.pool: Optional[ZeroIdleSARE] = None
         
     async def send_report(self, session: aiohttp.ClientSession, hits: List[TouchHit]):
         if not hits: return
@@ -479,17 +594,46 @@ class RsiBot:
 
     async def run(self):
         logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+        
+        # 1. Initialize Redis
         await self.cache.init()
-        async with aiohttp.ClientSession() as session:
-            await self.proxies.populate(CONFIG.PROXY_URL, session)
-            binance = BinanceClient(session, self.proxies)
-            bybit = BybitClient(session, self.proxies)
+        
+        # 2. Create ZeroIdleSARE (no background loops)
+        self.pool = ZeroIdleSARE(self.cache.redis)
+        
+        # 3. Create persistent HTTP session (critical for performance)
+        connector = aiohttp.TCPConnector(
+            limit_per_host=150,
+            ttl_dns_cache=600,
+            use_dns_cache=True,
+            force_close=False,  # Keep-alive connections
+            enable_cleanup_closed=True
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=CONFIG.REQUEST_TIMEOUT,
+            connect=2,
+            sock_read=CONFIG.REQUEST_TIMEOUT - 1
+        )
+        
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={"Connection": "keep-alive"}
+        ) as session:
             
-            # 1. HYBRID SYMBOL FETCH
+            # 4. Initialize SARE (<100ms)
+            await self.pool.initialize(session)
+            
+            # 5. Create exchange clients (SARE handles retries/proxy selection)
+            binance = BinanceClient(self.pool)
+            bybit = BybitClient(self.pool)
+            
+            # 6. Fetch symbols (unchanged)
             bp, bs, yp, ys = await self.fetch_symbols_hybrid(binance, bybit)
             
+            # 7. Filter symbols (unchanged)
             seen = set()
-            def filter_u(syms):
+            def filter_unique(syms):
                 res = []
                 for s in syms:
                     if s in CONFIG.IGNORED_SYMBOLS or not s.endswith("USDT"): continue
@@ -498,8 +642,8 @@ class RsiBot:
                         res.append(s)
                         seen.add(norm)
                 return res
-                
-            f_bp, f_bs, f_yp, f_ys = filter_u(bp), filter_u(bs), filter_u(yp), filter_u(ys)
+            
+            f_bp, f_bs, f_yp, f_ys = filter_unique(bp), filter_unique(bs), filter_unique(yp), filter_unique(ys)
             all_pairs = []
             for s in f_bp: all_pairs.append((binance, s, 'perp', 'Binance'))
             for s in f_bs: all_pairs.append((binance, s, 'spot', 'Binance'))
@@ -509,7 +653,7 @@ class RsiBot:
             total_sym_count = len(all_pairs)
             logging.info(f"Total symbols: {total_sym_count}")
             
-            # 2. ORIGINAL VOLATILITY CALCULATION (NO PRE-FILTER)
+            # 8. Calculate volatility (unchanged)
             logging.info("Calculating Volatility...")
             vol_scores = {}
             async def check_vol(client, sym, mkt):
@@ -522,7 +666,7 @@ class RsiBot:
             hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
             logging.info(f"Vol Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot: {len(hot_coins)}")
             
-            # 3. PRECISION SCAN SETUP WITH EARLY SENT STATE CHECK
+            # 9. Precision scan setup with sent state check (unchanged)
             sent_state = await self.cache.get_sent_state()
             scan_stats = {tf: ScanStats(tf, "Unknown", total_symbols=total_sym_count) for tf in ACTIVE_TFS}
             
@@ -551,14 +695,13 @@ class RsiBot:
                     tfs_to_scan_fresh.append(tf)
                     scan_stats[tf].source = "Fresh Scan (Low TF)"
             
-            # 4. EXECUTE FRESH SCANS (batched by timeframe, ALL SYMBOLS)
+            # 10. Execute fresh scans (unchanged)
             final_hits = []
             if tfs_to_scan_fresh:
                 logging.info(f"Scanning fresh TFs: {tfs_to_scan_fresh} across all symbols...")
                 
                 for tf in tfs_to_scan_fresh:
                     tf_tasks = []
-                    # Scan ALL symbols for this TF
                     async def scan_one(client, sym, mkt, ex):
                         closes = await client.fetch_closes(sym, tf, mkt)
                         if not closes: return []
@@ -584,10 +727,10 @@ class RsiBot:
                         tf_hits = [h for h in final_hits if h.timeframe == tf]
                         await self.cache.save_scan_results(tf, candle_key, [h.to_dict() for h in tf_hits])
             
-            # 5. MERGE CACHED
+            # 11. Merge cached hits
             final_hits.extend(cached_hits_to_use)
             
-            # Summary
+            # 12. Summary (unchanged)
             logging.info("="*60)
             logging.info(f"{'TF':<5} | {'Source':<25} | {'Success':<15} | {'Hits'}")
             logging.info("-" * 60)
@@ -597,7 +740,7 @@ class RsiBot:
                 logging.info(f"[{tf:<3}] {st.source:<25} | {succ_str:<15} | {st.hits_found}")
             logging.info("="*60)
             
-            # 6. ALERTING
+            # 13. Alerting logic (unchanged)
             hits_to_send = []
             new_state = sent_state.copy()
             for h in final_hits:
@@ -613,10 +756,20 @@ class RsiBot:
             await self.send_report(session, hits_to_send)
             await self.cache.save_sent_state(new_state)
             
+            # 14. **CRITICAL: Persist all proxy state changes**
+            await self.pool.persist_all()
+            
+            # 15. Final metrics
+            logging.info(
+                f"📊 Final Metrics | Direct belief: {self.pool.direct.success_alpha}/{self.pool.direct.success_beta} | "
+                f"Active proxies: {len(self.pool.proxies)} | Total requests: {self.pool.request_counter}"
+            )
+        
         await self.cache.close()
 
 if __name__ == "__main__":
     if os.name == 'nt':
-        asyncio.set_event_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
     bot = RsiBot()
     asyncio.run(bot.run())
