@@ -62,34 +62,7 @@ MIDDLE_BAND_TFS = ['15m', '30m', '1h', '2h', '4h', '1d', '1w']
 CACHED_TFS = {'2h', '4h', '1d', '1w'}
 
 # ==========================================
-# DATA MODELS (UNCHANGED)
-# ==========================================
-
-@dataclass
-class TouchHit:
-    symbol: str
-    exchange: str 
-    market: str   
-    timeframe: str
-    rsi: float
-    touch_type: str
-    direction: str = "" 
-    hot: bool = False
-    
-    def to_dict(self): return asdict(self)
-    @staticmethod
-    def from_dict(d): return TouchHit(**d)
-
-@dataclass
-class ScanStats:
-    timeframe: str
-    source: str
-    total_symbols: int = 0
-    successful_scans: int = 0
-    hits_found: int = 0
-
-# ==========================================
-# ZERO-IDLE SARE (MATHEMATICAL CORE)
+# PROXY STATE MODELS (ALWAYS-PROXY EDITION)
 # ==========================================
 
 @dataclass
@@ -111,7 +84,7 @@ class ProxyBelief:
         self.latency_var = (1 - kalman_gain) * self.latency_var + 0.01
     
     def beta_update(self, success: bool):
-        """Conjugate prior update with forgetting."""
+        """Conjugate prior update with exponential forgetting."""
         if success:
             self.success_alpha += 1
         else:
@@ -123,53 +96,38 @@ class ProxyBelief:
             self.success_beta *= 0.99
     
     def sample_reward(self) -> float:
-        """Thompson Sampling: draw from posterior."""
+        """Thompson Sampling: maximize expected reward."""
         p_success = np.random.beta(self.success_alpha, self.success_beta)
         latency_sample = np.random.normal(self.latency_mu, max(0.01, self.latency_var))
         return p_success - (latency_sample * 2.0) - (self.rate_limit_saturation * 0.5)
 
-@dataclass
-class DirectBelief:
-    """Belief for direct connection."""
-    success_alpha: int = 100
-    success_beta: int = 5
-    avg_latency: float = 0.05
-    
-    def sample_reward(self) -> float:
-        p_success = np.random.beta(self.success_alpha, self.success_beta)
-        latency_penalty = math.exp(self.avg_latency * 2) - 1
-        return p_success - latency_penalty
-    
-    def update(self, success: bool):
-        if success:
-            self.success_alpha += 1
-        else:
-            self.success_beta += 1
+# ==========================================
+# ZERO-IDLE SARE (ALWAYS-PROXY EDITION)
+# ==========================================
 
 class ZeroIdleSARE:
-    """Zero-background-task proxy system for burst workloads."""
+    """Proxy system that NEVER uses direct connection."""
     
-    def __init__(self, redis: aioredis.Redis):
+    def __init__(self, redis: aioredis.Redis, proxy_url: str):
         self.redis = redis
+        self.proxy_url = proxy_url
         self.proxies: Dict[str, ProxyBelief] = {}
-        self.direct = DirectBelief()
         self.session: Optional[aiohttp.ClientSession] = None
         self._dirty_proxies: Set[str] = set()
         self.request_counter = 0
+        self._lock = asyncio.Lock()
     
     async def initialize(self, session: aiohttp.ClientSession):
-        """Load all proxy states from Redis."""
+        """Load proxy states and populate if empty."""
         self.session = session
         start = time.time()
         
+        # Load existing states
         try:
-            # Atomic pipeline: get all proxy states + direct belief
             pipeline = self.redis.pipeline()
             pipeline.hgetall("bb_bot:sare_beliefs")
-            pipeline.get("bb_bot:direct_belief")
             results = await pipeline.execute()
             
-            # Load proxy beliefs
             for url, payload in results[0].items():
                 try:
                     d = json.loads(payload)
@@ -181,34 +139,59 @@ class ZeroIdleSARE:
                         success_beta=int(d[3]),
                         rate_limit_saturation=float(d[4]),
                     )
-                except Exception as e:
-                    logging.debug(f"Failed to parse proxy state {url}: {e}")
-            
-            # Load direct belief
-            if results[1]:
-                try:
-                    d = json.loads(results[1])
-                    self.direct = DirectBelief(int(d[0]), int(d[1]), float(d[2]))
                 except: pass
             
             logging.info(f"✅ Loaded {len(self.proxies)} proxy states in {time.time() - start:.3f}s")
         except Exception as e:
             logging.warning(f"⚠️ Redis load failed: {e}, starting fresh")
+        
+        # **CRITICAL**: If no proxies, populate from source URL
+        if len(self.proxies) < 5:
+            logging.warning("🚨 Proxy pool too small, fetching fresh proxies...")
+            await self._populate_proxy_pool()
+    
+    async def _populate_proxy_pool(self):
+        """Fetch and validate proxies from URL."""
+        try:
+            async with aiohttp.ClientSession() as temp_session:
+                async with temp_session.get(self.proxy_url, timeout=15) as resp:
+                    text = await resp.text()
+                    
+                    # Parse proxies
+                    new_proxies = []
+                    for line in text.splitlines():
+                        p = line.strip()
+                        if p and ":" in p:
+                            url = p if "://" in p else f"http://{p}"
+                            new_proxies.append(url)
+                    
+                    # Add to pool with initial belief
+                    async with self._lock:
+                        for url in new_proxies[:50]:  # Limit to 50
+                            if url not in self.proxies:
+                                self.proxies[url] = ProxyBelief(url=url)
+                    
+                    logging.info(f"📥 Added {len(new_proxies)} proxies from source")
+        except Exception as e:
+            logging.error(f"❌ Proxy population failed: {e}")
     
     def select_proxy(self) -> Optional[str]:
-        """Thompson Sampling with round-robin top-N."""
+        """Thompson Sampling: MUST return a proxy."""
+        # Try to get best proxy
+        if not self.proxies:
+            # Emergency: return any proxy we can find
+            logging.error("🚨 NO PROXIES AVAILABLE!")
+            return None
+        
         self.request_counter += 1
         
-        # Early exploration: 10% random selection for uncertain proxies
+        # Early exploration for uncertain proxies
         if self.request_counter < 200:
             uncertain = [p for p in self.proxies.values() if p.uses < 5]
             if uncertain and random.random() < 0.1:
                 return random.choice(uncertain).url
         
-        # Sample direct reward
-        direct_sample = self.direct.sample_reward()
-        
-        # Sort by success rate, take top 3
+        # Sample top 3 proxies by success rate
         top_proxies = sorted(
             self.proxies.values(),
             key=lambda p: p.success_alpha / (p.success_alpha + p.success_beta),
@@ -216,18 +199,23 @@ class ZeroIdleSARE:
         )[:3]
         
         if not top_proxies:
-            return None
+            # Fallback to any proxy
+            return random.choice(list(self.proxies.keys()))
         
-        # Sample each top proxy
+        # Thompson Sampling: pick best sample
         proxy_samples = [(p.url, p.sample_reward()) for p in top_proxies]
-        best_url, best_score = max(proxy_samples, key=lambda x: x[1])
-        
-        # Direct-first if better
-        return None if direct_sample > best_score else best_url
+        best_url, _ = max(proxy_samples, key=lambda x: x[1])
+        return best_url
     
     async def execute(self, url: str, params: dict) -> Tuple[Any, bool]:
-        """Execute request and update beliefs in-memory."""
+        """Execute request and update beliefs."""
         proxy = self.select_proxy()
+        
+        # **BLOCKED LOCATION FIX**: If no proxy, fail immediately
+        if not proxy:
+            logging.error("❌ No proxy available - request blocked")
+            return None, False
+        
         start = time.time()
         success = False
         data = None
@@ -238,55 +226,51 @@ class ZeroIdleSARE:
                     success = True
                     data = await resp.json()
                 elif resp.status == 429:
-                    # Rate limit: mark saturation
-                    if proxy and proxy in self.proxies:
+                    # Rate limit detected
+                    if proxy in self.proxies:
                         self.proxies[proxy].rate_limit_saturation = min(1.0, self.proxies[proxy].rate_limit_saturation + 0.5)
                         self._dirty_proxies.add(proxy)
-                    raise aiohttp.ClientError("Rate limited")
+                    logging.debug(f"🐌 Proxy {proxy} rate limited")
         except Exception as e:
-            # Failure case
-            pass
+            # Network failure
+            logging.debug(f"❌ Request failed via {proxy}: {e}")
         finally:
             latency = time.time() - start
             
             # Update beliefs
-            if proxy and proxy in self.proxies:
+            if proxy in self.proxies:
                 belief = self.proxies[proxy]
                 belief.uses += 1
                 
-                # Kalman update
+                # Kalman update for latency
                 belief.kalman_update(latency)
                 
-                # Beta update
+                # Beta update for success/failure
                 belief.beta_update(success)
                 
-                # Track failures for SPC culling
+                # Track consecutive failures for SPC
                 if success:
                     belief.failures = 0
                 else:
                     belief.failures += 1
                 
-                # **3-Sigma Statistical Culling** (Six Sigma)
+                # **3-Sigma Statistical Culling**
                 if belief.uses > 5 and belief.failures / belief.uses > 0.4:
                     del self.proxies[proxy]
-                    self._dirty_proxies.discard(proxy)  # No need to persist culled proxy
+                    self._dirty_proxies.discard(proxy)  # Remove from persist set
                     logging.warning(f"🚫 Culled {proxy} ({belief.failures}/{belief.uses} failures)")
                 
                 self._dirty_proxies.add(proxy)
-            elif not proxy:
-                # Update direct belief
-                self.direct.update(success)
             
             return data, success
     
     async def persist_all(self):
-        """Atomic batch persist of all changed beliefs."""
-        if not self._dirty_proxies and self.request_counter < 100:
-            return  # Don't persist if minimal activity
+        """Batch persist all changed beliefs."""
+        if not self._dirty_proxies:
+            return
         
         pipeline = self.redis.pipeline()
         
-        # Persist changed proxy beliefs (compact array format)
         for url in self._dirty_proxies:
             if url in self.proxies:  # Might have been culled
                 belief = self.proxies[url]
@@ -299,19 +283,12 @@ class ZeroIdleSARE:
                 ])
                 pipeline.hset("bb_bot:sare_beliefs", url, payload)
         
-        # Persist direct belief
-        pipeline.set("bb_bot:direct_belief", json.dumps([
-            self.direct.success_alpha,
-            self.direct.success_beta,
-            round(self.direct.avg_latency, 3),
-        ]))
-        
         await pipeline.execute()
-        logging.info(f"💾 Persisted {len(self._dirty_proxies)} updated beliefs")
+        logging.info(f"💾 Persisted {len(self._dirty_proxies)} updated proxy beliefs")
         self._dirty_proxies.clear()
 
 # ==========================================
-# EXCHANGE CLIENTS (UPDATED FOR SARE)
+# EXCHANGE CLIENTS (NOW ALWAYS-PROXY)
 # ==========================================
 
 class ExchangeClient:
@@ -319,7 +296,7 @@ class ExchangeClient:
         self.pool = pool
     
     async def _request(self, url: str, params: dict = None) -> Any:
-        """Single entrypoint: SARE handles all proxy logic."""
+        """All requests go through SARE (proxy only)."""
         for attempt in range(CONFIG.MAX_RETRIES):
             data, success = await self.pool.execute(url, params or {})
             if success:
@@ -490,7 +467,7 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
     return None, None, 0.0
 
 # ==========================================
-# MAIN BOT (FULLY INTEGRATED)
+# MAIN BOT (CORRECTED SUCCESS TRACKING)
 # ==========================================
 
 class RsiBot:
@@ -598,15 +575,15 @@ class RsiBot:
         # 1. Initialize Redis
         await self.cache.init()
         
-        # 2. Create ZeroIdleSARE (no background loops)
-        self.pool = ZeroIdleSARE(self.cache.redis)
+        # 2. Create ZeroIdleSARE (always-proxy edition)
+        self.pool = ZeroIdleSARE(self.cache.redis, CONFIG.PROXY_URL)
         
-        # 3. Create persistent HTTP session (critical for performance)
+        # 3. Create persistent HTTP session
         connector = aiohttp.TCPConnector(
             limit_per_host=150,
             ttl_dns_cache=600,
             use_dns_cache=True,
-            force_close=False,  # Keep-alive connections
+            force_close=False,  # Keep-alive
             enable_cleanup_closed=True
         )
         timeout = aiohttp.ClientTimeout(
@@ -621,17 +598,17 @@ class RsiBot:
             headers={"Connection": "keep-alive"}
         ) as session:
             
-            # 4. Initialize SARE (<100ms)
+            # 4. Initialize SARE (loads state + populates if empty)
             await self.pool.initialize(session)
             
-            # 5. Create exchange clients (SARE handles retries/proxy selection)
+            # 5. Create exchange clients
             binance = BinanceClient(self.pool)
             bybit = BybitClient(self.pool)
             
-            # 6. Fetch symbols (unchanged)
+            # 6. Fetch symbols
             bp, bs, yp, ys = await self.fetch_symbols_hybrid(binance, bybit)
             
-            # 7. Filter symbols (unchanged)
+            # 7. Filter symbols
             seen = set()
             def filter_unique(syms):
                 res = []
@@ -653,7 +630,7 @@ class RsiBot:
             total_sym_count = len(all_pairs)
             logging.info(f"Total symbols: {total_sym_count}")
             
-            # 8. Calculate volatility (unchanged)
+            # 8. Calculate volatility
             logging.info("Calculating Volatility...")
             vol_scores = {}
             async def check_vol(client, sym, mkt):
@@ -666,7 +643,7 @@ class RsiBot:
             hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
             logging.info(f"Vol Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot: {len(hot_coins)}")
             
-            # 9. Precision scan setup with sent state check (unchanged)
+            # 9. Precision scan setup with sent state check
             sent_state = await self.cache.get_sent_state()
             scan_stats = {tf: ScanStats(tf, "Unknown", total_symbols=total_sym_count) for tf in ACTIVE_TFS}
             
@@ -695,20 +672,25 @@ class RsiBot:
                     tfs_to_scan_fresh.append(tf)
                     scan_stats[tf].source = "Fresh Scan (Low TF)"
             
-            # 10. Execute fresh scans (unchanged)
+            # 10. Execute fresh scans
             final_hits = []
             if tfs_to_scan_fresh:
                 logging.info(f"Scanning fresh TFs: {tfs_to_scan_fresh} across all symbols...")
                 
                 for tf in tfs_to_scan_fresh:
                     tf_tasks = []
+                    
+                    # **FIXED**: Track actual successful data returns
+                    actual_successes = 0
+                    
                     async def scan_one(client, sym, mkt, ex):
                         closes = await client.fetch_closes(sym, tf, mkt)
-                        if not closes: return []
+                        if not closes:  # **FIXED**: Return None on failure
+                            return None
                         t_type, direction, rsi_val = check_bb_rsi(closes, tf)
                         if t_type:
                             return [TouchHit(sym, ex, mkt, tf, rsi_val, t_type, direction, sym in hot_coins)]
-                        return []
+                        return []  # Success but no pattern found
                     
                     for client, sym, mkt, ex in all_pairs:
                         tf_tasks.append(scan_one(client, sym, mkt, ex))
@@ -716,21 +698,25 @@ class RsiBot:
                     results = await asyncio.gather(*tf_tasks, return_exceptions=True)
                     
                     for result in results:
-                        if isinstance(result, list):
+                        if isinstance(result, list):  # **FIXED**: Only actual data is success
                             final_hits.extend(result)
                             scan_stats[tf].hits_found += len(result)
+                            if result:  # If got any data back
+                                actual_successes += 1
+                        elif result is None:  # **FIXED**: Network failure
+                            pass
                     
-                    scan_stats[tf].successful_scans = len([r for r in results if not isinstance(r, Exception)])
+                    scan_stats[tf].successful_scans = actual_successes  # **FIXED**: Real success count
                     
                     if tf in CACHED_TFS:
                         candle_key = get_cache_key(tf)
                         tf_hits = [h for h in final_hits if h.timeframe == tf]
                         await self.cache.save_scan_results(tf, candle_key, [h.to_dict() for h in tf_hits])
             
-            # 11. Merge cached hits
+            # 11. Merge cached
             final_hits.extend(cached_hits_to_use)
             
-            # 12. Summary (unchanged)
+            # 12. Summary (now shows real success rate)
             logging.info("="*60)
             logging.info(f"{'TF':<5} | {'Source':<25} | {'Success':<15} | {'Hits'}")
             logging.info("-" * 60)
@@ -740,7 +726,7 @@ class RsiBot:
                 logging.info(f"[{tf:<3}] {st.source:<25} | {succ_str:<15} | {st.hits_found}")
             logging.info("="*60)
             
-            # 13. Alerting logic (unchanged)
+            # 13. Alerting
             hits_to_send = []
             new_state = sent_state.copy()
             for h in final_hits:
@@ -756,13 +742,14 @@ class RsiBot:
             await self.send_report(session, hits_to_send)
             await self.cache.save_sent_state(new_state)
             
-            # 14. **CRITICAL: Persist all proxy state changes**
+            # 14. Persist proxy beliefs
             await self.pool.persist_all()
             
             # 15. Final metrics
             logging.info(
-                f"📊 Final Metrics | Direct belief: {self.pool.direct.success_alpha}/{self.pool.direct.success_beta} | "
-                f"Active proxies: {len(self.pool.proxies)} | Total requests: {self.pool.request_counter}"
+                f"📊 Final | Proxies: {len(self.pool.proxies)} | "
+                f"Requests: {self.pool.request_counter} | "
+                f"Dirty: {len(self.pool._dirty_proxies)}"
             )
         
         await self.cache.close()
