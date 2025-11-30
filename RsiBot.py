@@ -140,18 +140,17 @@ class AsyncProxyPool:
         else:
             logging.error("❌ NO WORKING PROXIES FOUND!")
 
-    async def _test_proxy(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool]:
+    async def _test_proxy_lightweight(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool, float]:
+        """Fast proxy test using HEAD request."""
+        start = time.time()
         try:
-            url = "https://fapi.binance.com/fapi/v1/klines"
-            params = {"symbol": "BTCUSDT", "interval": "1m", "limit": "2"}
-            async with session.get(url, params=params, proxy=proxy, timeout=7) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        return proxy, True
-                return proxy, False
+            # Use a lightweight endpoint
+            url = "https://fapi.binance.com/fapi/v1/ping"
+            async with session.head(url, proxy=proxy, timeout=3) as resp:
+                latency = time.time() - start
+                return proxy, resp.status == 200, latency
         except:
-            return proxy, False
+            return proxy, False, 999.0
 
     async def get_proxy(self) -> Optional[str]:
         if not self.proxies: return None
