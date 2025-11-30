@@ -387,66 +387,78 @@ class RsiBot:
     async def send_report(self, session: aiohttp.ClientSession, hits: List[TouchHit]):
         if not hits: return
 
-        # 1. Group hits
         grouped = {}
         for h in hits: grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
 
         tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
         ts_footer = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
 
-        # 2. Process and Send ONE Timeframe at a time
+        # Helper to shorten names
+        def clean_name(s):
+            # Remove USDT
+            s = s.replace("USDT", "")
+            # Remove common numeric prefixes
+            s = re.sub(r"^(10+|100+|1000+|1M)", "", s) 
+            return s
+
         for tf in tf_order:
             if tf not in grouped: continue
             
             total_hits = sum(len(grouped[tf].get(t, [])) for t in ["UPPER", "MIDDLE", "LOWER"])
             if total_hits == 0: continue
 
-            # --- Build Lines for THIS Timeframe ---
             tf_lines = []
             tf_lines.append(f"⏱ *{tf} Timeframe* ({total_hits})")
 
-            # Processing Order: Upper -> Middle -> Lower
             targets = ["UPPER", "MIDDLE", "LOWER"]
-
             for t in targets:
                 items = grouped[tf].get(t, [])
                 if not items: continue
                 
-                # Sort: Descending (High RSI) for Upper/Middle, Ascending (Low RSI) for Lower
                 items.sort(key=lambda x: x.rsi, reverse=(t != "LOWER"))
                 
-                # Headers with specific icons
                 if t == "UPPER":    header = "\n🔼 *UPPER BAND*"
                 elif t == "MIDDLE": header = "\n💠 *MIDDLE BAND*"
                 else:               header = "\n🔽 *LOWER BAND*"
-                
                 tf_lines.append(header)
 
-                # Chunk items into groups of 3
-                chunk_size = 3
-                for i in range(0, len(items), chunk_size):
-                    chunk = items[i:i + chunk_size]
-                    row_parts = []
-                    
-                    for item in chunk:
-                        sym = item.symbol.replace("USDT", "")
-                        fire = "🔥" if item.hot else ""
-                        
-                        # Direction arrows for Middle BB
-                        dir_arrow = ""
-                        if t == "MIDDLE":
-                            # ↘ means crossing down (bearish), ↗ means crossing up (bullish)
-                            dir_arrow = "↘" if item.direction == "from above" else "↗"
-                        
-                        # Format: SYM 12.3↘🔥
-                        row_parts.append(f"{sym} `{item.rsi:.1f}`{dir_arrow}{fire}")
-                    
-                    # Join with a bullet point
-                    tf_lines.append(" • ".join(row_parts))
+                # --- Smart Grid Logic ---
+                current_line = []
+                current_char_count = 0
+                MAX_CHARS = 28 # Safe limit for mobile (allows for bullet points)
 
-            tf_lines.append("") # Spacer at bottom of message
+                for item in items:
+                    sym = clean_name(item.symbol)
+                    fire = "🔥" if item.hot else ""
+                    
+                    # Direction arrows for Middle BB
+                    dir_arrow = ""
+                    if t == "MIDDLE":
+                        dir_arrow = "↘" if item.direction == "from above" else "↗"
 
-            # --- Send THIS Timeframe (Chunking if needed) ---
+                    # Construct the cell: "BTC 70.1"
+                    # We use fixed width for the symbol to align them nicely (max 6 chars)
+                    # The 　 is an ideographic space which is wider/better for alignment than normal space
+                    cell = f"{sym} `{item.rsi:.1f}`{dir_arrow}{fire}"
+                    cell_len = len(sym) + 6 # approx visual length
+                    
+                    # Check if adding this cell breaks the line limit
+                    if current_char_count + cell_len > MAX_CHARS:
+                        # Flush current line
+                        tf_lines.append(" • ".join(current_line))
+                        current_line = []
+                        current_char_count = 0
+                    
+                    current_line.append(cell)
+                    current_char_count += cell_len + 3 # +3 for " • "
+
+                # Flush remaining items
+                if current_line:
+                    tf_lines.append(" • ".join(current_line))
+
+            tf_lines.append("")
+
+            # --- Send Logic ---
             current_msg = []
             current_len = 0
 
@@ -457,20 +469,19 @@ class RsiBot:
                 try:
                     await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
                                      json={"chat_id": CONFIG.CHAT_ID, "text": text, "parse_mode": "Markdown"})
-                    await asyncio.sleep(0.5) # Rate limit safety
+                    await asyncio.sleep(0.5)
                 except Exception as e:
                     logging.error(f"TG Send Fail: {e}")
                 current_msg = []
                 current_len = 0
 
             for line in tf_lines:
-                # 3800 chars limit safety buffer
                 if current_len + len(line) + 10 > 3800:
                     await flush()
                 current_msg.append(line)
                 current_len += len(line) + 1
             
-            await flush() # Send the final piece of this timeframe
+            await flush()
 
     async def fetch_symbols_hybrid(self, binance: BinanceClient, bybit: BybitClient) -> Tuple[List[str], List[str], List[str], List[str]]:
         """Fetches symbols with per-exchange fallback to cache."""
