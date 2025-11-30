@@ -387,26 +387,28 @@ class RsiBot:
     async def send_report(self, session: aiohttp.ClientSession, hits: List[TouchHit]):
         if not hits: return
 
-        # 1. Group hits
+        # 1. Group hits by timeframe and type
         grouped = {}
         for h in hits: grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
 
-        # 2. Prepare ALL lines first
-        all_lines = []
+        # 2. Define headers and order
         tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
         headers = {"UPPER": "⬆️ UPPER BB", "MIDDLE": "🔶 MIDDLE BB", "LOWER": "⬇️ LOWER BB"}
-
+        
+        # 3. Build the message line-by-line
+        all_lines = []
         for tf in tf_order:
             if tf not in grouped: continue
             
             total_hits = sum(len(grouped[tf].get(t, [])) for t in ["UPPER", "MIDDLE", "LOWER"])
             if total_hits == 0: continue
 
+            # Add Timeframe Header
             all_lines.append(f" ▣ TIMEFRAME: {tf} ({total_hits} Hits)")
             all_lines.append("─────────────────────────")
 
-            found = [t for t in ["UPPER", "MIDDLE", "LOWER"] if grouped[tf].get(t)]
-            for t in found:
+            found_types = [t for t in ["UPPER", "MIDDLE", "LOWER"] if grouped[tf].get(t)]
+            for t in found_types:
                 items = grouped[tf].get(t, [])
                 items.sort(key=lambda x: x.symbol)
                 
@@ -421,13 +423,14 @@ class RsiBot:
                         ext = f" {'🔻' if item.direction=='from above' else '🔹'}"
                     if item.hot: ext += " 🔥"
                     
+                    # Add the hit line
                     all_lines.append(f"{prefix} {icon} *{sym_clean}* ➜ *{item.rsi:.2f}*{ext}")
-                all_lines.append("") # Spacer
+                all_lines.append("") # Spacer between sections
             
             all_lines.append("─────────────────────────")
-            all_lines.append("") # Block Spacer
+            all_lines.append("") # Spacer between timeframes
 
-        # 3. Send in Safe Chunks
+        # 4. Send in Safe Chunks (Max 3800 chars per message)
         if not all_lines: return
 
         current_msg = []
@@ -438,12 +441,12 @@ class RsiBot:
             nonlocal current_msg, current_len
             if not current_msg: return
             
-            # Add footer to every message chunk
+            # Add footer to every chunk so you know when it was sent
             text = "\n".join(current_msg) + f"\n\n{ts_footer}"
             try:
                 await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
                                  json={"chat_id": CONFIG.CHAT_ID, "text": text, "parse_mode": "Markdown"})
-                await asyncio.sleep(0.5) # Rate limit safety
+                await asyncio.sleep(0.5) # Prevent flooding limits
             except Exception as e:
                 logging.error(f"TG Send Fail: {e}")
             
@@ -451,13 +454,14 @@ class RsiBot:
             current_len = 0
 
         for line in all_lines:
-            # 3800 leaves room for footer and overhead
+            # If adding this line exceeds safe limit, send current buffer first
             if current_len + len(line) + 10 > 3800:
                 await flush()
             
             current_msg.append(line)
             current_len += len(line) + 1
 
+        # Send whatever is left
         await flush()
 
     async def fetch_symbols_hybrid(self, binance: BinanceClient, bybit: BybitClient) -> Tuple[List[str], List[str], List[str], List[str]]:
