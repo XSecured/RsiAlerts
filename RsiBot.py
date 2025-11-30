@@ -395,9 +395,7 @@ class RsiBot:
 
         # Helper to shorten names
         def clean_name(s):
-            # Remove USDT
             s = s.replace("USDT", "")
-            # Remove common numeric prefixes
             s = re.sub(r"^(10+|100+|1000+|1M)", "", s) 
             return s
 
@@ -408,7 +406,10 @@ class RsiBot:
             if total_hits == 0: continue
 
             tf_lines = []
-            tf_lines.append(f"⏱ *{tf} Timeframe* ({total_hits})")
+            # We pad the title with a special space to FORCE the bubble to be wide
+            # This prevents the "narrowing" effect on Android
+            header_pad = " " * 15 
+            tf_lines.append(f"⏱ *{tf} Timeframe* ({total_hits}){header_pad}")
 
             targets = ["UPPER", "MIDDLE", "LOWER"]
             for t in targets:
@@ -425,7 +426,7 @@ class RsiBot:
                 # --- Smart Grid Logic ---
                 current_line = []
                 current_char_count = 0
-                MAX_CHARS = 28 # Safe limit for mobile (allows for bullet points)
+                MAX_CHARS = 26 # Slightly tighter to ensure 3 columns fit without wrap
 
                 for item in items:
                     sym = clean_name(item.symbol)
@@ -434,27 +435,24 @@ class RsiBot:
                     # Direction arrows for Middle BB
                     dir_arrow = ""
                     if t == "MIDDLE":
-                        dir_arrow = "↘" if item.direction == "from above" else "↗"
+                        dir_arrow = "↓" if item.direction == "from above" else ""
 
                     # Construct the cell: "BTC 70.1"
-                    # We use fixed width for the symbol to align them nicely (max 6 chars)
-                    # The 　 is an ideographic space which is wider/better for alignment than normal space
+                    # Using a hyphen instead of bullet
                     cell = f"{sym} `{item.rsi:.1f}`{dir_arrow}{fire}"
-                    cell_len = len(sym) + 6 # approx visual length
+                    cell_len = len(sym) + 6 
                     
-                    # Check if adding this cell breaks the line limit
                     if current_char_count + cell_len > MAX_CHARS:
-                        # Flush current line
-                        tf_lines.append(" • ".join(current_line))
+                        # Separator is now "  |  " for cleaner look than hyphen
+                        tf_lines.append("  |  ".join(current_line))
                         current_line = []
                         current_char_count = 0
                     
                     current_line.append(cell)
-                    current_char_count += cell_len + 3 # +3 for " • "
+                    current_char_count += cell_len + 5 # +5 for "  |  "
 
-                # Flush remaining items
                 if current_line:
-                    tf_lines.append(" • ".join(current_line))
+                    tf_lines.append("  |  ".join(current_line))
 
             tf_lines.append("")
 
