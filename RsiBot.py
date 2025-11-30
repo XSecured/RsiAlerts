@@ -393,11 +393,12 @@ class RsiBot:
         tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
         ts_footer = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
 
-        # Helper to shorten names
+        # 1. Robust Name Cleaner
         def clean_name(s):
             s = s.replace("USDT", "")
-            s = re.sub(r"^(10+|100+|1000+|1M)", "", s) 
-            return s
+            # Matches 1000, 10000, 1M, etc followed by a letter
+            s = re.sub(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])", "", s) 
+            return s[:6] # Hard limit to 6 chars to ensure fit
 
         for tf in tf_order:
             if tf not in grouped: continue
@@ -406,10 +407,8 @@ class RsiBot:
             if total_hits == 0: continue
 
             tf_lines = []
-            # We pad the title with a special space to FORCE the bubble to be wide
-            # This prevents the "narrowing" effect on Android
-            header_pad = " " * 15 
-            tf_lines.append(f"⏱ *{tf} Timeframe* ({total_hits}){header_pad}")
+            # Use a monospaced header line to help force width, or just relied on the grid below
+            tf_lines.append(f"⏱ *{tf} Timeframe* ({total_hits})")
 
             targets = ["UPPER", "MIDDLE", "LOWER"]
             for t in targets:
@@ -423,40 +422,48 @@ class RsiBot:
                 else:               header = "\n🔽 *LOWER BAND*"
                 tf_lines.append(header)
 
-                # --- Smart Grid Logic ---
-                current_line = []
-                current_char_count = 0
-                MAX_CHARS = 26 # Slightly tighter to ensure 3 columns fit without wrap
-
-                for item in items:
-                    sym = clean_name(item.symbol)
-                    fire = "🔥" if item.hot else ""
+                # --- FIXED GRID LOGIC ---
+                # We define a cell width. 12 chars fits "PEPE   78.2" nicely.
+                CELL_WIDTH = 12 
+                
+                # Process in chunks of 3 to enforce the grid
+                for i in range(0, len(items), 3):
+                    chunk = items[i:i + 3]
+                    row_parts = []
                     
-                    # Direction arrows for Middle BB
-                    dir_arrow = ""
-                    if t == "MIDDLE":
-                        dir_arrow = "↓" if item.direction == "from above" else ""
+                    for item in chunk:
+                        sym = clean_name(item.symbol)
+                        
+                        # Direction arrows
+                        dir_arrow = ""
+                        if t == "MIDDLE":
+                            dir_arrow = "↘" if item.direction == "from above" else ""
+                        
+                        # Build content: "SYM 12.3"
+                        # We put the arrow INSIDE the fixed width or outside? 
+                        # Let's put text inside code, arrow/fire outside.
+                        text_content = f"{sym} {item.rsi:.1f}"
+                        
+                        # PAD with spaces to match CELL_WIDTH. 
+                        # Spaces inside backticks (`) are preserved by Telegram!
+                        padded_text = text_content.ljust(CELL_WIDTH)
+                        
+                        fire = "🔥" if item.hot else ""
+                        # Result: `PEPE 78.2   `↘🔥
+                        row_parts.append(f"`{padded_text}`{dir_arrow}{fire}")
 
-                    # Construct the cell: "BTC 70.1"
-                    # Using a hyphen instead of bullet
-                    cell = f"{sym} `{item.rsi:.1f}`{dir_arrow}{fire}"
-                    cell_len = len(sym) + 6 
-                    
-                    if current_char_count + cell_len > MAX_CHARS:
-                        # Separator is now "  |  " for cleaner look than hyphen
-                        tf_lines.append("  |  ".join(current_line))
-                        current_line = []
-                        current_char_count = 0
-                    
-                    current_line.append(cell)
-                    current_char_count += cell_len + 5 # +5 for "  |  "
+                    # FILLER LOGIC: If chunk has < 3 items, add empty code blocks
+                    # This forces the bubble to stay wide even on the last line!
+                    while len(row_parts) < 3:
+                        empty_block = " " * CELL_WIDTH
+                        row_parts.append(f"`{empty_block}`")
 
-                if current_line:
-                    tf_lines.append("  |  ".join(current_line))
+                    # Join with a simple space, the code blocks provide the separation visually
+                    tf_lines.append(" ".join(row_parts))
 
             tf_lines.append("")
 
-            # --- Send Logic ---
+            # --- Send Logic (No changes) ---
             current_msg = []
             current_len = 0
 
