@@ -393,12 +393,11 @@ class RsiBot:
         tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
         ts_footer = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
 
-        # 1. Robust Name Cleaner
+        # Cleaner: Remove 1000/1M prefixes + limit length
         def clean_name(s):
             s = s.replace("USDT", "")
-            # Matches 1000, 10000, 1M, etc followed by a letter
-            s = re.sub(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])", "", s) 
-            return s[:6] # Hard limit to 6 chars to ensure fit
+            s = re.sub(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])", "", s)
+            return s[:6] # Hard limit 6 chars
 
         for tf in tf_order:
             if tf not in grouped: continue
@@ -407,8 +406,9 @@ class RsiBot:
             if total_hits == 0: continue
 
             tf_lines = []
-            # Use a monospaced header line to help force width, or just relied on the grid below
-            tf_lines.append(f"⏱ *{tf} Timeframe* ({total_hits})")
+            # Header with padding to force bubble width
+            header_pad = "⠀" * 15 # Braille pattern blank for forcing width
+            tf_lines.append(f"⏱ *{tf} Timeframe* ({total_hits}){header_pad}")
 
             targets = ["UPPER", "MIDDLE", "LOWER"]
             for t in targets:
@@ -422,48 +422,65 @@ class RsiBot:
                 else:               header = "\n🔽 *LOWER BAND*"
                 tf_lines.append(header)
 
-                # --- FIXED GRID LOGIC ---
-                # We define a cell width. 12 chars fits "PEPE   78.2" nicely.
-                CELL_WIDTH = 12 
+                # --- PERFECT TABLE LOGIC ---
+                # We construct the whole line inside ONE code block for perfect alignment
                 
-                # Process in chunks of 3 to enforce the grid
                 for i in range(0, len(items), 3):
                     chunk = items[i:i + 3]
-                    row_parts = []
+                    row_text = ""
                     
+                    # Prepare the text content for the code block
                     for item in chunk:
                         sym = clean_name(item.symbol)
+                        # "SYM   70.1" -> Fixed 10 chars
+                        # Using <10 to left-align the string in 10 spaces
+                        cell_text = f"{sym:<6} {item.rsi:>4.1f}"
+                        row_text += cell_text + " " # Add 1 space margin
+
+                    # Add filler if row is short (to keep alignment)
+                    while len(chunk) < 3:
+                        row_text += " " * 11 # 10 chars + 1 margin
+                        chunk.append(None) # Dummy
+
+                    # Now render the row. 
+                    # Trick: We close the code block to insert the emoji, then reopen it?
+                    # No, that breaks alignment. 
+                    # Better: Put text in code block, and emojis at the END of the line?
+                    # OR: Just put everything in code block but emojis will look monochromatic.
+                    # The User wants "Perfect Alignment". 
+                    
+                    # Let's try: `BTC    70.1 | ETH    69.5 | SOL    80.0`
+                    # And we put the "Fire" icons at the very end of the line to not break the table
+                    
+                    line_content = []
+                    fire_indicators = []
+                    
+                    for item in items[i:i+3]:
+                        sym = clean_name(item.symbol)
                         
-                        # Direction arrows
-                        dir_arrow = ""
+                        # Arrow logic
+                        arrow = ""
                         if t == "MIDDLE":
-                            dir_arrow = "↘" if item.direction == "from above" else ""
+                            arrow = "↘" if item.direction == "from above" else "↗"
                         
-                        # Build content: "SYM 12.3"
-                        # We put the arrow INSIDE the fixed width or outside? 
-                        # Let's put text inside code, arrow/fire outside.
-                        text_content = f"{sym} {item.rsi:.1f}"
+                        # "BTC    70.1"
+                        txt = f"{sym:<6} {item.rsi:>4.1f}{arrow}"
+                        # Pad to fixed width of 13 chars
+                        line_content.append(f"{txt:<13}")
                         
-                        # PAD with spaces to match CELL_WIDTH. 
-                        # Spaces inside backticks (`) are preserved by Telegram!
-                        padded_text = text_content.ljust(CELL_WIDTH)
-                        
-                        fire = "🔥" if item.hot else ""
-                        # Result: `PEPE 78.2   `↘🔥
-                        row_parts.append(f"`{padded_text}`{dir_arrow}{fire}")
-
-                    # FILLER LOGIC: If chunk has < 3 items, add empty code blocks
-                    # This forces the bubble to stay wide even on the last line!
-                    while len(row_parts) < 3:
-                        empty_block = " " * CELL_WIDTH
-                        row_parts.append(f"`{empty_block}`")
-
-                    # Join with a simple space, the code blocks provide the separation visually
-                    tf_lines.append(" ".join(row_parts))
+                        if item.hot: fire_indicators.append("🔥")
+                    
+                    # Join with pipe
+                    full_row_str = "|".join(line_content)
+                    
+                    # Add fire icons at the end (outside the code block) if any exist
+                    fire_str = " " + "".join(fire_indicators) if fire_indicators else ""
+                    
+                    tf_lines.append(f"`{full_row_str}`{fire_str}")
 
             tf_lines.append("")
 
-            # --- Send Logic (No changes) ---
+            # --- Send Logic ---
             current_msg = []
             current_len = 0
 
