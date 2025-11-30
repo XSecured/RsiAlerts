@@ -92,101 +92,122 @@ class ScanStats:
 # ==========================================
 
 class AsyncProxyPool:
-    def __init__(self, max_pool_size=20):
+    def __init__(self, target_good: int = 40, max_test_concurrency: int = 300):
         self.proxies: List[str] = []
-        self.max_pool_size = max_pool_size
         self._lock = asyncio.Lock()
-        self.health: Dict[str, Dict[str, Any]] = {}  # proxy -> stats
+        self._rr_index = 0
+        self.target_good = target_good
+        self.max_test_concurrency = max_test_concurrency
+        self.failures: Dict[str, int] = {}
 
     async def populate(self, url: str, session: aiohttp.ClientSession):
-        if not url: return
-        raw = []
-        try:
-            logging.info(f"📥 Fetching proxies from {url}...")
-            async with session.get(url, timeout=15) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    for line in text.splitlines():
-                        p = line.strip()
-                        if p: raw.append(p if "://" in p else f"http://{p}")
-        except Exception as e:
-            logging.error(f"❌ Proxy fetch failed: {e}")
+        if not url:
+            logging.warning("No PROXY_URL configured, running without proxies.")
+            self.proxies = []
             return
 
-        logging.info(f"🔎 Validating {len(raw)} proxies...")
-        self.proxies = []
-        self.health = {}
-        
-        sem = asyncio.Semaphore(200)
-        async def protected_test(p):
-            async with sem: return await self._test_proxy(p, session)
-
-        tasks = [asyncio.create_task(protected_test(p)) for p in raw]
-        for future in asyncio.as_completed(tasks):
-            try:
-                proxy, is_good = await future
-                if is_good:
-                    self.proxies.append(proxy)
-                    self.health[proxy] = {"strikes": 0, "uses": 0, "cooldown_until": 0}
-                    if len(self.proxies) >= self.max_pool_size: break
-            except: pass
-        
-        for t in tasks:
-            if not t.done(): t.cancel()
-        await asyncio.sleep(0.1)
-        
-        if self.proxies:
-            logging.info(f"✅ Proxy Pool Ready: {len(self.proxies)} proxies.")
-        else:
-            logging.error("❌ NO WORKING PROXIES FOUND!")
-
-    async def _test_proxy(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool]:
         try:
-            url = "https://fapi.binance.com/fapi/v1/klines"
-            params = {"symbol": "BTCUSDT", "interval": "1m", "limit": "2"}
-            async with session.get(url, params=params, proxy=proxy, timeout=7) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        return proxy, True
-                return proxy, False
-        except:
-            return proxy, False
+            logging.info(f"📥 Fetching proxy list from {url} ...")
+            async with session.get(url, timeout=15) as resp:
+                if resp.status != 200:
+                    logging.error(f"Proxy list fetch failed: HTTP {resp.status}")
+                    return
+                text = await resp.text()
+        except Exception as e:
+            logging.error(f"Proxy list fetch error: {e}")
+            return
+
+        raw = []
+        for line in text.splitlines():
+            p = line.strip()
+            if not p:
+                continue
+            raw.append(p if "://" in p else f"http://{p}")
+
+        if not raw:
+            logging.error("Proxy list is empty.")
+            return
+
+        random.shuffle(raw)
+        logging.info(f"Testing up to {len(raw)} proxies, aiming for {self.target_good} good ones...")
+
+        test_url = "https://fapi.binance.com/fapi/v1/klines"
+        test_params = {"symbol": "BTCUSDT", "interval": "1m", "limit": "5"}
+        sem = asyncio.Semaphore(self.max_test_concurrency)
+
+        async def test_one(proxy: str):
+            start = time.monotonic()
+            try:
+                async with sem:
+                    async with session.get(
+                        test_url,
+                        params=test_params,
+                        proxy=proxy,
+                        timeout=7
+                    ) as r:
+                        if r.status != 200:
+                            return None
+                        data = await r.json()
+                        if not isinstance(data, list) or not data:
+                            return None
+            except Exception:
+                return None
+            latency = time.monotonic() - start
+            return proxy, latency
+
+        tasks = [asyncio.create_task(test_one(p)) for p in raw]
+        good: List[Tuple[str, float]] = []
+
+        try:
+            async for fut in _as_completed_early(tasks):
+                res = await fut
+                if res:
+                    good.append(res)
+                    if len(good) >= self.target_good:
+                        break
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
+        if not good:
+            logging.error("❌ No working proxies found in test phase.")
+            self.proxies = []
+            return
+
+        good.sort(key=lambda x: x[1])
+        self.proxies = [p for p, _lat in good]
+        self.failures = {}
+        self._rr_index = 0
+        logging.info(f"✅ Proxy pool ready: {len(self.proxies)} good proxies.")
 
     async def get_proxy(self) -> Optional[str]:
-        if not self.proxies: return None
-        
+        if not self.proxies:
+            return None
         async with self._lock:
-            now = time.time()
-            available = [p for p in self.proxies if self.health.get(p, {}).get("cooldown_until", 0) < now]
-            
-            if not available:
-                proxy = min(self.proxies, key=lambda p: self.health[p]["cooldown_until"])
-                return proxy
-            
-            def health_score(p):
-                h = self.health[p]
-                uses = max(h["uses"], 1)
-                return h["strikes"] / uses
-            
-            proxy = min(available, key=health_score)
-            self.health[proxy]["uses"] += 1
+            if not self.proxies:
+                return None
+            proxy = self.proxies[self._rr_index]
+            self._rr_index = (self._rr_index + 1) % len(self.proxies)
             return proxy
 
     async def report_failure(self, proxy: str):
-        async with self._lock:
-            h = self.health.setdefault(proxy, {"strikes": 0, "uses": 0, "cooldown_until": 0})
-            h["strikes"] += 1
-            
-            success_rate = 1 - (h["strikes"] / max(h["uses"], 1))
-            
-            if h["uses"] > 10 and success_rate < 0.6:
+        if not proxy:
+            return
+        self.failures[proxy] = self.failures.get(proxy, 0) + 1
+        if self.failures[proxy] >= 3:
+            async with self._lock:
                 if proxy in self.proxies:
                     self.proxies.remove(proxy)
-                    del self.health[proxy]
-                    logging.warning(f"🚫 Banned {proxy} ({success_rate:.1%} success)")
-            else:
-                h["cooldown_until"] = time.time() + 300
+                    logging.warning(f"🚫 Dropped proxy after repeated failures: {proxy}")
+                    if self._rr_index >= len(self.proxies) and self.proxies:
+                        self._rr_index = 0
+
+
+async def _as_completed_early(tasks: List[asyncio.Task]):
+    # Helper: async generator over as_completed
+    for fut in asyncio.as_completed(tasks):
+        yield fut
 
 # ==========================================
 # REDIS CACHE MANAGER (IMPROVEMENT #3: Integer Keys)
@@ -258,8 +279,16 @@ class ExchangeClient:
     def __init__(self, session: aiohttp.ClientSession, proxy_pool: AsyncProxyPool):
         self.session = session
         self.proxies = proxy_pool
-        limit = CONFIG.MAX_CONCURRENCY if proxy_pool.proxies else 5
+
+        # Derive a safe but fast concurrency from proxy count
+        proxy_count = len(self.proxies.proxies)
+        if proxy_count:
+            limit = min(CONFIG.MAX_CONCURRENCY, max(20, proxy_count * 4))
+        else:
+            limit = 5  # no proxies → very low direct concurrency
+
         self.sem = asyncio.Semaphore(limit)
+        logging.info(f"HTTP concurrency set to {limit} for {proxy_count} proxies")
 
     async def _request(self, url: str, params: dict = None) -> Any:
         last_error = "Unknown"
