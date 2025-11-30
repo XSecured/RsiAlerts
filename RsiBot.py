@@ -64,7 +64,29 @@ CACHED_TFS = {'2h', '4h', '1d', '1w'}
 # ==========================================
 # PROXY STATE MODELS (ALWAYS-PROXY EDITION)
 # ==========================================
+@dataclass
+class TouchHit:
+    symbol: str
+    exchange: str 
+    market: str   
+    timeframe: str
+    rsi: float
+    touch_type: str
+    direction: str = "" 
+    hot: bool = False
+    
+    def to_dict(self): return asdict(self)
+    @staticmethod
+    def from_dict(d): return TouchHit(**d)
 
+@dataclass
+class ScanStats:
+    timeframe: str
+    source: str
+    total_symbols: int = 0
+    successful_scans: int = 0
+    hits_found: int = 0
+    
 @dataclass
 class ProxyBelief:
     """Bayesian belief per proxy: Beta-Bernoulli + Kalman."""
