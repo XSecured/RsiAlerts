@@ -23,8 +23,8 @@ import redis.asyncio as aioredis
 @dataclass
 class Config:
     MAX_CONCURRENCY: int = 50
-    REQUEST_TIMEOUT: int = 7
-    MAX_RETRIES: int = 5
+    REQUEST_TIMEOUT: int = 6
+    MAX_RETRIES: int = 3
     
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     CACHE_TTL_MAP: Dict[str, int] = field(default_factory=lambda: {
@@ -144,7 +144,7 @@ class AsyncProxyPool:
         try:
             url = "https://fapi.binance.com/fapi/v1/klines"
             params = {"symbol": "BTCUSDT", "interval": "1m", "limit": "2"}
-            async with session.get(url, params=params, proxy=proxy, timeout=5) as resp:
+            async with session.get(url, params=params, proxy=proxy, timeout=4) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if isinstance(data, list) and len(data) > 0:
@@ -572,16 +572,30 @@ class RsiBot:
             total_sym_count = len(all_pairs)
             logging.info(f"Total symbols: {total_sym_count}")
             
-            # 2. ORIGINAL VOLATILITY CALCULATION (NO PRE-FILTER)
+            # 2. ORIGINAL VOLATILITY CALCULATION (OPTIMIZED SEMAPHORE - NO TIMEOUT)
             logging.info("Calculating Volatility...")
             vol_scores = {}
-            async def check_vol(client, sym, mkt):
-                c = await client.fetch_closes_volatility(sym, mkt)
-                v = calculate_volatility(c)
-                if v > 0: vol_scores[sym] = v
             
+            # Still use Semaphore to control concurrency (200 at a time)
+            vol_sem = asyncio.Semaphore(40) 
+
+            async def check_vol(client, sym, mkt):
+                # Wait for a slot
+                async with vol_sem:
+                    try:
+                        # Removed asyncio.wait_for() wrapper.
+                        # Now it will rely entirely on your ExchangeClient's internal timeout (7s) and retries (5x).
+                        c = await client.fetch_closes_volatility(sym, mkt)
+                        if c:
+                            v = calculate_volatility(c)
+                            if v > 0: vol_scores[sym] = v
+                    except Exception:
+                        pass
+            
+            # Task creation and Execution
             vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
-            for i in range(0, len(vol_tasks), 200): await asyncio.gather(*vol_tasks[i:i+200])
+            await asyncio.gather(*vol_tasks)
+            
             hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
             logging.info(f"Vol Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot: {len(hot_coins)}")
             
