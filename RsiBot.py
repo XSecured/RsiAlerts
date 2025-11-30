@@ -392,7 +392,6 @@ class RsiBot:
         for h in hits: grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
 
         tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
-        headers = {"UPPER": "⬆️ UPPER BB", "MIDDLE": "🔶 MIDDLE BB", "LOWER": "⬇️ LOWER BB"}
         ts_footer = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
 
         # 2. Process and Send ONE Timeframe at a time
@@ -404,29 +403,48 @@ class RsiBot:
 
             # --- Build Lines for THIS Timeframe ---
             tf_lines = []
-            tf_lines.append(f" ▣ TIMEFRAME: {tf} ({total_hits} Hits)")
-            tf_lines.append("─────────────────────────")
+            tf_lines.append(f"⏱ *{tf} Timeframe* ({total_hits})")
 
-            found = [t for t in ["UPPER", "MIDDLE", "LOWER"] if grouped[tf].get(t)]
-            for t in found:
+            # Processing Order: Upper -> Middle -> Lower
+            targets = ["UPPER", "MIDDLE", "LOWER"]
+
+            for t in targets:
                 items = grouped[tf].get(t, [])
-                items.sort(key=lambda x: x.symbol)
+                if not items: continue
                 
-                tf_lines.append(f"┌ {headers[t]}")
-                for idx, item in enumerate(items):
-                    prefix = "└" if idx == len(items)-1 else "│"
-                    icon = "🥐" if item.exchange == "Binance" else "💣"
-                    sym_clean = item.symbol.replace("USDT", "")
-                    
-                    ext = ""
-                    if t == "MIDDLE":
-                        ext = f" {'🔻' if item.direction=='from above' else '🔹'}"
-                    if item.hot: ext += " 🔥"
-                    
-                    tf_lines.append(f"{prefix} {icon} *{sym_clean}* ➜ *{item.rsi:.2f}*{ext}")
-                tf_lines.append("") # Spacer
+                # Sort: Descending (High RSI) for Upper/Middle, Ascending (Low RSI) for Lower
+                items.sort(key=lambda x: x.rsi, reverse=(t != "LOWER"))
+                
+                # Headers with specific icons
+                if t == "UPPER":    header = "\n🔼 *UPPER BAND*"
+                elif t == "MIDDLE": header = "\n💠 *MIDDLE BAND*"
+                else:               header = "\n🔽 *LOWER BAND*"
+                
+                tf_lines.append(header)
 
-            tf_lines.append("─────────────────────────")
+                # Chunk items into groups of 3
+                chunk_size = 3
+                for i in range(0, len(items), chunk_size):
+                    chunk = items[i:i + chunk_size]
+                    row_parts = []
+                    
+                    for item in chunk:
+                        sym = item.symbol.replace("USDT", "")
+                        fire = "🔥" if item.hot else ""
+                        
+                        # Direction arrows for Middle BB
+                        dir_arrow = ""
+                        if t == "MIDDLE":
+                            # ↘ means crossing down (bearish), ↗ means crossing up (bullish)
+                            dir_arrow = "↘" if item.direction == "from above" else "↗"
+                        
+                        # Format: SYM 12.3↘🔥
+                        row_parts.append(f"{sym} `{item.rsi:.1f}`{dir_arrow}{fire}")
+                    
+                    # Join with a bullet point
+                    tf_lines.append(" • ".join(row_parts))
+
+            tf_lines.append("") # Spacer at bottom of message
 
             # --- Send THIS Timeframe (Chunking if needed) ---
             current_msg = []
@@ -439,13 +457,14 @@ class RsiBot:
                 try:
                     await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
                                      json={"chat_id": CONFIG.CHAT_ID, "text": text, "parse_mode": "Markdown"})
-                    await asyncio.sleep(0.5) # Safety sleep
+                    await asyncio.sleep(0.5) # Rate limit safety
                 except Exception as e:
                     logging.error(f"TG Send Fail: {e}")
                 current_msg = []
                 current_len = 0
 
             for line in tf_lines:
+                # 3800 chars limit safety buffer
                 if current_len + len(line) + 10 > 3800:
                     await flush()
                 current_msg.append(line)
