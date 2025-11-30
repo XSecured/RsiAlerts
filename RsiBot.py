@@ -562,7 +562,7 @@ class RsiBot:
                     # Scan ALL symbols for this TF
                     async def scan_one(client, sym, mkt, ex):
                         closes = await client.fetch_closes(sym, tf, mkt)
-                        if not closes: return []
+                        if not closes: return None
                         t_type, direction, rsi_val = check_bb_rsi(closes, tf)
                         if t_type:
                             return [TouchHit(sym, ex, mkt, tf, rsi_val, t_type, direction, sym in hot_coins)]
@@ -578,7 +578,7 @@ class RsiBot:
                             final_hits.extend(result)
                             scan_stats[tf].hits_found += len(result)
                     
-                    scan_stats[tf].successful_scans = len([r for r in results if not isinstance(r, Exception)])
+                    scan_stats[tf].successful_scans = len([r for r in results if r is not None and not isinstance(r, Exception)])
                     
                     if tf in CACHED_TFS:
                         candle_key = get_cache_key(tf)
