@@ -117,7 +117,7 @@ class AsyncProxyPool:
         self.proxies = []
         self.health = {}
         
-        sem = asyncio.Semaphore(200)
+        sem = asyncio.Semaphore(100)
         async def protected_test(p):
             async with sem: return await self._test_proxy(p, session)
 
@@ -144,7 +144,7 @@ class AsyncProxyPool:
         try:
             url = "https://fapi.binance.com/fapi/v1/klines"
             params = {"symbol": "BTCUSDT", "interval": "1m", "limit": "2"}
-            async with session.get(url, params=params, proxy=proxy, timeout=7) as resp:
+            async with session.get(url, params=params, proxy=proxy, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if isinstance(data, list) and len(data) > 0:
