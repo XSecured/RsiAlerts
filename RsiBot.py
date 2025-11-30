@@ -460,16 +460,21 @@ class RsiBot:
         cached_data = cached.get('data') if cached else None
         
         async def try_fetch(fetch_func, cache_key: str, name: str):
-            for attempt in range(3):
-                result = await fetch_func()
-                if len(result) > 0:
-                    logging.info(f"✅ {name}: {len(result)} symbols")
-                    return result
-                logging.warning(f"⚠️ {name}: Attempt {attempt+1} failed, retrying...")
-                await asyncio.sleep(2)
+            # Only try ONCE per exchange. 
+            # The internal _request already retries 5 times. That is enough.
+            result = await fetch_func()
             
-            logging.warning(f"❌ {name}: Failed after retries, using cache")
-            return cached_data[cache_key] if cached_data else []
+            if result and len(result) > 0:
+                logging.info(f"✅ {name}: {len(result)} symbols")
+                return result
+            
+            # If live fetch fails, immediately check cache
+            if cached_data and cache_key in cached_data:
+                logging.warning(f"⚠️ {name}: Live fetch failed. Using CACHE ({len(cached_data[cache_key])} syms)")
+                return cached_data[cache_key]
+            
+            logging.error(f"❌ {name}: Failed and NO CACHE available.")
+            return []
         
         bp, bs, yp, ys = await asyncio.gather(
             try_fetch(binance.get_perp_symbols, 'bp', 'Binance Perp'),
