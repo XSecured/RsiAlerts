@@ -301,12 +301,12 @@ class BinanceClient(ExchangeClient):
         if not data: return []
         try: return [float(c[4]) for c in data]
         except: return []
-    async def fetch_closes(self, symbol: str, interval: str, market: str) -> Optional[List[float]]:
+    async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
         base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
         data = await self._request(base, {'symbol': symbol, 'interval': interval, 'limit': CONFIG.CANDLE_LIMIT})
-        if not data: return None  # ← Changed from []
+        if not data: return []
         try: return [float(c[4]) for c in data]
-        except: return None       # ← Changed from []
+        except: return []
 
 class BybitClient(ExchangeClient):
     async def get_perp_symbols(self) -> List[str]:
@@ -326,18 +326,17 @@ class BybitClient(ExchangeClient):
         if not raw: return []
         closes = [float(c[4]) for c in raw]
         return closes[::-1]
-    async def fetch_closes(self, symbol: str, interval: str, market: str) -> Optional[List[float]]:
+    async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
         url = 'https://api.bybit.com/v5/market/kline'
         cat = 'linear' if market == 'perp' else 'spot'
         b_int = {"15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W"}.get(interval, "D")
         data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': b_int, 'limit': CONFIG.CANDLE_LIMIT})
-        if not data: return None  # ← Changed from []
+        if not data: return []
         raw = data.get('result', {}).get('list', [])
-        if not raw: return None   # ← Changed from []
-        try: 
-            closes = [float(c[4]) for c in raw]
-            return closes[::-1]
-        except: return None       # ← Changed from []
+        if not raw: return []
+        closes = [float(c[4]) for c in raw]
+        return closes[::-1]
+
 # ==========================================
 # CORE LOGIC (IMPROVEMENT #3: Integer Keys Only)
 # ==========================================
@@ -563,16 +562,15 @@ class RsiBot:
                     # Scan ALL symbols for this TF
                     async def scan_one(client, sym, mkt, ex):
                         closes = await client.fetch_closes(sym, tf, mkt)
-                        if closes is None:  # ← Explicitly check for None
-                            return None     # ← Return None on fetch failure
-                        
-                        if len(closes) < CONFIG.MIN_CANDLES:
-                            return None     # ← Return None if not enough data
-                        
+                        # Treat empty/no-data as a failed scan
+                        if not closes:
+                            return None
+
                         t_type, direction, rsi_val = check_bb_rsi(closes, tf)
                         if t_type:
                             return [TouchHit(sym, ex, mkt, tf, rsi_val, t_type, direction, sym in hot_coins)]
-                        return []  # ← Success but no touch found
+                        # Fetched candles successfully but no hit
+                        return []
                     
                     for client, sym, mkt, ex in all_pairs:
                         tf_tasks.append(scan_one(client, sym, mkt, ex))
@@ -580,16 +578,16 @@ class RsiBot:
                     results = await asyncio.gather(*tf_tasks, return_exceptions=True)
                     
                     results = await asyncio.gather(*tf_tasks, return_exceptions=True)
-                    
-                    successful_count = 0
+
+                    success_count = 0
                     for result in results:
-                        if isinstance(result, Exception) or result is None:
-                            continue  # ← Skip both exceptions and fetch failures
-                        successful_count += 1
-                        final_hits.extend(result)
-                        scan_stats[tf].hits_found += len(result)
-                    
-                    scan_stats[tf].successful_scans = successful_count  # ← Use the corrected count
+                        if isinstance(result, list):
+                            success_count += 1
+                            if result:  # non-empty list = actual hits
+                                final_hits.extend(result)
+                                scan_stats[tf].hits_found += len(result)
+
+                    scan_stats[tf].successful_scans = success_count
                     
                     if tf in CACHED_TFS:
                         candle_key = get_cache_key(tf)
@@ -632,3 +630,4 @@ if __name__ == "__main__":
         asyncio.set_event_policy(asyncio.WindowsSelectorEventLoopPolicy())
     bot = RsiBot()
     asyncio.run(bot.run())
+    
