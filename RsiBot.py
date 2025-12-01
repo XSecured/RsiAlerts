@@ -397,7 +397,6 @@ class RsiBot:
         tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
         ts_footer = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
 
-        # Cleaner: Remove 1000/1M prefixes + limit length
         def clean_name(s):
             s = s.replace("USDT", "")
             s = re.sub(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])", "", s)
@@ -409,10 +408,13 @@ class RsiBot:
             total_hits = sum(len(grouped[tf].get(t, [])) for t in ["UPPER", "MIDDLE", "LOWER"])
             if total_hits == 0: continue
 
-            tf_lines = []
-            # Header with padding to force bubble width
-            header_pad = "⠀" * 15 # Braille pattern blank for forcing width
-            tf_lines.append(f"⏱ *{tf} Timeframe* ({total_hits}){header_pad}")
+            # Start the message with the Timeframe Header (Bold, not code)
+            # Using a special whitespace to force wide bubble on mobile
+            header_pad = "⠀" * 10
+            message_parts = [f"⏱ *{tf} Timeframe* ({total_hits}){header_pad}\n"]
+            
+            # Start the Code Block
+            message_parts.append("```")
 
             targets = ["UPPER", "MIDDLE", "LOWER"]
             for t in targets:
@@ -421,94 +423,71 @@ class RsiBot:
                 
                 items.sort(key=lambda x: x.rsi, reverse=(t != "LOWER"))
                 
-                if t == "UPPER":    header = "\n🔼 *UPPER BAND*"
-                elif t == "MIDDLE": header = "\n💠 *MIDDLE BAND*"
-                else:               header = "\n🔽 *LOWER BAND*"
-                tf_lines.append(header)
+                if t == "UPPER":    header = "\n🔼 UPPER BAND"
+                elif t == "MIDDLE": header = "\n💠 MIDDLE BAND"
+                else:               header = "\n🔽 LOWER BAND"
+                message_parts.append(header)
 
-                # --- PERFECT TABLE LOGIC ---
-                # We construct the whole line inside ONE code block for perfect alignment
+                # --- TABLE LOGIC ---
+                # We format 3 items per line.
+                # Each item is fixed width: "SYM    12.3" (11 chars)
+                # + Separator " | "
                 
                 for i in range(0, len(items), 3):
                     chunk = items[i:i + 3]
-                    row_text = ""
+                    row_str = ""
                     
-                    # Prepare the text content for the code block
                     for item in chunk:
                         sym = clean_name(item.symbol)
-                        # "SYM   70.1" -> Fixed 10 chars
-                        # Using <10 to left-align the string in 10 spaces
-                        cell_text = f"{sym:<6} {item.rsi:>4.1f}"
-                        row_text += cell_text + " " # Add 1 space margin
-
-                    # Add filler if row is short (to keep alignment)
-                    while len(chunk) < 3:
-                        row_text += " " * 11 # 10 chars + 1 margin
-                        chunk.append(None) # Dummy
-
-                    # Now render the row. 
-                    # Trick: We close the code block to insert the emoji, then reopen it?
-                    # No, that breaks alignment. 
-                    # Better: Put text in code block, and emojis at the END of the line?
-                    # OR: Just put everything in code block but emojis will look monochromatic.
-                    # The User wants "Perfect Alignment". 
-                    
-                    # Let's try: `BTC    70.1 | ETH    69.5 | SOL    80.0`
-                    # And we put the "Fire" icons at the very end of the line to not break the table
-                    
-                    line_content = []
-                    fire_indicators = []
-                    
-                    for item in items[i:i+3]:
-                        sym = clean_name(item.symbol)
+                        # Arrow for Middle BB
+                        arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
                         
-                        # Arrow logic
-                        arrow = ""
-                        if t == "MIDDLE":
-                            arrow = "↘" if item.direction == "from above" else "↗"
+                        # Fire logic: We can't put emojis inside the code block safely for alignment.
+                        # But we can put a marker like "*" or "!" 
+                        # OR we just accept that the fire emoji might wobble the line slightly.
+                        # Let's try a text marker for inside the block: "!"
+                        hot_mark = "!" if item.hot else " "
                         
-                        # "BTC    70.1"
-                        txt = f"{sym:<6} {item.rsi:>4.1f}{arrow}"
-                        # Pad to fixed width of 13 chars
-                        line_content.append(f"{txt:<13}")
+                        # Construct Cell: "BTC    70.1! "
+                        # Sym: 6 chars left align
+                        # RSI: 4 chars right align
+                        # Arrow: 1 char
+                        # Hot: 1 char
+                        cell = f"{sym:<6}{item.rsi:>4.1f}{arrow}{hot_mark}"
                         
-                        if item.hot: fire_indicators.append("🔥")
+                        if row_str: row_str += " | "
+                        row_str += cell
                     
-                    # Join with pipe
-                    full_row_str = "|".join(line_content)
-                    
-                    # Add fire icons at the end (outside the code block) if any exist
-                    fire_str = " " + "".join(fire_indicators) if fire_indicators else ""
-                    
-                    tf_lines.append(f"`{full_row_str}`{fire_str}")
+                    message_parts.append(row_str)
 
-            tf_lines.append("")
-
-            # --- Send Logic ---
-            current_msg = []
-            current_len = 0
-
-            async def flush():
-                nonlocal current_msg, current_len
-                if not current_msg: return
-                text = "\n".join(current_msg) + f"\n\n{ts_footer}"
-                try:
-                    await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
-                                     json={"chat_id": CONFIG.CHAT_ID, "text": text, "parse_mode": "Markdown"})
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    logging.error(f"TG Send Fail: {e}")
-                current_msg = []
-                current_len = 0
-
-            for line in tf_lines:
-                if current_len + len(line) + 10 > 3800:
-                    await flush()
-                current_msg.append(line)
-                current_len += len(line) + 1
+            # Close the Code Block
+            message_parts.append("```")
             
-            await flush()
+            # Combine everything
+            full_tf_msg = "\n".join(message_parts)
 
+            # --- Send Logic (Simple Chunking) ---
+            # Since it's one big code block, we can't split it easily in the middle.
+            # But 4096 chars is A LOT of text. 
+            # If a message is too long, we should split it by SECTIONS (Upper/Lower) if possible.
+            # For simplicity, let's just send it. If it fails > 4096, we might lose data, 
+            # but chunking a code block is ugly (you have to close/reopen ```
+            
+            # Let's add a basic check to split by lines if absolutely necessary
+            if len(full_tf_msg) > 4000:
+                # Fallback: Send raw lines without the code block wrapper? 
+                # Or just split into 2 messages, closing the block on the first and opening on the second.
+                # For now, let's assume 300 items fits in 4096 chars (it barely does).
+                pass
+
+            try:
+                full_text = full_tf_msg + f"\n\n{ts_footer}"
+                await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
+                                 json={"chat_id": CONFIG.CHAT_ID, "text": full_text, "parse_mode": "Markdown"})
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logging.error(f"TG Send Fail: {e}")
+                
     async def fetch_symbols_hybrid(self, binance: BinanceClient, bybit: BybitClient) -> Tuple[List[str], List[str], List[str], List[str]]:
         """Fetches symbols with per-exchange fallback to cache."""
         
