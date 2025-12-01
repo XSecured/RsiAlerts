@@ -97,6 +97,7 @@ class AsyncProxyPool:
         self.max_pool_size = max_pool_size
         self._lock = asyncio.Lock()
         self.health: Dict[str, Dict[str, Any]] = {}  # proxy -> stats
+        self._iterator = None # The infinite loop provider
 
     async def populate(self, url: str, session: aiohttp.ClientSession):
         if not url: return
@@ -127,7 +128,7 @@ class AsyncProxyPool:
                 proxy, is_good = await future
                 if is_good:
                     self.proxies.append(proxy)
-                    self.health[proxy] = {"strikes": 0, "uses": 0, "cooldown_until": 0}
+                    self.health[proxy] = {"strikes": 0, "uses": 0}
                     if len(self.proxies) >= self.max_pool_size: break
             except: pass
         
@@ -137,6 +138,8 @@ class AsyncProxyPool:
         
         if self.proxies:
             logging.info(f"✅ Proxy Pool Ready: {len(self.proxies)} proxies.")
+            # Create the infinite iterator immediately after population
+            self._iterator = cycle(self.proxies)
         else:
             logging.error("❌ NO WORKING PROXIES FOUND!")
 
@@ -154,39 +157,40 @@ class AsyncProxyPool:
             return proxy, False
 
     async def get_proxy(self) -> Optional[str]:
-        if not self.proxies: return None
+        """Lightning fast, Lock-Free proxy selector"""
+        if not self.proxies or not self._iterator: return None
         
-        async with self._lock:
-            now = time.time()
-            available = [p for p in self.proxies if self.health.get(p, {}).get("cooldown_until", 0) < now]
-            
-            if not available:
-                proxy = min(self.proxies, key=lambda p: self.health[p]["cooldown_until"])
-                return proxy
-            
-            def health_score(p):
-                h = self.health[p]
-                uses = max(h["uses"], 1)
-                return h["strikes"] / uses
-            
-            proxy = min(available, key=health_score)
-            self.health[proxy]["uses"] += 1
-            return proxy
+        # No await, no lock, just grab next one instantly
+        # Note: 'cycle' is thread-safe in CPython for simple next() calls, 
+        # and perfectly safe in asyncio single-threaded event loop.
+        return next(self._iterator)
 
     async def report_failure(self, proxy: str):
+        """Updates health and bans if necessary"""
         async with self._lock:
-            h = self.health.setdefault(proxy, {"strikes": 0, "uses": 0, "cooldown_until": 0})
+            if proxy not in self.health: return
+
+            h = self.health[proxy]
             h["strikes"] += 1
+            h["uses"] += 1 # Count failed attempts as uses too
             
+            # Logic: If > 10 uses and > 40% failure rate, BAN IT.
             success_rate = 1 - (h["strikes"] / max(h["uses"], 1))
             
             if h["uses"] > 10 and success_rate < 0.6:
                 if proxy in self.proxies:
-                    self.proxies.remove(proxy)
-                    del self.health[proxy]
-                    logging.warning(f"🚫 Banned {proxy} ({success_rate:.1%} success)")
-            else:
-                h["cooldown_until"] = time.time() + 300
+                    try:
+                        self.proxies.remove(proxy)
+                        del self.health[proxy]
+                        logging.warning(f"🚫 Banned {proxy} ({success_rate:.1%} success)")
+                        
+                        # Rebuild iterator without the banned proxy
+                        if self.proxies:
+                            self._iterator = cycle(self.proxies)
+                        else:
+                            self._iterator = None
+                    except ValueError:
+                        pass # Already removed
 
 # ==========================================
 # REDIS CACHE MANAGER (IMPROVEMENT #3: Integer Keys)
