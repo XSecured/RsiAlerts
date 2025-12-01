@@ -2,7 +2,7 @@ name: Run BB Touch Bot
 
 on:
   schedule:
-    - cron: '1 * * * *'  # Every Hour
+    - cron: '1 */4 * * *'  # Every 4 Hour
   workflow_dispatch:  # Manual trigger
 
 jobs:
