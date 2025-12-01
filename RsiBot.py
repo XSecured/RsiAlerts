@@ -23,7 +23,7 @@ import redis.asyncio as aioredis
 @dataclass
 class Config:
     MAX_CONCURRENCY: int = 50
-    REQUEST_TIMEOUT: int = 6
+    REQUEST_TIMEOUT: int = 7
     MAX_RETRIES: int = 3
     
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -301,7 +301,7 @@ class BinanceClient(ExchangeClient):
         return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
     async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
         base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
-        data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': 25})
+        data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': 72})
         if not data: return []
         try: return [float(c[4]) for c in data]
         except: return []
@@ -324,7 +324,7 @@ class BybitClient(ExchangeClient):
     async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
         url = 'https://api.bybit.com/v5/market/kline'
         cat = 'linear' if market == 'perp' else 'spot'
-        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': '60', 'limit': 25})
+        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': '60', 'limit': 72})
         if not data: return []
         raw = data.get('result', {}).get('list', [])
         if not raw: return []
