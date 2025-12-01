@@ -581,7 +581,7 @@ class RsiBot:
             vol_scores = {}
             
             # Still use Semaphore to control concurrency (200 at a time)
-            vol_sem = asyncio.Semaphore(40) 
+            vol_sem = asyncio.Semaphore(50) 
 
             async def check_vol(client, sym, mkt):
                 # Wait for a slot
@@ -600,7 +600,7 @@ class RsiBot:
             vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
             await asyncio.gather(*vol_tasks)
             
-            hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
+            hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:90])
             logging.info(f"Vol Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot: {len(hot_coins)}")
             
             # 3. PRECISION SCAN SETUP WITH EARLY SENT STATE CHECK
