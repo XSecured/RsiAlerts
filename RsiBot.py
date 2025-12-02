@@ -944,24 +944,18 @@ class RsiBot:
                         sym = clean_name(item.symbol)
                         
                         arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
-                        
-                        # FIRE LOGIC: Move to Start
-                        # Use "🔥" if hot, otherwise "  " (2 spaces)
-                        # This keeps the total characters identical
                         fire = "🔥" if item.hot else "  "
                         
-                        # Create fixed-width cell (16 chars total)
-                        # Format: "🔥SYM    12.3 "
-                        cell = f"{fire}{sym:<7}{item.rsi:>5.1f}{arrow}"
+                        # Create fixed-width cell (15 chars total)
+                        cell = f"{sym:<7}{item.rsi:>5.1f}{arrow}{fire}"
                         cells.append(cell)
                     
                     # Pad incomplete rows to maintain alignment
                     while len(cells) < 3:
-                        cells.append(" " * 16)  # Match the new width
+                        cells.append(" " * 15)  # Empty cell with same width
                     
                     # Join with consistent separator
-                    # Use your wide separator if you like
-                    row_str = "      | ".join(cells)
+                    row_str = " | ".join(cells)
                     message_parts.append(row_str)
 
             message_parts.append("```")
