@@ -935,16 +935,34 @@ class RsiBot:
                 else:               header = "\n🔽 LOWER BAND"
                 message_parts.append(header)
 
+                # --- SPACIOUS TABLE LOGIC ---
                 for i in range(0, len(items), 3):
                     chunk = items[i:i + 3]
                     row_str = ""
                     
                     for item in chunk:
                         sym = clean_name(item.symbol)
-                        arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
-                        hot_mark = "!" if item.hot else " "
-                        cell = f"{sym:<6}{item.rsi:>4.1f}{arrow}{hot_mark}"
                         
+                        # Direction Arrow (for Middle BB) or Space
+                        # using ' ' as default ensures alignment stays rigid
+                        arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
+                        
+                        # Fire Logic
+                        # We use the emoji if hot, else a double space to keep alignment equal
+                        # Note: Emojis are usually 2 chars wide visually in monospaced fonts
+                        fire = "🔥" if item.hot else "  "
+                        
+                        # CELL FORMATTING
+                        # Sym: Left-align in 7 spaces (allows for 6-char ticker + 1 space)
+                        # RSI: Right-align in 5 spaces (" 70.1")
+                        # Arrow: 1 char
+                        # Fire: 2 chars space
+                        # Total Width per cell = 7 + 5 + 1 + 2 = 15 chars + padding
+                        
+                        # Example: "BROCCO  84.6 ↘🔥"
+                        cell = f"{sym:<7}{item.rsi:>5.1f}{arrow}{fire}"
+                        
+                        # Add Separator with padding
                         if row_str: row_str += " | "
                         row_str += cell
                     
