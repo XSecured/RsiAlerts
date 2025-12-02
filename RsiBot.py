@@ -780,19 +780,36 @@ class ExchangeClient:
                 continue
             try:
                 async with self.sem:
+                    start_t = time.time()  # Track latency
                     async with self.session.get(url, params=params, proxy=proxy, timeout=CONFIG.REQUEST_TIMEOUT) as resp:
-                        if resp.status == 200: return await resp.json()
+                        if resp.status == 200:
+                            # FIX: Report success before returning!
+                            latency = (time.time() - start_t) * 1000
+                            await self.proxies.report_success(proxy, latency)
+                            return await resp.json()
+                        
+                        # Handle non-200
                         elif resp.status == 429:
+                            await self.proxies.report_failure(proxy) # Rate limit is a failure of sorts
                             logging.warning(f"⚠️ 429 Rate Limit ({proxy}). Sleeping 5s.")
                             await asyncio.sleep(5)
                             last_error = "429"
-                        elif resp.status >= 500: last_error = f"Server {resp.status}"
-                        else: last_error = f"HTTP {resp.status}"
+                        elif resp.status >= 500: 
+                            await self.proxies.report_failure(proxy)
+                            last_error = f"Server {resp.status}"
+                        else: 
+                            # 404 etc might not be proxy fault, but usually safest to report
+                            last_error = f"HTTP {resp.status}"
+            
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
                 await self.proxies.report_failure(proxy)
                 last_error = str(e)
-            except Exception as e: last_error = f"Unexpected: {str(e)}"
+            except Exception as e: 
+                # Don't report failure for generic python errors (bug in code vs bug in proxy)
+                last_error = f"Unexpected: {str(e)}"
+                
             await asyncio.sleep(0.5 + random.random() * 0.5)
+            
         logging.warning(f"❌ Failed {url} after {CONFIG.MAX_RETRIES} tries. Last err: {last_error}")
         return None
 
