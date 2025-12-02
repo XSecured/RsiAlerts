@@ -963,7 +963,7 @@ class RsiBot:
                         cell = f"{sym:<7}{item.rsi:>5.1f}{arrow}{fire}"
                         
                         # Add Separator with padding
-                        if row_str: row_str += " | "
+                        if row_str: row_str += "       | "
                         row_str += cell
                     
                     message_parts.append(row_str)
