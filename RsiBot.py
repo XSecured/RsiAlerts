@@ -11,7 +11,6 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Set, Optional, Tuple, Any
 from itertools import cycle
 from enum import Enum
-from wcwidth import wcswidth
 
 import aiohttp
 import numpy as np
@@ -58,7 +57,7 @@ TIMEFRAME_MINUTES = {
     '1d': 1440, '1w': 10080
 }
 
-ACTIVE_TFS = ['15m', '30m', '1h', '4h', '1d', '1w']
+ACTIVE_TFS = ['4h', '1d', '1w']
 MIDDLE_BAND_TFS = ['4h', '1d', '1w']
 CACHED_TFS = {'4h', '1d', '1w'}
 
@@ -161,7 +160,7 @@ class RobustProxyPool:
     """
 
     PROXY_SOURCES = [
-        ""
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
     ]
 
     def __init__(
@@ -920,10 +919,15 @@ class RsiBot:
             total_hits = sum(len(grouped[tf].get(t, [])) for t in ["UPPER", "MIDDLE", "LOWER"])
             if total_hits == 0: continue
 
+            # Header
             header_pad = "⠀" * 10
-            message_parts = [f"⏱ *{tf} Timeframe* ({total_hits}){header_pad}\n"]
-            message_parts.append("```")
-
+            header_msg = f"⏱ *{tf} Timeframe* ({total_hits}){header_pad}\n"
+            
+            # We will build a LIST of messages to send for this timeframe
+            # Start the first message buffer
+            current_buffer = [header_msg, "```"]
+            current_chars = len(header_msg) + 3
+            
             targets = ["UPPER", "MIDDLE", "LOWER"]
             for t in targets:
                 items = grouped[tf].get(t, [])
@@ -934,52 +938,68 @@ class RsiBot:
                 if t == "UPPER":    header = "\n🔼 UPPER BAND"
                 elif t == "MIDDLE": header = "\n💠 MIDDLE BAND"
                 else:               header = "\n🔽 LOWER BAND"
-                message_parts.append(header)
                 
-                def strip_ansi(text):
-                    return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
-                
-                def pad_visual(text, width):
-                    """Pad to exact visual width, handling Unicode & ANSI."""
-                    visible = strip_ansi(text)
-                    padding = width - wcswidth(visible)
-                    return text + " " * max(0, padding)
-                
-                # --- PERFECTLY ALIGNED TABLE ---
+                # Add section header to buffer
+                if current_chars + len(header) + 50 > 3800:
+                    # Close current block, start new one
+                    current_buffer.append("```
+                    await self._safe_send(session, "\n".join(current_buffer), ts_footer)
+                    current_buffer = ["```", header] # Start new block with the header
+                    current_chars = 3 + len(header)
+                else:
+                    current_buffer.append(header)
+                    current_chars += len(header)
+
                 for i in range(0, len(items), 3):
                     chunk = items[i:i + 3]
-                    cells = []
-                    
+                    row_str = ""
                     for item in chunk:
                         sym = clean_name(item.symbol)
-                        
-                        # Use explicit 1-column-wide symbols
-                        arrow = "v" if (t == "MIDDLE" and item.direction == "from above") else "^" if t == "MIDDLE" else " "
-                        fire = "!" if item.hot else " "
-                        
-                        # Build cell with EXACT visual widths:
-                        # Symbol: 7 columns | RSI: 5 columns | Arrow: 1 | Fire: 1 = 14 columns total
-                        symbol_part = pad_visual(sym[:6], 7)  # Truncate to 6, pad to 7
-                        rsi_part = f"{item.rsi:>5.1f}"
-                        
-                        cell = f"{symbol_part}{rsi_part}{arrow}{fire}"
-                        cells.append(cell)
+                        arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
+                        hot_mark = "!" if item.hot else " "
+                        # Adjusted spacing for alignment
+                        cell = f"{sym:<6}{item.rsi:>4.1f}{arrow}{hot_mark}"
+                        if row_str: row_str += " | "
+                        row_str += cell
                     
-                    message_parts.append(" | ".join(cells))
+                    # Check length before adding row
+                    # +1 for newline
+                    if current_chars + len(row_str) + 1 > 3800:
+                        current_buffer.append("```
+                        await self._safe_send(session, "\n".join(current_buffer), ts_footer)
+                        current_buffer = ["```", row_str] # Continue list in new block
+                        current_chars = 3 + len(row_str)
+                    else:
+                        current_buffer.append(row_str)
+                        current_chars += len(row_str) + 1
 
-            message_parts.append("```")
-            full_tf_msg = "\n".join(message_parts)
+            # Send whatever is left
+            if len(current_buffer) > 2: # Ensure we have content besides header/```
+                current_buffer.append("```")
+                await self._safe_send(session, "\n".join(current_buffer), ts_footer)
 
-            if len(full_tf_msg) > 4000:
-                pass
-
+    # Helper method for safe sending with retry
+    async def _safe_send(self, session, text, footer):
+        full_text = text + f"\n\n{footer}"
+        for attempt in range(3):
             try:
-                full_text = full_tf_msg + f"\n\n{ts_footer}"
-                await session.post(f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
-                                 json={"chat_id": CONFIG.CHAT_ID, "text": full_text, "parse_mode": "Markdown"})
-                await asyncio.sleep(0.5)
+                async with session.post(
+                    f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
+                    json={"chat_id": CONFIG.CHAT_ID, "text": full_text, "parse_mode": "Markdown"}
+                ) as resp:
+                    if resp.status == 429:
+                        wait = int(resp.headers.get("Retry-After", 5))
+                        logging.warning(f"⚠️ TG Rate Limit. Waiting {wait}s")
+                        await asyncio.sleep(wait)
+                        continue
+                    elif resp.status != 200:
+                        logging.error(f"TG Fail {resp.status}: {await resp.text()}")
+                        break
+                    await asyncio.sleep(0.5) # Safety gap
+                    break
             except Exception as e:
-                logging.error(f"TG Send Fail: {e}")
+                logging.error(f"TG Ex: {e}")
+                await asyncio.sleep(1)
                 
     async def fetch_symbols_hybrid(self, binance: BinanceClient, bybit: BybitClient) -> Tuple[List[str], List[str], List[str], List[str]]:
         cached = await self.cache.get_cached_symbols()
