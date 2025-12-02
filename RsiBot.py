@@ -936,7 +936,9 @@ class RsiBot:
                 message_parts.append(header)
 
                 # --- SPACIOUS TABLE LOGIC ---
-                CELL_WIDTH = 15  # Fixed width for ALL cells
+                SYM_WIDTH = 8   # Fixed width for symbol (handles up to 8 chars)
+                RSI_WIDTH = 6   # Fixed width for RSI value
+                CELL_WIDTH = SYM_WIDTH + RSI_WIDTH + 2  # +2 for arrow and fire
                 
                 for i in range(0, len(items), 3):
                     chunk = items[i:i + 3]
@@ -947,18 +949,14 @@ class RsiBot:
                         arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
                         fire = "!" if item.hot else " "
                         
-                        # Build content
-                        content = f"{sym:<6}{item.rsi:>6.1f}{arrow}{fire}"
-                        
-                        # FORCE exact width (this is the key fix!)
-                        cell = f"{content:<{CELL_WIDTH}}"
+                        # EACH FIELD has its own fixed width
+                        cell = f"{sym:<{SYM_WIDTH}}{item.rsi:>{RSI_WIDTH}.1f}{arrow}{fire}"
                         cells.append(cell)
                     
-                    # Pad incomplete rows with empty cells of SAME width
+                    # Pad incomplete rows
                     while len(cells) < 3:
                         cells.append(" " * CELL_WIDTH)
                     
-                    # Join with consistent separator
                     row_str = " | ".join(cells)
                     message_parts.append(row_str)
 
