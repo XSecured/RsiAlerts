@@ -935,7 +935,7 @@ class RsiBot:
                 else:               header = "\n🔽 LOWER BAND"
                 message_parts.append(header)
 
-                # --- SPACIOUS TABLE LOGIC ---
+                # --- PERFECT ALIGNMENT TABLE LOGIC ---
                 for i in range(0, len(items), 3):
                     chunk = items[i:i + 3]
                     cells = []
@@ -943,19 +943,30 @@ class RsiBot:
                     for item in chunk:
                         sym = clean_name(item.symbol)
                         
+                        # Direction Arrow
                         arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
-                        fire = "🔥" if item.hot else "  "
                         
-                        # Create fixed-width cell (15 chars total)
+                        # Volatility Marker (The Fix)
+                        # Using "!" guarantees perfect 1-char width.
+                        fire = "!" if item.hot else " "
+                        
+                        # Create fixed-width cell
+                        # Format: "SYM    12.3 !" (Total 15 chars)
+                        # Sym: 7 chars (Left)
+                        # RSI: 5 chars (Right)
+                        # Arrow: 1 char
+                        # Fire: 1 char
                         cell = f"{sym:<7}{item.rsi:>5.1f}{arrow}{fire}"
                         cells.append(cell)
                     
-                    # Pad incomplete rows to maintain alignment
+                    # Pad incomplete rows
                     while len(cells) < 3:
-                        cells.append(" " * 15)  # Empty cell with same width
+                        cells.append(" " * 14)  # 14 chars of empty space
                     
-                    # Join with consistent separator
-                    row_str = " | ".join(cells)
+                    # Join with SPACIOUS Separator
+                    # The separator itself is just characters.
+                    # "      | " ensures visual separation.
+                    row_str = "   | ".join(cells)
                     message_parts.append(row_str)
 
             message_parts.append("```")
