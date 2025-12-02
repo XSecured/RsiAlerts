@@ -9,5 +9,4 @@ dependencies:
   - aiohttp
   - redis-py
   - uvloop
-  - wcwidth
   #- pip
