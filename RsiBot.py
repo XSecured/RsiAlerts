@@ -1146,14 +1146,14 @@ class RsiBot:
                         tf_tasks.append(scan_one(client, sym, mkt, ex))
                     
                     results = await asyncio.gather(*tf_tasks, return_exceptions=True)
-                
+
                     for result in results:
                         if isinstance(result, list):
                             final_hits.extend(result)
-                        elif isinstance(result, Exception):
-                            # FIX: Log the error instead of swallowing it
-                            logging.error(f"⚠️ Scan Task Failed: {result}")
                             scan_stats[tf].hits_found += len(result)
+                    
+                        elif isinstance(result, Exception):
+                            logging.error(f"⚠️ Scan Task Failed: {result}")
                     
                     scan_stats[tf].successful_scans = len([r for r in results if r is not None and not isinstance(r, Exception)])
                     
