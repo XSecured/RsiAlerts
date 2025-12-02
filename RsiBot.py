@@ -983,7 +983,7 @@ class RsiBot:
                     # Check length before adding row
                     # +1 for newline
                     if current_chars + len(row_str) + 1 > 3800:
-                        current_buffer.append("```
+                        current_buffer.append("```")
                         await self._safe_send(session, "\n".join(current_buffer), ts_footer)
                         current_buffer = ["```", row_str] # Continue list in new block
                         current_chars = 3 + len(row_str)
