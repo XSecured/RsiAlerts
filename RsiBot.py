@@ -472,8 +472,9 @@ class RobustProxyPool:
         """Report failed request."""
         async with self._lock:
             self._record_failure(proxy)
-
-    async def fetch(
+            
+    ############UNUSED BUILT IN CORE PROXY SYSTEM FUNCTIONS, PROXY SYSTEM ONLY WORK 100% WITH THEM
+    '''async def fetch(
         self,
         url: str,
         method: str = "GET",
@@ -695,7 +696,7 @@ class RobustProxyPool:
         active = self.active_proxies
         scored = [(p, self._proxies[p].compute_score(), self._proxies[p].success_rate) for p in active]
         scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:n]
+        return scored[:n]'''
 
 # ==========================================
 # REDIS CACHE MANAGER
@@ -905,7 +906,7 @@ class RsiBot:
         grouped = {}
         for h in hits: grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
 
-        tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m"]
+        tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m", "5m", "3m"]
         ts_footer = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
 
         def clean_name(s):
@@ -942,7 +943,7 @@ class RsiBot:
                 # Add section header to buffer
                 if current_chars + len(header) + 50 > 3800:
                     # Close current block, start new one
-                    current_buffer.append("```
+                    current_buffer.append("```")
                     await self._safe_send(session, "\n".join(current_buffer), ts_footer)
                     current_buffer = ["```", header] # Start new block with the header
                     current_chars = 3 + len(header)
@@ -956,7 +957,7 @@ class RsiBot:
                     for item in chunk:
                         sym = clean_name(item.symbol)
                         arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
-                        hot_mark = "!" if item.hot else " "
+                        hot_mark = "🔥" if item.hot else " "
                         # Adjusted spacing for alignment
                         cell = f"{sym:<6}{item.rsi:>4.1f}{arrow}{hot_mark}"
                         if row_str: row_str += " | "
