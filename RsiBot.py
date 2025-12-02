@@ -935,38 +935,31 @@ class RsiBot:
                 else:               header = "\n🔽 LOWER BAND"
                 message_parts.append(header)
 
-                # --- PERFECT ALIGNMENT TABLE LOGIC ---
+                # --- SPACIOUS TABLE LOGIC ---
+                CELL_WIDTH = 15  # Fixed width for ALL cells
+                
                 for i in range(0, len(items), 3):
                     chunk = items[i:i + 3]
                     cells = []
                     
                     for item in chunk:
                         sym = clean_name(item.symbol)
-                        
-                        # Direction Arrow
                         arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
-                        
-                        # Volatility Marker (The Fix)
-                        # Using "!" guarantees perfect 1-char width.
                         fire = "!" if item.hot else " "
                         
-                        # Create fixed-width cell
-                        # Format: "SYM    12.3 !" (Total 15 chars)
-                        # Sym: 7 chars (Left)
-                        # RSI: 5 chars (Right)
-                        # Arrow: 1 char
-                        # Fire: 1 char
-                        cell = f"{sym:<7}{item.rsi:>5.1f}{arrow}{fire}"
+                        # Build content
+                        content = f"{sym:<6}{item.rsi:>6.1f}{arrow}{fire}"
+                        
+                        # FORCE exact width (this is the key fix!)
+                        cell = f"{content:<{CELL_WIDTH}}"
                         cells.append(cell)
                     
-                    # Pad incomplete rows
+                    # Pad incomplete rows with empty cells of SAME width
                     while len(cells) < 3:
-                        cells.append(" " * 14)  # 14 chars of empty space
+                        cells.append(" " * CELL_WIDTH)
                     
-                    # Join with SPACIOUS Separator
-                    # The separator itself is just characters.
-                    # "      | " ensures visual separation.
-                    row_str = "   | ".join(cells)
+                    # Join with consistent separator
+                    row_str = " | ".join(cells)
                     message_parts.append(row_str)
 
             message_parts.append("```")
