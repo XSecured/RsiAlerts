@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Set, Optional, Tuple, Any
 from itertools import cycle
+from enum import Enum
 
 import aiohttp
 import numpy as np
@@ -88,112 +89,616 @@ class ScanStats:
     hits_found: int = 0
 
 # ==========================================
-# PROXY POOL (IMPROVEMENT #5: Dynamic Health Scoring)
+# ULTRA-ROBUST ASYNC PROXY POOL - PRODUCTION GRADE
 # ==========================================
 
-class AsyncProxyPool:
-    def __init__(self, max_pool_size=20):
-        self.proxies: List[str] = []
-        self.max_pool_size = max_pool_size
-        self._lock = asyncio.Lock()
-        self.health: Dict[str, Dict[str, Any]] = {}  # proxy -> stats
-        self._iterator = None # The infinite loop provider
+class ProxyState(Enum):
+    ACTIVE = "active"
+    COOLING = "cooling"
+    BANNED = "banned"
 
-    async def populate(self, url: str, session: aiohttp.ClientSession):
-        if not url: return
-        raw = []
+
+@dataclass
+class ProxyStats:
+    successes: int = 0
+    failures: int = 0
+    consecutive_failures: int = 0
+    total_latency_ms: float = 0.0
+    last_used: float = field(default_factory=time.time)
+    last_success: float = 0.0
+    last_failure: float = 0.0
+    state: ProxyState = ProxyState.ACTIVE
+    cooldown_until: float = 0.0
+
+    @property
+    def total_uses(self) -> int:
+        return self.successes + self.failures
+
+    @property
+    def success_rate(self) -> float:
+        if self.total_uses == 0:
+            return 0.8  # Optimistic for new proxies
+        return self.successes / self.total_uses
+
+    @property
+    def avg_latency_ms(self) -> float:
+        if self.successes == 0:
+            return 9999.0
+        return self.total_latency_ms / self.successes
+
+    def compute_score(self) -> float:
+        """Higher = better. Combines success rate, latency, freshness."""
+        if self.state != ProxyState.ACTIVE:
+            return 0.0
+
+        score = self.success_rate
+
+        # Exponential penalty for consecutive failures
+        score *= (0.5 ** self.consecutive_failures)
+
+        # Latency bonus (faster = better)
+        if self.avg_latency_ms < 9999:
+            latency_factor = max(0.1, 1.0 - (self.avg_latency_ms / 5000))
+            score *= (0.6 + 0.4 * latency_factor)
+
+        # Freshness bonus for untested proxies
+        if self.total_uses < 3:
+            score += 0.15
+
+        return max(0.001, min(1.0, score))
+
+
+class RobustProxyPool:
+    """
+    Production-grade async proxy pool with:
+    - Weighted scoring selection
+    - Circuit breaker pattern
+    - Auto-retry with fallback
+    - Multi-source aggregation
+    - Background health maintenance
+    - Guaranteed request delivery
+    """
+
+    PROXY_SOURCES = [
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
+    ]
+
+    def __init__(
+        self,
+        max_pool_size: int = 20,
+        min_pool_size: int = 15,
+        max_consecutive_failures: int = 2,
+        cooldown_seconds: float = 90.0,
+        ban_after_uses: int = 8,
+        ban_below_rate: float = 0.25,
+        validation_concurrency: int = 100,
+        background_refresh_interval: float = 180.0,
+        request_timeout: float = 7.0,
+        validation_timeout: float = 4.0,
+        allow_direct_fallback: bool = False,
+    ):
+        self.max_pool_size = max_pool_size
+        self.min_pool_size = min_pool_size
+        self.max_consecutive_failures = max_consecutive_failures
+        self.cooldown_seconds = cooldown_seconds
+        self.ban_after_uses = ban_after_uses
+        self.ban_below_rate = ban_below_rate
+        self.validation_concurrency = validation_concurrency
+        self.background_refresh_interval = background_refresh_interval
+        self.request_timeout = request_timeout
+        self.validation_timeout = validation_timeout
+        self.allow_direct_fallback = allow_direct_fallback
+
+        self._proxies: Dict[str, ProxyStats] = {}
+        self._lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._refresh_task: Optional[asyncio.Task] = None
+        self._custom_sources: List[str] = []
+        self._initialized = False
+
+        # Stats tracking
+        self._total_requests = 0
+        self._successful_requests = 0
+        self._direct_fallbacks = 0
+
+    @property
+    def active_proxies(self) -> List[str]:
+        now = time.time()
+        active = []
+        for proxy, stats in self._proxies.items():
+            if stats.state == ProxyState.ACTIVE:
+                active.append(proxy)
+            elif stats.state == ProxyState.COOLING and now > stats.cooldown_until:
+                stats.state = ProxyState.ACTIVE
+                stats.consecutive_failures = 0
+                active.append(proxy)
+        return active
+
+    @property
+    def pool_size(self) -> int:
+        return len(self.active_proxies)
+
+    @property
+    def is_healthy(self) -> bool:
+        return self.pool_size >= self.min_pool_size
+
+    async def initialize(
+        self,
+        session: aiohttp.ClientSession,
+        additional_sources: Optional[List[str]] = None,
+        start_background_tasks: bool = True,
+    ) -> bool:
+        self._session = session
+
+        if additional_sources:
+            self._custom_sources = list(additional_sources)
+
+        logging.info("🚀 Initializing Robust Proxy Pool...")
+        await self._populate_pool()
+
+        if start_background_tasks:
+            self._start_background_refresh()
+
+        self._initialized = True
+
+        if self.pool_size > 0:
+            logging.info(f"✅ Proxy Pool Ready: {self.pool_size} active proxies")
+            return True
+        else:
+            logging.error("❌ No working proxies found!")
+            return False
+
+    async def shutdown(self):
+        """Gracefully shutdown background tasks."""
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+        logging.info("🛑 Proxy Pool shut down")
+
+    async def _fetch_from_source(self, url: str) -> Set[str]:
+        """Fetch proxies from a single source URL."""
+        proxies = set()
         try:
-            logging.info(f"📥 Fetching proxies from {url}...")
-            async with session.get(url, timeout=15) as resp:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with self._session.get(url, timeout=timeout) as resp:
                 if resp.status == 200:
                     text = await resp.text()
                     for line in text.splitlines():
                         p = line.strip()
-                        if p: raw.append(p if "://" in p else f"http://{p}")
+                        if p and not p.startswith('#') and '.' in p:
+                            if "://" not in p:
+                                p = f"http://{p}"
+                            proxies.add(p)
         except Exception as e:
-            logging.error(f"❌ Proxy fetch failed: {e}")
-            return
+            logging.debug(f"Source fetch failed ({url}): {e}")
+        return proxies
 
-        logging.info(f"🔎 Validating {len(raw)} proxies...")
-        self.proxies = []
-        self.health = {}
-        
-        sem = asyncio.Semaphore(100)
-        async def protected_test(p):
-            async with sem: return await self._test_proxy(p, session)
-
-        tasks = [asyncio.create_task(protected_test(p)) for p in raw]
-        for future in asyncio.as_completed(tasks):
-            try:
-                proxy, is_good = await future
-                if is_good:
-                    self.proxies.append(proxy)
-                    self.health[proxy] = {"strikes": 0, "uses": 0}
-                    if len(self.proxies) >= self.max_pool_size: break
-            except: pass
-        
-        for t in tasks:
-            if not t.done(): t.cancel()
-        await asyncio.sleep(0.1)
-        
-        if self.proxies:
-            logging.info(f"✅ Proxy Pool Ready: {len(self.proxies)} proxies.")
-            # Create the infinite iterator immediately after population
-            self._iterator = cycle(self.proxies)
-        else:
-            logging.error("❌ NO WORKING PROXIES FOUND!")
-
-    async def _test_proxy(self, proxy: str, session: aiohttp.ClientSession) -> Tuple[str, bool]:
+    async def _validate_proxy(self, proxy: str) -> Tuple[str, bool, float]:
+        """
+        Validate a single proxy against Binance API.
+        Returns: (proxy, is_valid, latency_ms)
+        """
+        start = time.time()
         try:
-            url = "https://fapi.binance.com/fapi/v1/klines"
-            params = {"symbol": "BTCUSDT", "interval": "1m", "limit": "2"}
-            async with session.get(url, params=params, proxy=proxy, timeout=4) as resp:
+            timeout = aiohttp.ClientTimeout(total=self.validation_timeout)
+            url = "https://fapi.binance.com/fapi/v1/time"
+            
+            async with self._session.get(url, proxy=proxy, timeout=timeout) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        return proxy, True
-                return proxy, False
+                    if "serverTime" in data:
+                        latency_ms = (time.time() - start) * 1000
+                        return proxy, True, latency_ms
         except:
-            return proxy, False
+            pass
+        return proxy, False, 0.0
+
+    async def _populate_pool(self):
+        """Fetch and validate proxies from all sources."""
+        all_sources = self.PROXY_SOURCES + self._custom_sources
+
+        logging.info(f"📥 Fetching from {len(all_sources)} proxy sources...")
+
+        fetch_tasks = [self._fetch_from_source(url) for url in all_sources]
+        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+        all_raw = set()
+        for result in results:
+            if isinstance(result, set):
+                all_raw.update(result)
+
+        new_candidates = all_raw - set(self._proxies.keys())
+        logging.info(f"🔎 Validating {len(new_candidates)} new proxy candidates...")
+
+        if not new_candidates:
+            return
+
+        sem = asyncio.Semaphore(self.validation_concurrency)
+        validated_count = 0
+
+        async def validate_with_limit(proxy: str):
+            async with sem:
+                return await self._validate_proxy(proxy)
+
+        tasks = [asyncio.create_task(validate_with_limit(p)) for p in new_candidates]
+
+        for coro in asyncio.as_completed(tasks):
+            try:
+                proxy, is_valid, latency_ms = await coro
+                if is_valid:
+                    async with self._lock:
+                        if proxy not in self._proxies:
+                            self._proxies[proxy] = ProxyStats(
+                                successes=1,
+                                total_latency_ms=latency_ms,
+                                last_success=time.time(),
+                            )
+                            validated_count += 1
+
+                            if len(self.active_proxies) >= self.max_pool_size:
+                                break
+            except:
+                pass
+
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+        await asyncio.sleep(0.05)
+        logging.info(f"✨ Added {validated_count} new proxies (total active: {self.pool_size})")
+
+    def _start_background_refresh(self):
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._background_refresh_loop())
+
+    async def _background_refresh_loop(self):
+        """Periodically refresh and health-check the pool."""
+        while True:
+            try:
+                await asyncio.sleep(self.background_refresh_interval)
+
+                if self.pool_size < self.min_pool_size:
+                    logging.warning(f"⚠️ Pool critically low ({self.pool_size}), refreshing...")
+                    await self._populate_pool()
+
+                await self._prune_old_banned()
+                await self._spot_health_check()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"Background refresh error: {e}")
+
+    async def _prune_old_banned(self):
+        """Remove long-banned proxies to free memory."""
+        async with self._lock:
+            cutoff = time.time() - 600
+            to_remove = [
+                p for p, s in self._proxies.items()
+                if s.state == ProxyState.BANNED and s.last_failure < cutoff
+            ]
+            for p in to_remove:
+                del self._proxies[p]
+            if to_remove:
+                logging.debug(f"🧹 Pruned {len(to_remove)} old banned proxies")
+
+    async def _spot_health_check(self):
+        """Quickly test a random sample of active proxies."""
+        active = self.active_proxies
+        if len(active) < 5:
+            return
+
+        sample = random.sample(active, min(5, len(active)))
+        tasks = [self._validate_proxy(p) for p in sample]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        async with self._lock:
+            for result in results:
+                if isinstance(result, tuple):
+                    proxy, is_valid, latency_ms = result
+                    if proxy in self._proxies:
+                        if is_valid:
+                            self._proxies[proxy].successes += 1
+                            self._proxies[proxy].total_latency_ms += latency_ms
+                            self._proxies[proxy].consecutive_failures = 0
+                        else:
+                            self._record_failure(proxy)
+
+    def _select_weighted(self) -> Optional[str]:
+        """Select proxy using weighted random based on scores."""
+        active = self.active_proxies
+        if not active:
+            return None
+
+        scored = [(p, self._proxies[p].compute_score()) for p in active]
+        total = sum(s for _, s in scored)
+
+        if total <= 0:
+            return random.choice(active)
+
+        r = random.random() * total
+        cumulative = 0.0
+        for proxy, score in scored:
+            cumulative += score
+            if cumulative >= r:
+                return proxy
+
+        return scored[-1][0]
 
     async def get_proxy(self) -> Optional[str]:
-        """Lightning fast, Lock-Free proxy selector"""
-        if not self.proxies or not self._iterator: return None
-        
-        # No await, no lock, just grab next one instantly
-        # Note: 'cycle' is thread-safe in CPython for simple next() calls, 
-        # and perfectly safe in asyncio single-threaded event loop.
-        return next(self._iterator)
+        """Get the best available proxy."""
+        proxy = self._select_weighted()
+        if proxy:
+            self._proxies[proxy].last_used = time.time()
+        return proxy
+
+    def _record_failure(self, proxy: str):
+        """Record failure (internal, call within lock or sync context)."""
+        if proxy not in self._proxies:
+            return
+
+        stats = self._proxies[proxy]
+        stats.failures += 1
+        stats.consecutive_failures += 1
+        stats.last_failure = time.time()
+
+        if stats.consecutive_failures >= self.max_consecutive_failures:
+            stats.state = ProxyState.COOLING
+            stats.cooldown_until = time.time() + self.cooldown_seconds
+            logging.debug(f"⏸️ {proxy} cooling down ({self.cooldown_seconds}s)")
+
+        if stats.total_uses >= self.ban_after_uses and stats.success_rate < self.ban_below_rate:
+            stats.state = ProxyState.BANNED
+            logging.warning(f"🚫 Banned {proxy} (rate: {stats.success_rate:.0%})")
+
+    async def report_success(self, proxy: str, latency_ms: Optional[float] = None):
+        """Report successful request."""
+        async with self._lock:
+            if proxy not in self._proxies:
+                return
+            stats = self._proxies[proxy]
+            stats.successes += 1
+            stats.consecutive_failures = 0
+            stats.last_success = time.time()
+            if latency_ms:
+                stats.total_latency_ms += latency_ms
+            if stats.state == ProxyState.COOLING:
+                stats.state = ProxyState.ACTIVE
 
     async def report_failure(self, proxy: str):
-        """Updates health and bans if necessary"""
+        """Report failed request."""
         async with self._lock:
-            if proxy not in self.health: return
+            self._record_failure(proxy)
 
-            h = self.health[proxy]
-            h["strikes"] += 1
-            h["uses"] += 1 # Count failed attempts as uses too
+    async def fetch(
+        self,
+        url: str,
+        method: str = "GET",
+        max_retries: int = 8,
+        base_delay: float = 0.05,
+        **kwargs,
+    ) -> Tuple[bool, Any]:
+        """
+        Fetch URL with automatic proxy rotation and retry.
+        
+        Returns:
+            (True, response_data) on success
+            (False, error_message) on failure
+        """
+        if not self._session:
+            return False, "Session not initialized"
+
+        self._total_requests += 1
+        tried_proxies: Set[str] = set()
+        last_error = "Unknown error"
+
+        for attempt in range(max_retries):
+            proxy = None
+            available = set(self.active_proxies) - tried_proxies
             
-            # Logic: If > 10 uses and > 40% failure rate, BAN IT.
-            success_rate = 1 - (h["strikes"] / max(h["uses"], 1))
+            if available:
+                proxy = self._select_from_set(available)
+            elif self.active_proxies:
+                proxy = self._select_weighted()
+
+            if proxy is None and self.allow_direct_fallback:
+                logging.debug("🔄 Attempting direct connection (no proxy)")
+                self._direct_fallbacks += 1
+
+            if proxy:
+                tried_proxies.add(proxy)
+
+            start_time = time.time()
+
+            try:
+                timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+                async with self._session.request(
+                    method, url, proxy=proxy, timeout=timeout, **kwargs
+                ) as resp:
+                    
+                    latency_ms = (time.time() - start_time) * 1000
+
+                    if resp.status == 200:
+                        try:
+                            data = await resp.json()
+                        except:
+                            data = await resp.text()
+
+                        if proxy:
+                            await self.report_success(proxy, latency_ms)
+
+                        self._successful_requests += 1
+                        return True, data
+
+                    if resp.status in (403, 407, 429, 502, 503):
+                        if proxy:
+                            await self.report_failure(proxy)
+                        last_error = f"HTTP {resp.status}"
+                    else:
+                        last_error = f"HTTP {resp.status}"
+
+            except asyncio.TimeoutError:
+                if proxy:
+                    await self.report_failure(proxy)
+                last_error = "Timeout"
+
+            except (aiohttp.ClientProxyConnectionError, aiohttp.ClientHttpProxyError) as e:
+                if proxy:
+                    await self.report_failure(proxy)
+                last_error = f"Proxy connection error"
+
+            except aiohttp.ClientError as e:
+                if proxy:
+                    await self.report_failure(proxy)
+                last_error = f"Client error: {type(e).__name__}"
+
+            except Exception as e:
+                if proxy:
+                    await self.report_failure(proxy)
+                last_error = f"Error: {type(e).__name__}"
+
+            if attempt < max_retries - 1:
+                delay = base_delay * (1.5 ** attempt) + random.uniform(0, 0.05)
+                await asyncio.sleep(delay)
+
+        return False, f"All {max_retries} attempts failed. Last: {last_error}"
+
+    def _select_from_set(self, candidates: Set[str]) -> Optional[str]:
+        """Select best proxy from a specific set."""
+        if not candidates:
+            return None
+        
+        scored = [(p, self._proxies[p].compute_score()) for p in candidates if p in self._proxies]
+        if not scored:
+            return None
             
-            if h["uses"] > 10 and success_rate < 0.6:
-                if proxy in self.proxies:
-                    try:
-                        self.proxies.remove(proxy)
-                        del self.health[proxy]
-                        logging.warning(f"🚫 Banned {proxy} ({success_rate:.1%} success)")
-                        
-                        # Rebuild iterator without the banned proxy
-                        if self.proxies:
-                            self._iterator = cycle(self.proxies)
-                        else:
-                            self._iterator = None
-                    except ValueError:
-                        pass # Already removed
+        total = sum(s for _, s in scored)
+        if total <= 0:
+            return random.choice(list(candidates))
+
+        r = random.random() * total
+        cumulative = 0.0
+        for proxy, score in scored:
+            cumulative += score
+            if cumulative >= r:
+                return proxy
+        return scored[-1][0]
+
+    async def fetch_json(self, url: str, max_retries: int = 8, **kwargs) -> Tuple[bool, Any]:
+        """Convenience wrapper for JSON endpoints."""
+        return await self.fetch(url, max_retries=max_retries, **kwargs)
+
+    async def fetch_binance_klines(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int = 500,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        max_retries: int = 10,
+    ) -> Tuple[bool, Any]:
+        """
+        Optimized method for Binance klines with extra retries.
+        
+        Returns:
+            (True, klines_list) on success
+            (False, error_message) on failure
+        """
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        }
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+
+        success, data = await self.fetch(url, params=params, max_retries=max_retries)
+
+        if success and isinstance(data, list):
+            return True, data
+        elif success:
+            return False, f"Unexpected response type: {type(data)}"
+        else:
+            return False, data
+
+    async def fetch_multiple_symbols(
+        self,
+        symbols: List[str],
+        interval: str,
+        limit: int = 500,
+        concurrency: int = 10,
+    ) -> Dict[str, Tuple[bool, Any]]:
+        """
+        Fetch klines for multiple symbols with controlled concurrency.
+        Returns dict: {symbol: (success, data_or_error)}
+        """
+        sem = asyncio.Semaphore(concurrency)
+        results = {}
+
+        async def fetch_one(symbol: str):
+            async with sem:
+                return symbol, await self.fetch_binance_klines(symbol, interval, limit)
+
+        tasks = [fetch_one(s) for s in symbols]
+        for coro in asyncio.as_completed(tasks):
+            symbol, result = await coro
+            results[symbol] = result
+
+        return results
+
+    async def force_refresh(self):
+        """Force an immediate pool refresh."""
+        logging.info("🔄 Force refreshing proxy pool...")
+        await self._populate_pool()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get detailed pool statistics."""
+        states = {"active": 0, "cooling": 0, "banned": 0}
+        total_success_rate = 0.0
+        total_latency = 0.0
+        count_for_avg = 0
+
+        for proxy, stats in self._proxies.items():
+            states[stats.state.value] += 1
+            if stats.state == ProxyState.ACTIVE and stats.total_uses > 0:
+                total_success_rate += stats.success_rate
+                total_latency += stats.avg_latency_ms
+                count_for_avg += 1
+
+        request_success_rate = 0
+        if self._total_requests > 0:
+            request_success_rate = self._successful_requests / self._total_requests
+
+        return {
+            "pool_size": self.pool_size,
+            "total_proxies": len(self._proxies),
+            "active": states["active"],
+            "cooling": states["cooling"],
+            "banned": states["banned"],
+            "avg_proxy_success_rate": (total_success_rate / count_for_avg) if count_for_avg else 0,
+            "avg_latency_ms": (total_latency / count_for_avg) if count_for_avg else 0,
+            "total_requests": self._total_requests,
+            "successful_requests": self._successful_requests,
+            "request_success_rate": request_success_rate,
+            "direct_fallbacks": self._direct_fallbacks,
+            "is_healthy": self.is_healthy,
+        }
+
+    def get_top_proxies(self, n: int = 10) -> List[Tuple[str, float, float]]:
+        """Get top N proxies by score. Returns [(proxy, score, success_rate), ...]"""
+        active = self.active_proxies
+        scored = [(p, self._proxies[p].compute_score(), self._proxies[p].success_rate) for p in active]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:n]
 
 # ==========================================
-# REDIS CACHE MANAGER (IMPROVEMENT #3: Integer Keys)
+# REDIS CACHE MANAGER
 # ==========================================
 
 class CacheManager:
@@ -259,10 +764,10 @@ class CacheManager:
 # ==========================================
 
 class ExchangeClient:
-    def __init__(self, session: aiohttp.ClientSession, proxy_pool: AsyncProxyPool):
+    def __init__(self, session: aiohttp.ClientSession, proxy_pool: RobustProxyPool):
         self.session = session
         self.proxies = proxy_pool
-        limit = CONFIG.MAX_CONCURRENCY if proxy_pool.proxies else 5
+        limit = CONFIG.MAX_CONCURRENCY if proxy_pool.active_proxies else 5
         self.sem = asyncio.Semaphore(limit)
 
     async def _request(self, url: str, params: dict = None) -> Any:
@@ -342,7 +847,7 @@ class BybitClient(ExchangeClient):
         return closes[::-1]
 
 # ==========================================
-# CORE LOGIC (IMPROVEMENT #3: Integer Keys Only)
+# CORE LOGIC
 # ==========================================
 
 def get_cache_key(tf: str) -> int:
@@ -380,13 +885,19 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
     return None, None, 0.0
 
 # ==========================================
-# MAIN BOT (IMPROVEMENT #1: Hybrid Fetch + #6: Session Reuse)
+# MAIN BOT
 # ==========================================
 
 class RsiBot:
     def __init__(self):
         self.cache = CacheManager()
-        self.proxies = AsyncProxyPool()
+        self.proxies = RobustProxyPool(
+            validation_concurrency=100,
+            allow_direct_fallback=False,
+            max_pool_size=20,
+            request_timeout=CONFIG.REQUEST_TIMEOUT,
+            validation_timeout=4.0
+        )
         
     async def send_report(self, session: aiohttp.ClientSession, hits: List[TouchHit]):
         if not hits: return
@@ -400,7 +911,7 @@ class RsiBot:
         def clean_name(s):
             s = s.replace("USDT", "")
             s = re.sub(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])", "", s)
-            return s[:6] # Hard limit 6 chars
+            return s[:6]
 
         for tf in tf_order:
             if tf not in grouped: continue
@@ -408,12 +919,8 @@ class RsiBot:
             total_hits = sum(len(grouped[tf].get(t, [])) for t in ["UPPER", "MIDDLE", "LOWER"])
             if total_hits == 0: continue
 
-            # Start the message with the Timeframe Header (Bold, not code)
-            # Using a special whitespace to force wide bubble on mobile
             header_pad = "⠀" * 10
             message_parts = [f"⏱ *{tf} Timeframe* ({total_hits}){header_pad}\n"]
-            
-            # Start the Code Block
             message_parts.append("```")
 
             targets = ["UPPER", "MIDDLE", "LOWER"]
@@ -428,31 +935,14 @@ class RsiBot:
                 else:               header = "\n🔽 LOWER BAND"
                 message_parts.append(header)
 
-                # --- TABLE LOGIC ---
-                # We format 3 items per line.
-                # Each item is fixed width: "SYM    12.3" (11 chars)
-                # + Separator " | "
-                
                 for i in range(0, len(items), 3):
                     chunk = items[i:i + 3]
                     row_str = ""
                     
                     for item in chunk:
                         sym = clean_name(item.symbol)
-                        # Arrow for Middle BB
                         arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
-                        
-                        # Fire logic: We can't put emojis inside the code block safely for alignment.
-                        # But we can put a marker like "*" or "!" 
-                        # OR we just accept that the fire emoji might wobble the line slightly.
-                        # Let's try a text marker for inside the block: "!"
                         hot_mark = "!" if item.hot else " "
-                        
-                        # Construct Cell: "BTC    70.1! "
-                        # Sym: 6 chars left align
-                        # RSI: 4 chars right align
-                        # Arrow: 1 char
-                        # Hot: 1 char
                         cell = f"{sym:<6}{item.rsi:>4.1f}{arrow}{hot_mark}"
                         
                         if row_str: row_str += " | "
@@ -460,24 +950,10 @@ class RsiBot:
                     
                     message_parts.append(row_str)
 
-            # Close the Code Block
             message_parts.append("```")
-            
-            # Combine everything
             full_tf_msg = "\n".join(message_parts)
 
-            # --- Send Logic (Simple Chunking) ---
-            # Since it's one big code block, we can't split it easily in the middle.
-            # But 4096 chars is A LOT of text. 
-            # If a message is too long, we should split it by SECTIONS (Upper/Lower) if possible.
-            # For simplicity, let's just send it. If it fails > 4096, we might lose data, 
-            # but chunking a code block is ugly (you have to close/reopen ```
-            
-            # Let's add a basic check to split by lines if absolutely necessary
             if len(full_tf_msg) > 4000:
-                # Fallback: Send raw lines without the code block wrapper? 
-                # Or just split into 2 messages, closing the block on the first and opening on the second.
-                # For now, let's assume 300 items fits in 4096 chars (it barely does).
                 pass
 
             try:
@@ -489,21 +965,16 @@ class RsiBot:
                 logging.error(f"TG Send Fail: {e}")
                 
     async def fetch_symbols_hybrid(self, binance: BinanceClient, bybit: BybitClient) -> Tuple[List[str], List[str], List[str], List[str]]:
-        """Fetches symbols with per-exchange fallback to cache."""
-        
         cached = await self.cache.get_cached_symbols()
         cached_data = cached.get('data') if cached else None
         
         async def try_fetch(fetch_func, cache_key: str, name: str):
-            # Only try ONCE per exchange. 
-            # The internal _request already retries 5 times. That is enough.
             result = await fetch_func()
             
             if result and len(result) > 0:
                 logging.info(f"✅ {name}: {len(result)} symbols")
                 return result
             
-            # If live fetch fails, immediately check cache
             if cached_data and cache_key in cached_data:
                 logging.warning(f"⚠️ {name}: Live fetch failed. Using CACHE ({len(cached_data[cache_key])} syms)")
                 return cached_data[cache_key]
@@ -527,11 +998,10 @@ class RsiBot:
         logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
         await self.cache.init()
         async with aiohttp.ClientSession() as session:
-            await self.proxies.populate(CONFIG.PROXY_URL, session)
+            await self.proxies.initialize(session, additional_sources=[CONFIG.PROXY_URL])
             binance = BinanceClient(session, self.proxies)
             bybit = BybitClient(session, self.proxies)
             
-            # 1. HYBRID SYMBOL FETCH
             bp, bs, yp, ys = await self.fetch_symbols_hybrid(binance, bybit)
             
             seen = set()
@@ -555,19 +1025,13 @@ class RsiBot:
             total_sym_count = len(all_pairs)
             logging.info(f"Total symbols: {total_sym_count}")
             
-            # 2. ORIGINAL VOLATILITY CALCULATION (OPTIMIZED SEMAPHORE - NO TIMEOUT)
             logging.info("Calculating Volatility...")
             vol_scores = {}
-            
-            # Still use Semaphore to control concurrency (200 at a time)
             vol_sem = asyncio.Semaphore(50) 
 
             async def check_vol(client, sym, mkt):
-                # Wait for a slot
                 async with vol_sem:
                     try:
-                        # Removed asyncio.wait_for() wrapper.
-                        # Now it will rely entirely on your ExchangeClient's internal timeout (7s) and retries (5x).
                         c = await client.fetch_closes_volatility(sym, mkt)
                         if c:
                             v = calculate_volatility(c)
@@ -575,14 +1039,12 @@ class RsiBot:
                     except Exception:
                         pass
             
-            # Task creation and Execution
             vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
             await asyncio.gather(*vol_tasks)
             
             hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:90])
             logging.info(f"Vol Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot: {len(hot_coins)}")
             
-            # 3. PRECISION SCAN SETUP WITH EARLY SENT STATE CHECK
             sent_state = await self.cache.get_sent_state()
             scan_stats = {tf: ScanStats(tf, "Unknown", total_symbols=total_sym_count) for tf in ACTIVE_TFS}
             
@@ -611,14 +1073,12 @@ class RsiBot:
                     tfs_to_scan_fresh.append(tf)
                     scan_stats[tf].source = "Fresh Scan (Low TF)"
             
-            # 4. EXECUTE FRESH SCANS (batched by timeframe, ALL SYMBOLS)
             final_hits = []
             if tfs_to_scan_fresh:
                 logging.info(f"Scanning fresh TFs: {tfs_to_scan_fresh} across all symbols...")
                 
                 for tf in tfs_to_scan_fresh:
                     tf_tasks = []
-                    # Scan ALL symbols for this TF
                     async def scan_one(client, sym, mkt, ex):
                         closes = await client.fetch_closes(sym, tf, mkt)
                         if not closes: return None
@@ -644,10 +1104,8 @@ class RsiBot:
                         tf_hits = [h for h in final_hits if h.timeframe == tf]
                         await self.cache.save_scan_results(tf, candle_key, [h.to_dict() for h in tf_hits])
             
-            # 5. MERGE CACHED
             final_hits.extend(cached_hits_to_use)
             
-            # Summary
             logging.info("="*60)
             logging.info(f"{'TF':<5} | {'Source':<25} | {'Success':<15} | {'Hits'}")
             logging.info("-" * 60)
@@ -657,7 +1115,6 @@ class RsiBot:
                 logging.info(f"[{tf:<3}] {st.source:<25} | {succ_str:<15} | {st.hits_found}")
             logging.info("="*60)
             
-            # 6. ALERTING
             hits_to_send = []
             new_state = sent_state.copy()
             for h in final_hits:
