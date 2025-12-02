@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Set, Optional, Tuple, Any
 from itertools import cycle
 from enum import Enum
+from wcwidth import wcswidth
 
 import aiohttp
 import numpy as np
@@ -57,7 +58,7 @@ TIMEFRAME_MINUTES = {
     '1d': 1440, '1w': 10080
 }
 
-ACTIVE_TFS = ['15m', '5m', '30m', '1h', '4h', '1d', '1w']
+ACTIVE_TFS = ['15m', '30m', '1h', '4h', '1d', '1w']
 MIDDLE_BAND_TFS = ['4h', '1d', '1w']
 CACHED_TFS = {'4h', '1d', '1w'}
 
@@ -160,7 +161,7 @@ class RobustProxyPool:
     """
 
     PROXY_SOURCES = [
-        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
+        ""
     ]
 
     def __init__(
@@ -934,31 +935,37 @@ class RsiBot:
                 elif t == "MIDDLE": header = "\n💠 MIDDLE BAND"
                 else:               header = "\n🔽 LOWER BAND"
                 message_parts.append(header)
-
-                # --- SPACIOUS TABLE LOGIC ---
-                SYM_WIDTH = 8   # Fixed width for symbol (handles up to 8 chars)
-                RSI_WIDTH = 6   # Fixed width for RSI value
-                CELL_WIDTH = SYM_WIDTH + RSI_WIDTH + 2  # +2 for arrow and fire
                 
+                def strip_ansi(text):
+                    return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
+                
+                def pad_visual(text, width):
+                    """Pad to exact visual width, handling Unicode & ANSI."""
+                    visible = strip_ansi(text)
+                    padding = width - wcswidth(visible)
+                    return text + " " * max(0, padding)
+                
+                # --- PERFECTLY ALIGNED TABLE ---
                 for i in range(0, len(items), 3):
                     chunk = items[i:i + 3]
                     cells = []
                     
                     for item in chunk:
                         sym = clean_name(item.symbol)
-                        arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
+                        
+                        # Use explicit 1-column-wide symbols
+                        arrow = "v" if (t == "MIDDLE" and item.direction == "from above") else "^" if t == "MIDDLE" else " "
                         fire = "!" if item.hot else " "
                         
-                        # EACH FIELD has its own fixed width
-                        cell = f"{sym:<{SYM_WIDTH}}{item.rsi:>{RSI_WIDTH}.1f}{arrow}{fire}"
+                        # Build cell with EXACT visual widths:
+                        # Symbol: 7 columns | RSI: 5 columns | Arrow: 1 | Fire: 1 = 14 columns total
+                        symbol_part = pad_visual(sym[:6], 7)  # Truncate to 6, pad to 7
+                        rsi_part = f"{item.rsi:>5.1f}"
+                        
+                        cell = f"{symbol_part}{rsi_part}{arrow}{fire}"
                         cells.append(cell)
                     
-                    # Pad incomplete rows
-                    while len(cells) < 3:
-                        cells.append(" " * CELL_WIDTH)
-                    
-                    row_str = " | ".join(cells)
-                    message_parts.append(row_str)
+                    message_parts.append(" | ".join(cells))
 
             message_parts.append("```")
             full_tf_msg = "\n".join(message_parts)
