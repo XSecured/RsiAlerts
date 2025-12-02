@@ -1109,7 +1109,7 @@ class RsiBot:
             logging.info("="*60)
             logging.info(f"{'TF':<5} | {'Source':<25} | {'Success':<15} | {'Hits'}")
             logging.info("-" * 60)
-            for tf in sorted(ACTIVE_TFS, key=lambda x: ["15m","30m","1h","2h","4h","1d","1w"].index(x)):
+            for tf in sorted(ACTIVE_TFS, key=lambda x: ["5m","15m","30m","1h","2h","4h","1d","1w"].index(x)):
                 st = scan_stats[tf]
                 succ_str = "Skipped (Cached/Sent)" if st.source in ["Cached", "Already Sent"] else f"{st.successful_scans}/{st.total_symbols}"
                 logging.info(f"[{tf:<3}] {st.source:<25} | {succ_str:<15} | {st.hits_found}")
