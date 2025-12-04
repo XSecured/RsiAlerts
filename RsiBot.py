@@ -57,7 +57,7 @@ TIMEFRAME_MINUTES = {
     '1d': 1440, '1w': 10080
 }
 
-ACTIVE_TFS = ['15m', '30m', '1h', '4h', '1d', '1w']
+ACTIVE_TFS = ['4h', '1d', '1w']
 MIDDLE_BAND_TFS = ['4h', '1d', '1w']
 CACHED_TFS = {'4h', '1d', '1w'}
 
