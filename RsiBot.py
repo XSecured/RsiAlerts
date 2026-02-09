@@ -1132,21 +1132,21 @@ class RsiBot:
         
     async def send_report(self, session: aiohttp.ClientSession, hits: List[TouchHit]):
         """
-        Send formatted Telegram report using HTML parse mode with <pre> tags
-        for guaranteed monospace alignment across all Telegram clients.
+        Send formatted Telegram report using HTML parse mode with <pre> tags.
         
-        Layout:
-        - UPPER BAND section
-        - MIDDLE BAND ▲ BULLISH section
-        - MIDDLE BAND ▼ BEARISH section  
-        - LOWER BAND section
+        Uses a vertical list layout for guaranteed alignment on all devices.
+        Packs as many sections as possible into each message before splitting.
         
-        Each section shows 3 symbols per row, perfectly aligned.
+        Sections per timeframe:
+        - UPPER BAND
+        - MIDDLE BAND ▲ BULLISH
+        - MIDDLE BAND ▼ BEARISH
+        - LOWER BAND
         """
         if not hits:
             return
 
-        # Group hits by timeframe, then by section
+        # ── Group hits by timeframe → section ──
         grouped: Dict[str, Dict[str, List[TouchHit]]] = {}
         for h in hits:
             tf_group = grouped.setdefault(h.timeframe, {})
@@ -1170,44 +1170,15 @@ class RsiBot:
             s = re.sub(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])", "", s)
             return s[:6]
 
-        def format_cell(item: TouchHit) -> str:
-            """
-            Format a single symbol cell with fixed width for perfect alignment.
-            Layout: 'SYM   67.3🔥' = 6 + 5 + 2 = 13 chars per cell
-            """
-            sym = clean_name(item.symbol)
-            hot = "🔥" if item.hot else "  "
-            # 6 chars for symbol (left-aligned), 5 chars for RSI (right-aligned), 2 chars for hot
-            return f"{sym:<6}{item.rsi:>5.1f}{hot}"
-
-        def build_rows(items: List[TouchHit], cols: int = 3) -> List[str]:
-            """Build formatted rows with `cols` symbols per line, separated by │"""
-            rows = []
-            for i in range(0, len(items), cols):
-                chunk = items[i:i + cols]
-                cells = []
-                for item in chunk:
-                    cells.append(format_cell(item))
-                # Pad with empty cells if the last row is incomplete
-                while len(cells) < cols:
-                    cells.append(" " * 13)  # 13 = width of one cell
-                row = " │ ".join(cells)
-                rows.append(f"│ {row} │")
-            return rows
-
-        # Section definitions: key, emoji/label, sort order
+        # Section definitions: (key, label, sort_descending)
         section_defs = [
-            ("UPPER",          "🔼 UPPER BAND",           True),   # sort RSI descending
-            ("MIDDLE_BULLISH", "💠 MIDDLE ▲ BULLISH",      True),   # sort RSI descending
-            ("MIDDLE_BEARISH", "💠 MIDDLE ▼ BEARISH",      False),  # sort RSI ascending
-            ("LOWER",          "🔽 LOWER BAND",            False),  # sort RSI ascending
+            ("UPPER",          "🔼 UPPER BAND",          True),
+            ("MIDDLE_BULLISH", "💠 MIDDLE ▲ BULLISH",     True),
+            ("MIDDLE_BEARISH", "💠 MIDDLE ▼ BEARISH",     False),
+            ("LOWER",          "🔽 LOWER BAND",           False),
         ]
 
-        # Calculate the width of the box based on 3 columns
-        # Each cell = 13 chars, separator " │ " = 3 chars, borders "│ " and " │" = 4 chars
-        # Total = 4 + 13 + 3 + 13 + 3 + 13 = 49 chars
-        box_width = 49
-
+        # ── Process each timeframe ──
         for tf in tf_order:
             if tf not in grouped:
                 continue
@@ -1217,84 +1188,118 @@ class RsiBot:
             if total_hits == 0:
                 continue
 
-            # Build all sections for this timeframe
-            all_section_blocks: List[str] = []
+            # ── Build all section text blocks for this timeframe ──
+            section_blocks: List[str] = []
 
             for section_key, section_label, sort_descending in section_defs:
                 items = tf_sections.get(section_key, [])
                 if not items:
                     continue
                 
-                # Sort items
+                # Sort items by RSI
                 items.sort(key=lambda x: x.rsi, reverse=sort_descending)
                 
                 count = len(items)
-                header_line = f"{section_label} ({count})"
                 
-                # Build the box
-                top_border = f"┌{'─' * (box_width - 2)}┐"
-                bottom_border = f"└{'─' * (box_width - 2)}┘"
+                # Build the section as a list of lines
+                lines: List[str] = []
+                lines.append(f"{section_label} ({count})")
                 
-                content_rows = build_rows(items, cols=3)
+                for item in items:
+                    sym = clean_name(item.symbol)
+                    hot = " 🔥" if item.hot else ""
+                    # Format: " SYM    RSI 🔥"
+                    # Left-align symbol in 7 chars, right-align RSI in 5 chars
+                    line = f" {sym:<7}{item.rsi:>5.1f}{hot}"
+                    lines.append(line)
                 
-                block_lines = [
-                    "",
-                    header_line,
-                    top_border,
-                ]
-                block_lines.extend(content_rows)
-                block_lines.append(bottom_border)
-                
-                all_section_blocks.append("\n".join(block_lines))
+                # Join this section into a single block with a trailing blank line for spacing
+                section_text = "\n".join(lines)
+                section_blocks.append(section_text)
 
-            if not all_section_blocks:
+            if not section_blocks:
                 continue
 
-            # Build messages for this timeframe, respecting Telegram's 4096 char limit
-            # We use HTML <pre> for monospace, so account for tag overhead
+            # ── Pack sections into messages (bin-packing) ──
+            # Strategy: keep adding sections to the current message buffer
+            # until the next section would exceed the Telegram limit.
+            # This minimizes the number of messages sent.
+            
             tf_header = f"⏱ <b>{tf} Timeframe</b> ({total_hits})\n"
             
-            # Strategy: try to fit all sections into one message.
-            # If too long, send each section as its own message.
-            full_body = "\n".join(all_section_blocks)
-            full_message = tf_header + f"<pre>{full_body}</pre>"
+            # Calculate overhead: header + <pre></pre> tags + footer + safety margin
+            # <pre>\n</pre> = 11 chars, footer ~30 chars, safety = 50
+            overhead = len(tf_header) + len(ts_footer) + 11 + 50
+            max_body_chars = 4096 - overhead
             
-            if len(full_message) + len(ts_footer) + 10 <= 4000:
-                # Everything fits in one message
-                await self._safe_send(session, full_message, ts_footer)
-            else:
-                # Send header first, then each section separately
-                for section_block in all_section_blocks:
-                    section_message = tf_header + f"<pre>{section_block}</pre>"
+            current_body_parts: List[str] = []
+            current_body_len: int = 0
+            
+            for i, section_text in enumerate(section_blocks):
+                # Calculate how much space this section needs
+                # +2 for the "\n\n" separator between sections
+                separator = "\n\n" if current_body_parts else ""
+                needed = len(separator) + len(section_text)
+                
+                if current_body_len + needed > max_body_chars and current_body_parts:
+                    # Current buffer is full — send it
+                    body = "\n\n".join(current_body_parts)
+                    message = tf_header + "<pre>\n" + body + "\n</pre>"
+                    await self._safe_send(session, message, ts_footer)
                     
-                    if len(section_message) + len(ts_footer) + 10 <= 4000:
-                        await self._safe_send(session, section_message, ts_footer)
-                    else:
-                        # Even a single section is too long — split by rows
-                        # This handles extreme cases (100+ hits in one section)
-                        lines = section_block.split("\n")
-                        chunk_buffer = []
-                        chunk_chars = 0
+                    # Reset buffer
+                    current_body_parts = []
+                    current_body_len = 0
+                
+                # Check if a single section alone exceeds the limit (extreme edge case)
+                if len(section_text) > max_body_chars:
+                    # Split this section's items across multiple messages
+                    lines = section_text.split("\n")
+                    section_header_line = lines[0]  # e.g., "🔼 UPPER BAND (85)"
+                    item_lines = lines[1:]
+                    
+                    chunk_lines: List[str] = [section_header_line]
+                    chunk_len = len(section_header_line)
+                    part_num = 1
+                    
+                    for line in item_lines:
+                        line_len = len(line) + 1  # +1 for newline
                         
-                        for line in lines:
-                            line_len = len(line) + 1  # +1 for newline
-                            if chunk_chars + line_len + len(tf_header) + 30 > 3800 and chunk_buffer:
-                                chunk_text = tf_header + "<pre>" + "\n".join(chunk_buffer) + "</pre>"
-                                await self._safe_send(session, chunk_text, ts_footer)
-                                chunk_buffer = []
-                                chunk_chars = 0
+                        if chunk_len + line_len > max_body_chars and len(chunk_lines) > 1:
+                            # Send this chunk
+                            body = "\n".join(chunk_lines)
+                            message = tf_header + "<pre>\n" + body + "\n</pre>"
+                            await self._safe_send(session, message, ts_footer)
                             
-                            chunk_buffer.append(line)
-                            chunk_chars += line_len
+                            # Start new chunk with continuation header
+                            part_num += 1
+                            cont_header = f"{section_header_line} pt.{part_num}"
+                            chunk_lines = [cont_header]
+                            chunk_len = len(cont_header)
                         
-                        if chunk_buffer:
-                            chunk_text = tf_header + "<pre>" + "\n".join(chunk_buffer) + "</pre>"
-                            await self._safe_send(session, chunk_text, ts_footer)
+                        chunk_lines.append(line)
+                        chunk_len += line_len
+                    
+                    # Add remaining chunk lines to the buffer for potential merging with next section
+                    if chunk_lines:
+                        remaining_text = "\n".join(chunk_lines)
+                        current_body_parts.append(remaining_text)
+                        current_body_len += len(remaining_text)
+                else:
+                    # Normal case: section fits, add to buffer
+                    current_body_parts.append(section_text)
+                    current_body_len += len(section_text) + 2  # +2 for potential "\n\n" separator
+            
+            # ── Send whatever remains in the buffer ──
+            if current_body_parts:
+                body = "\n\n".join(current_body_parts)
+                message = tf_header + "<pre>\n" + body + "\n</pre>"
+                await self._safe_send(session, message, ts_footer)
 
     async def _safe_send(self, session: aiohttp.ClientSession, text: str, footer: str):
         """
         Send a single Telegram message with retry logic and rate limit handling.
-        Uses HTML parse mode for guaranteed monospace rendering.
+        Uses HTML parse mode for monospace rendering via <pre> tags.
         """
         full_text = text + f"\n\n{footer}"
         
@@ -1316,16 +1321,30 @@ class RsiBot:
                     elif resp.status != 200:
                         resp_text = await resp.text()
                         logging.error(f"Telegram send failed (HTTP {resp.status}): {resp_text}")
+                        # If it's a parse error, try sending without HTML as fallback
+                        if "can't parse" in resp_text.lower() or "bad request" in resp_text.lower():
+                            logging.warning("Retrying without HTML parse mode...")
+                            async with session.post(
+                                f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
+                                json={
+                                    "chat_id": CONFIG.CHAT_ID,
+                                    "text": full_text.replace("<pre>", "").replace("</pre>", "").replace("<b>", "").replace("</b>", "")
+                                }
+                            ) as fallback_resp:
+                                if fallback_resp.status == 200:
+                                    logging.info("✅ Sent with fallback (no formatting)")
+                                    await asyncio.sleep(0.5)
+                                    return
                         break
                     
-                    # Success — add safety gap between messages
+                    # Success
                     await asyncio.sleep(0.5)
                     return
             except Exception as e:
-                logging.error(f"Telegram send exception: {e}")
+                logging.error(f"Telegram send exception (attempt {attempt + 1}/3): {e}")
                 await asyncio.sleep(1)
         
-        logging.error(f"Failed to send Telegram message after 3 attempts")
+        logging.error("Failed to send Telegram message after 3 attempts")
                 
     async def fetch_symbols_hybrid(
         self,
