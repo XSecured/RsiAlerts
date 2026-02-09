@@ -18,7 +18,7 @@ import talib
 import redis.asyncio as aioredis
 
 # ==========================================
-# CONFIGURATION & CONSTANTS
+# CONFIGURATION & CONSTANTS (UPDATED)
 # ==========================================
 
 @dataclass
@@ -46,8 +46,15 @@ class Config:
     LOWER_TOUCH_THRESHOLD: float = 0.02
     MIDDLE_TOUCH_THRESHOLD: float = 0.035
 
+    # Number of lookback candles for middle band direction analysis
+    MIDDLE_BAND_LOOKBACK: int = 5
+
+    # Weekly scan delay in seconds after Monday 00:00 UTC
+    # Gives time for the new weekly candle to form its first data
+    WEEKLY_SCAN_DELAY: int = 1800  # 30 minutes
+
     IGNORED_SYMBOLS: Set[str] = field(default_factory=lambda: {
-        "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT"
+        "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDY"
     })
 
 CONFIG = Config()
@@ -73,7 +80,7 @@ class TouchHit:
     timeframe: str
     rsi: float
     touch_type: str
-    direction: str = "" 
+    direction: str = ""   # "bullish" or "bearish" for middle band hits
     hot: bool = False
     
     def to_dict(self): return asdict(self)
@@ -869,10 +876,43 @@ class BybitClient(ExchangeClient):
 # ==========================================
 
 def get_cache_key(tf: str) -> int:
-    """Returns stable integer timestamp for current TF candle."""
+    """
+    Returns stable integer timestamp for the current TF candle open.
+    
+    For weekly: Aligns to Monday 00:00 UTC.
+    The Unix epoch (Jan 1, 1970) was a Thursday, so we offset by 3 days (259200s)
+    to align the 604800-second weekly boundary with Monday.
+    
+    For daily: 86400 divides evenly from epoch and aligns with UTC midnight.
+    
+    For 4h: 14400 divides evenly, candles open at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC.
+    """
     mins = TIMEFRAME_MINUTES[tf]
+    period_seconds = mins * 60
     now = int(time.time())
-    return now - (now % (mins * 60))
+    
+    if tf == '1w':
+        # Offset: Unix epoch was Thursday. Monday is 3 days (259200s) before the next Thursday boundary.
+        # To align: subtract the Thursday offset, do modular arithmetic, then add it back.
+        thursday_offset = 259200  # 3 days in seconds (Thu -> Mon)
+        adjusted = now - thursday_offset
+        candle_start = adjusted - (adjusted % period_seconds) + thursday_offset
+        return candle_start
+    else:
+        # Daily and sub-daily align naturally with epoch
+        return now - (now % period_seconds)
+
+
+def is_weekly_scan_ready() -> bool:
+    """
+    Check if enough time has passed since the weekly candle open
+    to allow scanning. Prevents scanning stale data right at the boundary.
+    """
+    now = int(time.time())
+    weekly_candle_open = get_cache_key('1w')
+    elapsed_since_open = now - weekly_candle_open
+    return elapsed_since_open >= CONFIG.WEEKLY_SCAN_DELAY
+
 
 def calculate_volatility(closes: List[float]) -> float:
     if len(closes) < 24: return 0.0
@@ -881,25 +921,198 @@ def calculate_volatility(closes: List[float]) -> float:
         if closes[i-1] != 0: returns.append((closes[i] - closes[i-1]) / closes[i-1] * 100)
     return np.std(returns) if returns else 0.0
 
+
+def classify_middle_band_direction(
+    rsi_array: np.ndarray,
+    mid_array: np.ndarray,
+    idx: int,
+    lookback: int = 5
+) -> str:
+    """
+    Determine if a middle band touch is BULLISH or BEARISH using
+    a 3-signal voting system:
+    
+    Signal 1 - Trajectory: Was RSI predominantly above or below the middle band
+               over the lookback period?
+               - Predominantly ABOVE → approaching from above → BULLISH (price found support)
+               - Predominantly BELOW → approaching from below → BEARISH (price found resistance)
+    
+    Signal 2 - Crossing Direction: Did RSI cross the middle band, and in which direction?
+               - Crossed from above to below → BEARISH
+               - Crossed from below to above → BULLISH
+               - No cross → use position relative to band
+    
+    Signal 3 - RSI Momentum: Is RSI rising or falling over the lookback?
+               - Rising (positive delta) → BULLISH
+               - Falling (negative delta) → BEARISH
+    
+    Convention:
+        - "bullish" = RSI came from ABOVE and touched/crossed down to middle band
+          (interpreted as: price was strong, pulled back to support → bounce expected)
+        - "bearish" = RSI came from BELOW and touched/crossed up to middle band
+          (interpreted as: price was weak, pushed up to resistance → rejection expected)
+    
+    Returns: "bullish" or "bearish"
+    """
+    # Determine safe lookback range
+    safe_lookback = min(lookback, idx)
+    if safe_lookback < 2:
+        # Not enough data, fall back to simple position check
+        if rsi_array[idx] > mid_array[idx]:
+            return "bullish"  # Currently above mid = came from above
+        else:
+            return "bearish"  # Currently below mid = came from below
+    
+    start_idx = idx - safe_lookback
+    
+    # ── Signal 1: Trajectory Analysis ──
+    # Count how many of the lookback candles had RSI above vs below the middle band
+    above_count = 0
+    below_count = 0
+    for i in range(start_idx, idx + 1):
+        if np.isnan(rsi_array[i]) or np.isnan(mid_array[i]):
+            continue
+        if rsi_array[i] > mid_array[i]:
+            above_count += 1
+        else:
+            below_count += 1
+    
+    # Predominantly above = came from above = bullish (support touch)
+    # Predominantly below = came from below = bearish (resistance touch)
+    if above_count > below_count:
+        trajectory_vote = "bullish"
+    elif below_count > above_count:
+        trajectory_vote = "bearish"
+    else:
+        trajectory_vote = "neutral"
+    
+    # ── Signal 2: Crossing Direction ──
+    # Look for the most recent sign change in (RSI - mid)
+    crossing_vote = "neutral"
+    for i in range(idx, start_idx, -1):
+        if np.isnan(rsi_array[i]) or np.isnan(rsi_array[i - 1]):
+            continue
+        if np.isnan(mid_array[i]) or np.isnan(mid_array[i - 1]):
+            continue
+        
+        prev_diff = rsi_array[i - 1] - mid_array[i - 1]
+        curr_diff = rsi_array[i] - mid_array[i]
+        
+        if prev_diff > 0 and curr_diff <= 0:
+            # Crossed from above to below → came from above → bullish
+            crossing_vote = "bullish"
+            break
+        elif prev_diff < 0 and curr_diff >= 0:
+            # Crossed from below to above → came from below → bearish
+            crossing_vote = "bearish"
+            break
+    
+    # If no cross found, use current position as a weaker signal
+    if crossing_vote == "neutral":
+        if rsi_array[idx] > mid_array[idx]:
+            crossing_vote = "bullish"
+        elif rsi_array[idx] < mid_array[idx]:
+            crossing_vote = "bearish"
+    
+    # ── Signal 3: RSI Momentum ──
+    # Compare current RSI to RSI from `safe_lookback` candles ago
+    momentum_start_idx = max(start_idx, 0)
+    # Find the first non-NaN value in the lookback range for comparison
+    momentum_start_rsi = None
+    for i in range(momentum_start_idx, idx):
+        if not np.isnan(rsi_array[i]):
+            momentum_start_rsi = rsi_array[i]
+            break
+    
+    if momentum_start_rsi is not None and not np.isnan(rsi_array[idx]):
+        rsi_delta = rsi_array[idx] - momentum_start_rsi
+        if rsi_delta > 0:
+            # RSI is rising → momentum pushing up from below → bearish (approaching resistance)
+            momentum_vote = "bearish"
+        elif rsi_delta < 0:
+            # RSI is falling → momentum pushing down from above → bullish (approaching support)
+            momentum_vote = "bullish"
+        else:
+            momentum_vote = "neutral"
+    else:
+        momentum_vote = "neutral"
+    
+    # ── Voting ──
+    votes = {"bullish": 0, "bearish": 0}
+    for vote in [trajectory_vote, crossing_vote, momentum_vote]:
+        if vote in votes:
+            votes[vote] += 1
+    
+    if votes["bullish"] >= 2:
+        return "bullish"
+    elif votes["bearish"] >= 2:
+        return "bearish"
+    else:
+        # Tiebreaker: use trajectory as the strongest single signal
+        if trajectory_vote != "neutral":
+            return trajectory_vote
+        elif crossing_vote != "neutral":
+            return crossing_vote
+        else:
+            # Ultimate fallback: position relative to middle band
+            if rsi_array[idx] >= mid_array[idx]:
+                return "bullish"
+            else:
+                return "bearish"
+
+
 def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[str], float]:
-    if len(closes) < CONFIG.MIN_CANDLES: return None, None, 0.0
+    """
+    Check if the RSI Bollinger Band touch condition is met.
+    
+    Returns:
+        (touch_type, direction, rsi_value)
+        touch_type: "UPPER", "MIDDLE", "LOWER", or None
+        direction: "bullish", "bearish", or "" (empty for upper/lower)
+        rsi_value: current RSI value
+    """
+    if len(closes) < CONFIG.MIN_CANDLES:
+        return None, None, 0.0
+    
     np_c = np.array(closes, dtype=float)
     rsi = talib.RSI(np_c, timeperiod=CONFIG.RSI_PERIOD)
-    upper, mid, lower = talib.BBANDS(rsi, timeperiod=CONFIG.BB_LENGTH, nbdevup=CONFIG.BB_STDDEV, nbdevdn=CONFIG.BB_STDDEV, matype=0)
+    upper, mid, lower = talib.BBANDS(
+        rsi,
+        timeperiod=CONFIG.BB_LENGTH,
+        nbdevup=CONFIG.BB_STDDEV,
+        nbdevdn=CONFIG.BB_STDDEV,
+        matype=0
+    )
     
+    # Use second-to-last candle (last completed candle)
     idx = -2
-    if np.isnan(rsi[idx]) or np.isnan(upper[idx]): return None, None, 0.0
+    
+    if np.isnan(rsi[idx]) or np.isnan(upper[idx]):
+        return None, None, 0.0
     
     curr_rsi = rsi[idx]
-    if curr_rsi >= upper[idx] * (1 - CONFIG.UPPER_TOUCH_THRESHOLD): return "UPPER", None, curr_rsi
-    if curr_rsi <= lower[idx] * (1 + CONFIG.LOWER_TOUCH_THRESHOLD): return "LOWER", None, curr_rsi
     
+    # Check upper band touch
+    if curr_rsi >= upper[idx] * (1 - CONFIG.UPPER_TOUCH_THRESHOLD):
+        return "UPPER", "", curr_rsi
+    
+    # Check lower band touch
+    if curr_rsi <= lower[idx] * (1 + CONFIG.LOWER_TOUCH_THRESHOLD):
+        return "LOWER", "", curr_rsi
+    
+    # Check middle band touch (only for configured timeframes)
     if tf in MIDDLE_BAND_TFS:
-        if abs(curr_rsi - mid[idx]) <= (mid[idx] * CONFIG.MIDDLE_TOUCH_THRESHOLD):
-            prev_diff = rsi[idx-1] - mid[idx-1]
-            curr_diff = curr_rsi - mid[idx]
-            direction = "from above" if (prev_diff > 0 >= curr_diff) or (curr_diff > 0) else "from below"
+        mid_val = mid[idx]
+        if mid_val > 0 and abs(curr_rsi - mid_val) <= (mid_val * CONFIG.MIDDLE_TOUCH_THRESHOLD):
+            # Use the multi-signal classification system
+            direction = classify_middle_band_direction(
+                rsi_array=rsi,
+                mid_array=mid,
+                idx=len(rsi) + idx,  # Convert negative index to positive
+                lookback=CONFIG.MIDDLE_BAND_LOOKBACK
+            )
             return "MIDDLE", direction, curr_rsi
+    
     return None, None, 0.0
 
 # ==========================================
@@ -918,108 +1131,211 @@ class RsiBot:
         )
         
     async def send_report(self, session: aiohttp.ClientSession, hits: List[TouchHit]):
-        if not hits: return
+        """
+        Send formatted Telegram report using HTML parse mode with <pre> tags
+        for guaranteed monospace alignment across all Telegram clients.
+        
+        Layout:
+        - UPPER BAND section
+        - MIDDLE BAND ▲ BULLISH section
+        - MIDDLE BAND ▼ BEARISH section  
+        - LOWER BAND section
+        
+        Each section shows 3 symbols per row, perfectly aligned.
+        """
+        if not hits:
+            return
 
-        grouped = {}
-        for h in hits: grouped.setdefault(h.timeframe, {}).setdefault(h.touch_type, []).append(h)
+        # Group hits by timeframe, then by section
+        grouped: Dict[str, Dict[str, List[TouchHit]]] = {}
+        for h in hits:
+            tf_group = grouped.setdefault(h.timeframe, {})
+            
+            if h.touch_type == "MIDDLE":
+                if h.direction == "bullish":
+                    section_key = "MIDDLE_BULLISH"
+                else:
+                    section_key = "MIDDLE_BEARISH"
+            else:
+                section_key = h.touch_type
+            
+            tf_group.setdefault(section_key, []).append(h)
 
         tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m", "5m", "3m"]
         ts_footer = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
 
-        def clean_name(s):
+        def clean_name(s: str) -> str:
+            """Clean symbol name: remove USDT suffix and common prefixes, cap at 6 chars."""
             s = s.replace("USDT", "")
             s = re.sub(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])", "", s)
             return s[:6]
 
+        def format_cell(item: TouchHit) -> str:
+            """
+            Format a single symbol cell with fixed width for perfect alignment.
+            Layout: 'SYM   67.3🔥' = 6 + 5 + 2 = 13 chars per cell
+            """
+            sym = clean_name(item.symbol)
+            hot = "🔥" if item.hot else "  "
+            # 6 chars for symbol (left-aligned), 5 chars for RSI (right-aligned), 2 chars for hot
+            return f"{sym:<6}{item.rsi:>5.1f}{hot}"
+
+        def build_rows(items: List[TouchHit], cols: int = 3) -> List[str]:
+            """Build formatted rows with `cols` symbols per line, separated by │"""
+            rows = []
+            for i in range(0, len(items), cols):
+                chunk = items[i:i + cols]
+                cells = []
+                for item in chunk:
+                    cells.append(format_cell(item))
+                # Pad with empty cells if the last row is incomplete
+                while len(cells) < cols:
+                    cells.append(" " * 13)  # 13 = width of one cell
+                row = " │ ".join(cells)
+                rows.append(f"│ {row} │")
+            return rows
+
+        # Section definitions: key, emoji/label, sort order
+        section_defs = [
+            ("UPPER",          "🔼 UPPER BAND",           True),   # sort RSI descending
+            ("MIDDLE_BULLISH", "💠 MIDDLE ▲ BULLISH",      True),   # sort RSI descending
+            ("MIDDLE_BEARISH", "💠 MIDDLE ▼ BEARISH",      False),  # sort RSI ascending
+            ("LOWER",          "🔽 LOWER BAND",            False),  # sort RSI ascending
+        ]
+
+        # Calculate the width of the box based on 3 columns
+        # Each cell = 13 chars, separator " │ " = 3 chars, borders "│ " and " │" = 4 chars
+        # Total = 4 + 13 + 3 + 13 + 3 + 13 = 49 chars
+        box_width = 49
+
         for tf in tf_order:
-            if tf not in grouped: continue
+            if tf not in grouped:
+                continue
             
-            total_hits = sum(len(grouped[tf].get(t, [])) for t in ["UPPER", "MIDDLE", "LOWER"])
-            if total_hits == 0: continue
+            tf_sections = grouped[tf]
+            total_hits = sum(len(v) for v in tf_sections.values())
+            if total_hits == 0:
+                continue
 
-            # Header
-            header_pad = "⠀" * 10
-            header_msg = f"⏱ *{tf} Timeframe* ({total_hits}){header_pad}\n"
-            
-            # We will build a LIST of messages to send for this timeframe
-            # Start the first message buffer
-            current_buffer = [header_msg, "```"]
-            current_chars = len(header_msg) + 3
-            
-            targets = ["UPPER", "MIDDLE", "LOWER"]
-            for t in targets:
-                items = grouped[tf].get(t, [])
-                if not items: continue
-                
-                items.sort(key=lambda x: x.rsi, reverse=(t != "LOWER"))
-                
-                if t == "UPPER":    header = "\n🔼 UPPER BAND"
-                elif t == "MIDDLE": header = "\n💠 MIDDLE BAND"
-                else:               header = "\n🔽 LOWER BAND"
-                
-                # Add section header to buffer
-                if current_chars + len(header) + 50 > 3800:
-                    # Close current block, start new one
-                    current_buffer.append("```")
-                    await self._safe_send(session, "\n".join(current_buffer), ts_footer)
-                    current_buffer = ["```", header] # Start new block with the header
-                    current_chars = 3 + len(header)
-                else:
-                    current_buffer.append(header)
-                    current_chars += len(header)
+            # Build all sections for this timeframe
+            all_section_blocks: List[str] = []
 
-                for i in range(0, len(items), 3):
-                    chunk = items[i:i + 3]
-                    row_str = ""
-                    for item in chunk:
-                        sym = clean_name(item.symbol)
-                        arrow = "↘" if (t == "MIDDLE" and item.direction == "from above") else "↗" if t == "MIDDLE" else " "
-                        hot_mark = "🔥" if item.hot else " "
-                        # Adjusted spacing for alignment
-                        cell = f"{sym:<6}{item.rsi:>4.1f}{arrow}{hot_mark}"
-                        if row_str: row_str += " | "
-                        row_str += cell
+            for section_key, section_label, sort_descending in section_defs:
+                items = tf_sections.get(section_key, [])
+                if not items:
+                    continue
+                
+                # Sort items
+                items.sort(key=lambda x: x.rsi, reverse=sort_descending)
+                
+                count = len(items)
+                header_line = f"{section_label} ({count})"
+                
+                # Build the box
+                top_border = f"┌{'─' * (box_width - 2)}┐"
+                bottom_border = f"└{'─' * (box_width - 2)}┘"
+                
+                content_rows = build_rows(items, cols=3)
+                
+                block_lines = [
+                    "",
+                    header_line,
+                    top_border,
+                ]
+                block_lines.extend(content_rows)
+                block_lines.append(bottom_border)
+                
+                all_section_blocks.append("\n".join(block_lines))
+
+            if not all_section_blocks:
+                continue
+
+            # Build messages for this timeframe, respecting Telegram's 4096 char limit
+            # We use HTML <pre> for monospace, so account for tag overhead
+            tf_header = f"⏱ <b>{tf} Timeframe</b> ({total_hits})\n"
+            
+            # Strategy: try to fit all sections into one message.
+            # If too long, send each section as its own message.
+            full_body = "\n".join(all_section_blocks)
+            full_message = tf_header + f"<pre>{full_body}</pre>"
+            
+            if len(full_message) + len(ts_footer) + 10 <= 4000:
+                # Everything fits in one message
+                await self._safe_send(session, full_message, ts_footer)
+            else:
+                # Send header first, then each section separately
+                for section_block in all_section_blocks:
+                    section_message = tf_header + f"<pre>{section_block}</pre>"
                     
-                    # Check length before adding row
-                    # +1 for newline
-                    if current_chars + len(row_str) + 1 > 3800:
-                        current_buffer.append("```")
-                        await self._safe_send(session, "\n".join(current_buffer), ts_footer)
-                        current_buffer = ["```", row_str] # Continue list in new block
-                        current_chars = 3 + len(row_str)
+                    if len(section_message) + len(ts_footer) + 10 <= 4000:
+                        await self._safe_send(session, section_message, ts_footer)
                     else:
-                        current_buffer.append(row_str)
-                        current_chars += len(row_str) + 1
+                        # Even a single section is too long — split by rows
+                        # This handles extreme cases (100+ hits in one section)
+                        lines = section_block.split("\n")
+                        chunk_buffer = []
+                        chunk_chars = 0
+                        
+                        for line in lines:
+                            line_len = len(line) + 1  # +1 for newline
+                            if chunk_chars + line_len + len(tf_header) + 30 > 3800 and chunk_buffer:
+                                chunk_text = tf_header + "<pre>" + "\n".join(chunk_buffer) + "</pre>"
+                                await self._safe_send(session, chunk_text, ts_footer)
+                                chunk_buffer = []
+                                chunk_chars = 0
+                            
+                            chunk_buffer.append(line)
+                            chunk_chars += line_len
+                        
+                        if chunk_buffer:
+                            chunk_text = tf_header + "<pre>" + "\n".join(chunk_buffer) + "</pre>"
+                            await self._safe_send(session, chunk_text, ts_footer)
 
-            # Send whatever is left
-            if len(current_buffer) > 2: # Ensure we have content besides header/```
-                current_buffer.append("```")
-                await self._safe_send(session, "\n".join(current_buffer), ts_footer)
-
-    # Helper method for safe sending with retry
-    async def _safe_send(self, session, text, footer):
+    async def _safe_send(self, session: aiohttp.ClientSession, text: str, footer: str):
+        """
+        Send a single Telegram message with retry logic and rate limit handling.
+        Uses HTML parse mode for guaranteed monospace rendering.
+        """
         full_text = text + f"\n\n{footer}"
+        
         for attempt in range(3):
             try:
                 async with session.post(
                     f"https://api.telegram.org/bot{CONFIG.TELEGRAM_TOKEN}/sendMessage",
-                    json={"chat_id": CONFIG.CHAT_ID, "text": full_text, "parse_mode": "Markdown"}
+                    json={
+                        "chat_id": CONFIG.CHAT_ID,
+                        "text": full_text,
+                        "parse_mode": "HTML"
+                    }
                 ) as resp:
                     if resp.status == 429:
-                        wait = int(resp.headers.get("Retry-After", 5))
-                        logging.warning(f"⚠️ TG Rate Limit. Waiting {wait}s")
-                        await asyncio.sleep(wait)
+                        retry_after = int(resp.headers.get("Retry-After", 5))
+                        logging.warning(f"⚠️ Telegram rate limit. Waiting {retry_after}s")
+                        await asyncio.sleep(retry_after)
                         continue
                     elif resp.status != 200:
-                        logging.error(f"TG Fail {resp.status}: {await resp.text()}")
+                        resp_text = await resp.text()
+                        logging.error(f"Telegram send failed (HTTP {resp.status}): {resp_text}")
                         break
-                    await asyncio.sleep(0.5) # Safety gap
-                    break
+                    
+                    # Success — add safety gap between messages
+                    await asyncio.sleep(0.5)
+                    return
             except Exception as e:
-                logging.error(f"TG Ex: {e}")
+                logging.error(f"Telegram send exception: {e}")
                 await asyncio.sleep(1)
+        
+        logging.error(f"Failed to send Telegram message after 3 attempts")
                 
-    async def fetch_symbols_hybrid(self, binance: BinanceClient, bybit: BybitClient) -> Tuple[List[str], List[str], List[str], List[str]]:
+    async def fetch_symbols_hybrid(
+        self,
+        binance: BinanceClient,
+        bybit: BybitClient
+    ) -> Tuple[List[str], List[str], List[str], List[str]]:
+        """
+        Fetch symbols from all exchanges with cache fallback.
+        Returns: (binance_perp, binance_spot, bybit_perp, bybit_spot)
+        """
         cached = await self.cache.get_cached_symbols()
         cached_data = cached.get('data') if cached else None
         
@@ -1050,148 +1366,269 @@ class RsiBot:
         return bp, bs, yp, ys
 
     async def run(self):
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s %(levelname)s %(message)s'
+        )
+        
+        # ── Startup Config Validation ──
+        if not CONFIG.TELEGRAM_TOKEN:
+            logging.error("❌ TELEGRAM_BOT_TOKEN is not set! Exiting.")
+            return
+        if not CONFIG.CHAT_ID:
+            logging.error("❌ TELEGRAM_CHAT_ID is not set! Exiting.")
+            return
+        
         await self.cache.init()
+        
         async with aiohttp.ClientSession() as session:
-            await self.proxies.initialize(session, additional_sources=[CONFIG.PROXY_URL])
-            binance = BinanceClient(session, self.proxies)
-            bybit = BybitClient(session, self.proxies)
-            
-            bp, bs, yp, ys = await self.fetch_symbols_hybrid(binance, bybit)
-            
-            seen = set()
-            def filter_u(syms):
-                res = []
-                for s in syms:
-                    if s in CONFIG.IGNORED_SYMBOLS or not s.endswith("USDT"): continue
-                    norm = s.upper().replace("USDT", "")
-                    if norm not in seen:
-                        res.append(s)
-                        seen.add(norm)
-                return res
+            try:
+                await self.proxies.initialize(session, additional_sources=[CONFIG.PROXY_URL])
+                binance = BinanceClient(session, self.proxies)
+                bybit = BybitClient(session, self.proxies)
                 
-            f_bp, f_bs, f_yp, f_ys = filter_u(bp), filter_u(bs), filter_u(yp), filter_u(ys)
-            all_pairs = []
-            for s in f_bp: all_pairs.append((binance, s, 'perp', 'Binance'))
-            for s in f_bs: all_pairs.append((binance, s, 'spot', 'Binance'))
-            for s in f_yp: all_pairs.append((bybit, s, 'perp', 'Bybit'))
-            for s in f_ys: all_pairs.append((bybit, s, 'spot', 'Bybit'))
-            
-            total_sym_count = len(all_pairs)
-            logging.info(f"Total symbols: {total_sym_count}")
-            
-            logging.info("Calculating Volatility...")
-            vol_scores = {}
-            vol_sem = asyncio.Semaphore(50) 
+                # ── Fetch Symbols ──
+                bp, bs, yp, ys = await self.fetch_symbols_hybrid(binance, bybit)
+                
+                # ── Deduplicate with Priority ──
+                # Priority: Binance Perp > Binance Spot > Bybit Perp > Bybit Spot
+                # We process in priority order. Once a normalized symbol is seen, skip it.
+                seen_normalized: Set[str] = set()
+                all_pairs: List[Tuple[Any, str, str, str]] = []
+                
+                def add_with_dedup(
+                    client: ExchangeClient,
+                    symbols: List[str],
+                    market: str,
+                    exchange: str
+                ):
+                    """Add symbols to all_pairs, skipping already-seen normalized names."""
+                    for s in symbols:
+                        if s in CONFIG.IGNORED_SYMBOLS:
+                            continue
+                        if not s.endswith("USDT"):
+                            continue
+                        norm = s.upper().replace("USDT", "")
+                        if norm not in seen_normalized:
+                            seen_normalized.add(norm)
+                            all_pairs.append((client, s, market, exchange))
+                
+                # Add in strict priority order
+                add_with_dedup(binance, bp, 'perp', 'Binance')
+                add_with_dedup(binance, bs, 'spot', 'Binance')
+                add_with_dedup(bybit, yp, 'perp', 'Bybit')
+                add_with_dedup(bybit, ys, 'spot', 'Bybit')
+                
+                total_sym_count = len(all_pairs)
+                logging.info(f"Total unique symbols after dedup: {total_sym_count}")
+                
+                # ── Volatility Calculation ──
+                logging.info("Calculating Volatility...")
+                vol_scores: Dict[str, float] = {}
+                vol_sem = asyncio.Semaphore(50)
 
-            async def check_vol(client, sym, mkt):
-                async with vol_sem:
-                    try:
-                        c = await client.fetch_closes_volatility(sym, mkt)
-                        if c:
-                            v = calculate_volatility(c)
-                            if v > 0: vol_scores[sym] = v
-                    except Exception:
-                        pass
-            
-            vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
-            await asyncio.gather(*vol_tasks)
-            
-            hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:200])
-            logging.info(f"Vol Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot: {len(hot_coins)}")
-            
-            sent_state = await self.cache.get_sent_state()
-            scan_stats = {tf: ScanStats(tf, "Unknown", total_symbols=total_sym_count) for tf in ACTIVE_TFS}
-            
-            tfs_to_scan_fresh = []
-            cached_hits_to_use = []
-            
-            for tf in ACTIVE_TFS:
-                if tf in CACHED_TFS:
-                    candle_key = get_cache_key(tf)
-                    if sent_state.get(tf) == candle_key:
-                        logging.info(f"⏭️ Skipping {tf}: already sent for this candle")
-                        scan_stats[tf].source = "Already Sent"
+                async def check_vol(client: ExchangeClient, sym: str, mkt: str):
+                    async with vol_sem:
+                        try:
+                            c = await client.fetch_closes_volatility(sym, mkt)
+                            if c:
+                                v = calculate_volatility(c)
+                                if v > 0:
+                                    vol_scores[sym] = v
+                        except Exception as e:
+                            logging.debug(f"Volatility check failed for {sym}: {e}")
+                
+                vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
+                await asyncio.gather(*vol_tasks)
+                
+                hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:200])
+                logging.info(f"Vol Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot: {len(hot_coins)}")
+                
+                # ── Determine Which Timeframes to Scan ──
+                sent_state = await self.cache.get_sent_state()
+                scan_stats = {
+                    tf: ScanStats(tf, "Unknown", total_symbols=total_sym_count)
+                    for tf in ACTIVE_TFS
+                }
+                
+                tfs_to_scan_fresh: List[str] = []
+                cached_hits_to_use: List[TouchHit] = []
+                
+                for tf in ACTIVE_TFS:
+                    # ── Weekly Timing Gate ──
+                    if tf == '1w' and not is_weekly_scan_ready():
+                        elapsed = int(time.time()) - get_cache_key('1w')
+                        remaining = CONFIG.WEEKLY_SCAN_DELAY - elapsed
+                        logging.info(
+                            f"⏳ Skipping 1w: Weekly candle just opened. "
+                            f"Waiting {remaining}s more for data to settle."
+                        )
+                        scan_stats[tf].source = "Skipped (Weekly Delay)"
                         continue
-                    
-                    cached_res = await self.cache.get_scan_results(tf, candle_key)
-                    if cached_res is None:
-                        tfs_to_scan_fresh.append(tf)
-                        scan_stats[tf].source = "Fresh Scan (New Candle)"
-                    else:
-                        hits = [TouchHit.from_dict(d) for d in cached_res]
-                        cached_hits_to_use.extend(hits)
-                        scan_stats[tf].source = "Cached"
-                        scan_stats[tf].hits_found = len(hits)
-                        scan_stats[tf].successful_scans = 0
-                else:
-                    tfs_to_scan_fresh.append(tf)
-                    scan_stats[tf].source = "Fresh Scan (Low TF)"
-            
-            final_hits = []
-            if tfs_to_scan_fresh:
-                logging.info(f"Scanning fresh TFs: {tfs_to_scan_fresh} across all symbols...")
-                
-                for tf in tfs_to_scan_fresh:
-                    tf_tasks = []
-                    async def scan_one(client, sym, mkt, ex):
-                        closes = await client.fetch_closes(sym, tf, mkt)
-                        if not closes: return None
-                        t_type, direction, rsi_val = check_bb_rsi(closes, tf)
-                        if t_type:
-                            return [TouchHit(sym, ex, mkt, tf, rsi_val, t_type, direction, sym in hot_coins)]
-                        return []
-                    
-                    for client, sym, mkt, ex in all_pairs:
-                        tf_tasks.append(scan_one(client, sym, mkt, ex))
-                    
-                    results = await asyncio.gather(*tf_tasks, return_exceptions=True)
-
-                    for result in results:
-                        if isinstance(result, list):
-                            final_hits.extend(result)
-                            scan_stats[tf].hits_found += len(result)
-                    
-                        elif isinstance(result, Exception):
-                            logging.error(f"⚠️ Scan Task Failed: {result}")
-                    
-                    scan_stats[tf].successful_scans = len([r for r in results if r is not None and not isinstance(r, Exception)])
                     
                     if tf in CACHED_TFS:
                         candle_key = get_cache_key(tf)
-                        tf_hits = [h for h in final_hits if h.timeframe == tf]
-                        await self.cache.save_scan_results(tf, candle_key, [h.to_dict() for h in tf_hits])
-            
-            final_hits.extend(cached_hits_to_use)
-            
-            logging.info("="*60)
-            logging.info(f"{'TF':<5} | {'Source':<25} | {'Success':<15} | {'Hits'}")
-            logging.info("-" * 60)
-            for tf in sorted(ACTIVE_TFS, key=lambda x: ["3m","5m","15m","30m","1h","2h","4h","1d","1w"].index(x)):
-                st = scan_stats[tf]
-                succ_str = "Skipped (Cached/Sent)" if st.source in ["Cached", "Already Sent"] else f"{st.successful_scans}/{st.total_symbols}"
-                logging.info(f"[{tf:<3}] {st.source:<25} | {succ_str:<15} | {st.hits_found}")
-            logging.info("="*60)
-            
-            hits_to_send = []
-            new_state = sent_state.copy()
-            for h in final_hits:
-                tf = h.timeframe
-                if tf in CACHED_TFS:
-                    candle_key = get_cache_key(tf)
-                    if sent_state.get(tf, 0) != candle_key:
+                        
+                        # Already sent for this candle? Skip entirely.
+                        if sent_state.get(tf) == candle_key:
+                            logging.info(f"⏭️ Skipping {tf}: already sent for this candle")
+                            scan_stats[tf].source = "Already Sent"
+                            continue
+                        
+                        # Check if we have cached scan results for this candle
+                        cached_res = await self.cache.get_scan_results(tf, candle_key)
+                        if cached_res is not None:
+                            hits = [TouchHit.from_dict(d) for d in cached_res]
+                            cached_hits_to_use.extend(hits)
+                            scan_stats[tf].source = "Cached"
+                            scan_stats[tf].hits_found = len(hits)
+                            scan_stats[tf].successful_scans = 0
+                            logging.info(f"📦 Using cached results for {tf}: {len(hits)} hits")
+                        else:
+                            tfs_to_scan_fresh.append(tf)
+                            scan_stats[tf].source = "Fresh Scan (New Candle)"
+                    else:
+                        tfs_to_scan_fresh.append(tf)
+                        scan_stats[tf].source = "Fresh Scan (Low TF)"
+                
+                # ── Execute Fresh Scans ──
+                final_hits: List[TouchHit] = []
+                
+                if tfs_to_scan_fresh:
+                    logging.info(f"Scanning fresh TFs: {tfs_to_scan_fresh} across {total_sym_count} symbols...")
+                    
+                    for tf in tfs_to_scan_fresh:
+                        tf_hits: List[TouchHit] = []
+                        
+                        async def scan_one(
+                            client: ExchangeClient,
+                            sym: str,
+                            mkt: str,
+                            ex: str,
+                            scan_tf: str
+                        ) -> List[TouchHit]:
+                            """
+                            Scan a single symbol on a single timeframe.
+                            Returns list of TouchHit (0 or 1 items).
+                            Catches all exceptions internally to prevent task failures.
+                            """
+                            try:
+                                closes = await client.fetch_closes(sym, scan_tf, mkt)
+                                if not closes:
+                                    return []
+                                
+                                t_type, direction, rsi_val = check_bb_rsi(closes, scan_tf)
+                                if t_type:
+                                    return [TouchHit(
+                                        symbol=sym,
+                                        exchange=ex,
+                                        market=mkt,
+                                        timeframe=scan_tf,
+                                        rsi=rsi_val,
+                                        touch_type=t_type,
+                                        direction=direction if direction else "",
+                                        hot=sym in hot_coins
+                                    )]
+                                return []
+                            except Exception as e:
+                                logging.debug(f"Scan failed for {sym} on {scan_tf}: {e}")
+                                return []
+                        
+                        # Build tasks for this timeframe
+                        tf_tasks = [
+                            scan_one(client, sym, mkt, ex, tf)
+                            for client, sym, mkt, ex in all_pairs
+                        ]
+                        
+                        results = await asyncio.gather(*tf_tasks, return_exceptions=True)
+                        
+                        successful_count = 0
+                        for result in results:
+                            if isinstance(result, list):
+                                tf_hits.extend(result)
+                                successful_count += 1
+                            elif isinstance(result, Exception):
+                                # This should rarely happen since scan_one catches internally
+                                logging.error(f"⚠️ Unexpected scan task exception: {result}")
+                        
+                        scan_stats[tf].successful_scans = successful_count
+                        scan_stats[tf].hits_found = len(tf_hits)
+                        
+                        final_hits.extend(tf_hits)
+                        
+                        # Cache the results for cacheable timeframes
+                        if tf in CACHED_TFS:
+                            candle_key = get_cache_key(tf)
+                            await self.cache.save_scan_results(
+                                tf,
+                                candle_key,
+                                [h.to_dict() for h in tf_hits]
+                            )
+                            logging.info(f"💾 Cached {len(tf_hits)} hits for {tf} (key: {candle_key})")
+                
+                # Merge cached hits with fresh hits
+                final_hits.extend(cached_hits_to_use)
+                
+                # ── Print Scan Summary ──
+                logging.info("=" * 65)
+                logging.info(f"{'TF':<5} | {'Source':<28} | {'Scanned':<18} | {'Hits'}")
+                logging.info("-" * 65)
+                
+                tf_display_order = [
+                    t for t in ["3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1w"]
+                    if t in ACTIVE_TFS
+                ]
+                for tf in tf_display_order:
+                    st = scan_stats[tf]
+                    if st.source in ("Cached", "Already Sent", "Skipped (Weekly Delay)"):
+                        scanned_str = "—"
+                    else:
+                        scanned_str = f"{st.successful_scans}/{st.total_symbols}"
+                    logging.info(
+                        f"[{tf:<3}] {st.source:<28} | {scanned_str:<18} | {st.hits_found}"
+                    )
+                logging.info("=" * 65)
+                logging.info(f"Total hits to send: {len(final_hits)}")
+                
+                # ── Filter Hits & Update Sent State ──
+                hits_to_send: List[TouchHit] = []
+                new_state = sent_state.copy()
+                
+                for h in final_hits:
+                    tf = h.timeframe
+                    if tf in CACHED_TFS:
+                        candle_key = get_cache_key(tf)
+                        if sent_state.get(tf, 0) != candle_key:
+                            hits_to_send.append(h)
+                            new_state[tf] = candle_key
+                    else:
                         hits_to_send.append(h)
-                        new_state[tf] = candle_key
+                
+                # ── Send Report ──
+                if hits_to_send:
+                    logging.info(f"📤 Sending {len(hits_to_send)} hits to Telegram...")
+                    await self.send_report(session, hits_to_send)
+                    logging.info("✅ Report sent successfully")
                 else:
-                    hits_to_send.append(h)
-            
-            await self.send_report(session, hits_to_send)
-            await self.cache.save_sent_state(new_state)
-            
+                    logging.info("📭 No new hits to send")
+                
+                # ── Persist Sent State ──
+                await self.cache.save_sent_state(new_state)
+                
+            finally:
+                # ── Graceful Cleanup (4a) ──
+                # Always shut down the proxy pool background tasks,
+                # even if an exception occurred during scanning
+                await self.proxies.shutdown()
+                logging.info("🧹 Proxy pool background tasks cleaned up")
+        
+        # Close Redis connection
         await self.cache.close()
+        logging.info("🏁 Scan cycle complete")
+
 
 if __name__ == "__main__":
     if os.name == 'nt':
-        asyncio.set_event_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     bot = RsiBot()
     asyncio.run(bot.run())
