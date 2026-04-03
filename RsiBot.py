@@ -54,7 +54,7 @@ class Config:
     WEEKLY_SCAN_DELAY: int = 1800  # 30 minutes
 
     IGNORED_SYMBOLS: Set[str] = field(default_factory=lambda: {
-        "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDY"
+        "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDY", "PYUSD"
     })
 
 CONFIG = Config()
