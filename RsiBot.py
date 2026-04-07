@@ -17,6 +17,8 @@ import numpy as np
 import talib
 import redis.asyncio as aioredis
 
+from middle_band_classifier import classify_middle_band_direction as classify_middle_band_direction_core
+
 # ==========================================
 # CONFIGURATION & CONSTANTS (UPDATED)
 # ==========================================
@@ -929,136 +931,20 @@ def classify_middle_band_direction(
     lookback: int = 5
 ) -> str:
     """
-    Determine if a middle band touch is BULLISH or BEARISH using
-    a 3-signal voting system:
-    
-    Signal 1 - Trajectory: Was RSI predominantly above or below the middle band
-               over the lookback period?
-               - Predominantly ABOVE → approaching from above → BULLISH (price found support)
-               - Predominantly BELOW → approaching from below → BEARISH (price found resistance)
-    
-    Signal 2 - Crossing Direction: Did RSI cross the middle band, and in which direction?
-               - Crossed from above to below → BEARISH
-               - Crossed from below to above → BULLISH
-               - No cross → use position relative to band
-    
-    Signal 3 - RSI Momentum: Is RSI rising or falling over the lookback?
-               - Rising (positive delta) → BULLISH
-               - Falling (negative delta) → BEARISH
-    
+    Determine middle-band direction from the last decisive side RSI occupied
+    before it entered the middle-band touch zone.
+
     Convention:
-        - "bullish" = RSI came from ABOVE and touched/crossed down to middle band
-          (interpreted as: price was strong, pulled back to support → bounce expected)
-        - "bearish" = RSI came from BELOW and touched/crossed up to middle band
-          (interpreted as: price was weak, pushed up to resistance → rejection expected)
-    
-    Returns: "bullish" or "bearish"
+        - "bullish" = RSI approached the middle band from ABOVE
+        - "bearish" = RSI approached the middle band from BELOW
     """
-    # Determine safe lookback range
-    safe_lookback = min(lookback, idx)
-    if safe_lookback < 2:
-        # Not enough data, fall back to simple position check
-        if rsi_array[idx] > mid_array[idx]:
-            return "bullish"  # Currently above mid = came from above
-        else:
-            return "bearish"  # Currently below mid = came from below
-    
-    start_idx = idx - safe_lookback
-    
-    # ── Signal 1: Trajectory Analysis ──
-    # Count how many of the lookback candles had RSI above vs below the middle band
-    above_count = 0
-    below_count = 0
-    for i in range(start_idx, idx + 1):
-        if np.isnan(rsi_array[i]) or np.isnan(mid_array[i]):
-            continue
-        if rsi_array[i] > mid_array[i]:
-            above_count += 1
-        else:
-            below_count += 1
-    
-    # Predominantly above = came from above = bullish (support touch)
-    # Predominantly below = came from below = bearish (resistance touch)
-    if above_count > below_count:
-        trajectory_vote = "bullish"
-    elif below_count > above_count:
-        trajectory_vote = "bearish"
-    else:
-        trajectory_vote = "neutral"
-    
-    # ── Signal 2: Crossing Direction ──
-    # Look for the most recent sign change in (RSI - mid)
-    crossing_vote = "neutral"
-    for i in range(idx, start_idx, -1):
-        if np.isnan(rsi_array[i]) or np.isnan(rsi_array[i - 1]):
-            continue
-        if np.isnan(mid_array[i]) or np.isnan(mid_array[i - 1]):
-            continue
-        
-        prev_diff = rsi_array[i - 1] - mid_array[i - 1]
-        curr_diff = rsi_array[i] - mid_array[i]
-        
-        if prev_diff > 0 and curr_diff <= 0:
-            # Crossed from above to below → came from above → bullish
-            crossing_vote = "bullish"
-            break
-        elif prev_diff < 0 and curr_diff >= 0:
-            # Crossed from below to above → came from below → bearish
-            crossing_vote = "bearish"
-            break
-    
-    # If no cross found, use current position as a weaker signal
-    if crossing_vote == "neutral":
-        if rsi_array[idx] > mid_array[idx]:
-            crossing_vote = "bullish"
-        elif rsi_array[idx] < mid_array[idx]:
-            crossing_vote = "bearish"
-    
-    # ── Signal 3: RSI Momentum ──
-    # Compare current RSI to RSI from `safe_lookback` candles ago
-    momentum_start_idx = max(start_idx, 0)
-    # Find the first non-NaN value in the lookback range for comparison
-    momentum_start_rsi = None
-    for i in range(momentum_start_idx, idx):
-        if not np.isnan(rsi_array[i]):
-            momentum_start_rsi = rsi_array[i]
-            break
-    
-    if momentum_start_rsi is not None and not np.isnan(rsi_array[idx]):
-        rsi_delta = rsi_array[idx] - momentum_start_rsi
-        if rsi_delta > 0:
-            # RSI is rising → momentum pushing up from below → bearish (approaching resistance)
-            momentum_vote = "bearish"
-        elif rsi_delta < 0:
-            # RSI is falling → momentum pushing down from above → bullish (approaching support)
-            momentum_vote = "bullish"
-        else:
-            momentum_vote = "neutral"
-    else:
-        momentum_vote = "neutral"
-    
-    # ── Voting ──
-    votes = {"bullish": 0, "bearish": 0}
-    for vote in [trajectory_vote, crossing_vote, momentum_vote]:
-        if vote in votes:
-            votes[vote] += 1
-    
-    if votes["bullish"] >= 2:
-        return "bullish"
-    elif votes["bearish"] >= 2:
-        return "bearish"
-    else:
-        # Tiebreaker: use trajectory as the strongest single signal
-        if trajectory_vote != "neutral":
-            return trajectory_vote
-        elif crossing_vote != "neutral":
-            return crossing_vote
-        else:
-            # Ultimate fallback: position relative to middle band
-            if rsi_array[idx] >= mid_array[idx]:
-                return "bullish"
-            else:
-                return "bearish"
+    return classify_middle_band_direction_core(
+        rsi_array=rsi_array,
+        mid_array=mid_array,
+        idx=idx,
+        lookback=lookback,
+        touch_threshold=CONFIG.MIDDLE_TOUCH_THRESHOLD,
+    )
 
 
 def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[str], float]:
