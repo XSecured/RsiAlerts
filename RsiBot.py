@@ -1418,15 +1418,15 @@ class RsiBot:
         
         if CONFIG.BYBIT_ENABLED:
             bp, bs, yp, ys = await asyncio.gather(
-                try_fetch(binance.getperpsymbols, 'bp', 'Binance Perp'),
-                try_fetch(binance.getspotsymbols, 'bs', 'Binance Spot'),
-                try_fetch(bybit.getperpsymbols,   'yp', 'Bybit Perp'),
-                try_fetch(bybit.getspotsymbols,   'ys', 'Bybit Spot'),
+                try_fetch(binance.get_perp_symbols, 'bp', 'Binance Perp'),
+                try_fetch(binance.get_spot_symbols, 'bs', 'Binance Spot'),
+                try_fetch(bybit.get_perp_symbols,   'yp', 'Bybit Perp'),
+                try_fetch(bybit.get_spot_symbols,   'ys', 'Bybit Spot'),
             )
         else:
             bp, bs = await asyncio.gather(
-                try_fetch(binance.getperpsymbols, 'bp', 'Binance Perp'),
-                try_fetch(binance.getspotsymbols, 'bs', 'Binance Spot'),
+                try_fetch(binance.get_perp_symbols, 'bp', 'Binance Perp'),
+                try_fetch(binance.get_spot_symbols, 'bs', 'Binance Spot'),
             )
             yp, ys = [], []
         
