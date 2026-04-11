@@ -57,6 +57,8 @@ class Config:
         "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDY", "PYUSD"
     })
 
+    BYBIT_ENABLED: bool = False
+
 CONFIG = Config()
 
 TIMEFRAME_MINUTES = {
@@ -1414,12 +1416,19 @@ class RsiBot:
             logging.error(f"❌ {name}: Failed and NO CACHE available.")
             return []
         
-        bp, bs, yp, ys = await asyncio.gather(
-            try_fetch(binance.get_perp_symbols, 'bp', 'Binance Perp'),
-            try_fetch(binance.get_spot_symbols, 'bs', 'Binance Spot'),
-            try_fetch(bybit.get_perp_symbols, 'yp', 'Bybit Perp'),
-            try_fetch(bybit.get_spot_symbols, 'ys', 'Bybit Spot')
-        )
+        if CONFIG.BYBIT_ENABLED:
+            bp, bs, yp, ys = await asyncio.gather(
+                tryfetch(binance.getperpsymbols, 'bp', 'Binance Perp'),
+                tryfetch(binance.getspotsymbols, 'bs', 'Binance Spot'),
+                tryfetch(bybit.getperpsymbols,   'yp', 'Bybit Perp'),
+                tryfetch(bybit.getspotsymbols,   'ys', 'Bybit Spot'),
+            )
+        else:
+            bp, bs = await asyncio.gather(
+                tryfetch(binance.getperpsymbols, 'bp', 'Binance Perp'),
+                tryfetch(binance.getspotsymbols, 'bs', 'Binance Spot'),
+            )
+            yp, ys = [], []
         
         if any(len(x) > 0 for x in [bp, bs, yp, ys]):
             await self.cache.save_cached_symbols({'bp': bp, 'bs': bs, 'yp': yp, 'ys': ys})
@@ -1475,10 +1484,11 @@ class RsiBot:
                             all_pairs.append((client, s, market, exchange))
                 
                 # Add in strict priority order
-                add_with_dedup(binance, bp, 'perp', 'Binance')
-                add_with_dedup(binance, bs, 'spot', 'Binance')
-                add_with_dedup(bybit, yp, 'perp', 'Bybit')
-                add_with_dedup(bybit, ys, 'spot', 'Bybit')
+                addwithdedup(binance, bp, 'perp', 'Binance')
+                addwithdedup(binance, bs, 'spot', 'Binance')
+                if CONFIG.BYBIT_ENABLED:
+                    addwithdedup(bybit, yp, 'perp', 'Bybit')
+                    addwithdedup(bybit, ys, 'spot', 'Bybit')
                 
                 total_sym_count = len(all_pairs)
                 logging.info(f"Total unique symbols after dedup: {total_sym_count}")
