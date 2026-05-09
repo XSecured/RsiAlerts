@@ -1512,7 +1512,7 @@ class RsiBot:
                 vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
                 await asyncio.gather(*vol_tasks)
                 
-                hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:200])
+                hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
                 logging.info(f"Vol Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot: {len(hot_coins)}")
                 
                 # ── Determine Which Timeframes to Scan ──
