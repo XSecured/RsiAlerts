@@ -54,7 +54,8 @@ class Config:
     WEEKLY_SCAN_DELAY: int = 1800  # 30 minutes
 
     IGNORED_SYMBOLS: Set[str] = field(default_factory=lambda: {
-        "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDYUSDT", "PYUSDUSDT", "USDEUSDT", "USDDUSDT", "BFUSDUSDT" 
+        "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDYUSDT", "PYUSDUSDT",
+        "USDEUSDT", "USDDUSDT", "BFUSDUSDT", "BTTCUSDT"
     })
 
     BYBIT_ENABLED: bool = False
@@ -833,7 +834,7 @@ class BinanceClient(ExchangeClient):
         return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
     async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
         base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
-        data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': 72})
+        data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': 48})
         if not data: return []
         try: return [float(c[4]) for c in data]
         except: return []
@@ -856,7 +857,7 @@ class BybitClient(ExchangeClient):
     async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
         url = 'https://api.bybit.com/v5/market/kline'
         cat = 'linear' if market == 'perp' else 'spot'
-        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': '60', 'limit': 72})
+        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': '60', 'limit': 48})
         if not data: return []
         raw = data.get('result', {}).get('list', [])
         if not raw: return []
