@@ -835,9 +835,9 @@ class BinanceClient(ExchangeClient):
         data = await self._request('https://api.binance.com/api/v3/exchangeInfo')
         if not data: return []
         return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
-    async def fetch_combined_data(self, symbol: str, market: str) -> List[float]:
+    async def fetch_combined_data(self, symbol: str, market: str, limit: int) -> List[float]:
         base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
-        data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': 850})
+        data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': limit})
         if not data: return []
         try: return [float(c[4]) for c in data]
         except: return []
@@ -857,10 +857,10 @@ class BybitClient(ExchangeClient):
         data = await self._request('https://api.bybit.com/v5/market/instruments-info', {'category': 'spot'})
         if not data: return []
         return [s['symbol'] for s in data['result']['list'] if s['status'] == 'Trading' and s['quoteCoin'] == 'USDT']
-    async def fetch_combined_data(self, symbol: str, market: str) -> List[float]:
+    async def fetch_combined_data(self, symbol: str, market: str, limit: int) -> List[float]:
         url = 'https://api.bybit.com/v5/market/kline'
         cat = 'linear' if market == 'perp' else 'spot'
-        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': '60', 'limit': 850})
+        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': '60', 'limit': limit})
         if not data: return []
         raw = data.get('result', {}).get('list', [])
         if not raw: return []
@@ -1517,26 +1517,26 @@ class RsiBot:
                 ema_survivors: List[Tuple[Any, str, str, str]] = []
                 scan_sem = asyncio.Semaphore(CONFIG.MAX_CONCURRENCY)
                 successful_fetches = 0
+                
+                # Calculate required data based on EMA length
+                required_hours = CONFIG.EMA_LENGTH * 24
+                fetch_limit = required_hours + 40 # Buffer for talib calculations
 
                 async def process_symbol(client, sym, mkt, ex):
                     nonlocal successful_fetches
                     async with scan_sem:
                         try:
-                            # Fetch ~850 hourly candles for both EMA and Volatility
-                            h_closes = await client.fetch_combined_data(sym, mkt)
-                            
+                            h_closes = await client.fetch_combined_data(sym, mkt, fetch_limit)
                             if not h_closes:
                                 return
                             
                             successful_fetches += 1
                             
-                            if len(h_closes) < 816:
+                            if len(h_closes) < required_hours:
                                 return
 
-                            # Check Daily EMA 34 (requires 816h candles)
                             d_closes = resample_to_daily(h_closes)
                             if check_above_ema(d_closes, CONFIG.EMA_LENGTH):
-                                # Calculate volatility using last 48h of the same data
                                 v = calculate_volatility(h_closes[-48:])
                                 if v > 0:
                                     vol_scores[sym] = v
@@ -1551,7 +1551,7 @@ class RsiBot:
                 all_pairs = ema_survivors
                 
                 logging.info(f"I/O Success: {successful_fetches}/{total_sym_count} symbols fetched.")
-                logging.info(f"EMA Filter: {len(all_pairs)} symbols above 34 EMA.")
+                logging.info(f"EMA Filter: {len(all_pairs)} symbols above {CONFIG.EMA_LENGTH} EMA.")
                 logging.info(f"Volatility Ranking: {len(hot_coins)} coins marked with 🔥")
                 
                 # ── Determine Which Timeframes to Scan ──
