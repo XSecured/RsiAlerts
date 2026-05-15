@@ -1537,6 +1537,7 @@ class RsiBot:
 
                             d_closes = resample_to_daily(h_closes)
                             if check_above_ema(d_closes, CONFIG.EMA_LENGTH):
+                                # Calculate volatility using last 48h of the same data
                                 v = calculate_volatility(h_closes[-48:])
                                 if v > 0:
                                     vol_scores[sym] = v
