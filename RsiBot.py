@@ -42,6 +42,9 @@ class Config:
     CANDLE_LIMIT: int = 60
     MIN_CANDLES: int = 36
 
+    EMA_LENGTH: int = 34
+    HOT_COINS_LIMIT: int = 60
+
     UPPER_TOUCH_THRESHOLD: float = 0.02
     LOWER_TOUCH_THRESHOLD: float = 0.02
     MIDDLE_TOUCH_THRESHOLD: float = 0.035
@@ -832,9 +835,9 @@ class BinanceClient(ExchangeClient):
         data = await self._request('https://api.binance.com/api/v3/exchangeInfo')
         if not data: return []
         return [s['symbol'] for s in data['symbols'] if s['status'] == 'TRADING' and s.get('quoteAsset') == 'USDT']
-    async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
+    async def fetch_combined_data(self, symbol: str, market: str) -> List[float]:
         base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
-        data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': 48})
+        data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': 850})
         if not data: return []
         try: return [float(c[4]) for c in data]
         except: return []
@@ -854,10 +857,10 @@ class BybitClient(ExchangeClient):
         data = await self._request('https://api.bybit.com/v5/market/instruments-info', {'category': 'spot'})
         if not data: return []
         return [s['symbol'] for s in data['result']['list'] if s['status'] == 'Trading' and s['quoteCoin'] == 'USDT']
-    async def fetch_closes_volatility(self, symbol: str, market: str) -> List[float]:
+    async def fetch_combined_data(self, symbol: str, market: str) -> List[float]:
         url = 'https://api.bybit.com/v5/market/kline'
         cat = 'linear' if market == 'perp' else 'spot'
-        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': '60', 'limit': 48})
+        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': '60', 'limit': 850})
         if not data: return []
         raw = data.get('result', {}).get('list', [])
         if not raw: return []
@@ -924,6 +927,20 @@ def calculate_volatility(closes: List[float]) -> float:
         if closes[i-1] != 0: returns.append((closes[i] - closes[i-1]) / closes[i-1] * 100)
     return np.std(returns) if returns else 0.0
 
+def resample_to_daily(hourly_closes: List[float]) -> List[float]:
+    daily_closes = []
+    for i in range(len(hourly_closes) - 1, -1, -24):
+        daily_closes.append(hourly_closes[i])
+    return daily_closes[::-1]
+
+def check_above_ema(closes: List[float], period: int) -> bool:
+    if len(closes) < period:
+        return False
+    np_c = np.array(closes, dtype=float)
+    ema = talib.EMA(np_c, timeperiod=period)
+    if np.isnan(ema[-1]):
+        return False
+    return closes[-1] > ema[-1]
 
 def classify_middle_band_direction(
     rsi_array: np.ndarray,
@@ -1494,27 +1511,48 @@ class RsiBot:
                 total_sym_count = len(all_pairs)
                 logging.info(f"Total unique symbols after dedup: {total_sym_count}")
                 
-                # ── Volatility Calculation ──
-                logging.info("Calculating Volatility...")
+                # ── EMA Filter & Volatility Calculation ──                             
+                logging.info("Starting Unified EMA Filter & Volatility Scan...")
                 vol_scores: Dict[str, float] = {}
-                vol_sem = asyncio.Semaphore(50)
+                ema_survivors: List[Tuple[Any, str, str, str]] = []
+                scan_sem = asyncio.Semaphore(CONFIG.MAX_CONCURRENCY)
+                successful_fetches = 0
 
-                async def check_vol(client: ExchangeClient, sym: str, mkt: str):
-                    async with vol_sem:
+                async def process_symbol(client, sym, mkt, ex):
+                    nonlocal successful_fetches
+                    async with scan_sem:
                         try:
-                            c = await client.fetch_closes_volatility(sym, mkt)
-                            if c:
-                                v = calculate_volatility(c)
+                            # Fetch ~850 hourly candles for both EMA and Volatility
+                            h_closes = await client.fetch_combined_data(sym, mkt)
+                            
+                            if not h_closes:
+                                return
+                            
+                            successful_fetches += 1
+                            
+                            if len(h_closes) < 816:
+                                return
+
+                            # Check Daily EMA 34 (requires 816h candles)
+                            d_closes = resample_to_daily(h_closes)
+                            if check_above_ema(d_closes, CONFIG.EMA_LENGTH):
+                                # Calculate volatility using last 48h of the same data
+                                v = calculate_volatility(h_closes[-48:])
                                 if v > 0:
                                     vol_scores[sym] = v
+                                    ema_survivors.append((client, sym, mkt, ex))
                         except Exception as e:
-                            logging.debug(f"Volatility check failed for {sym}: {e}")
+                            logging.debug(f"Processing failed for {sym}: {e}")
+
+                tasks = [process_symbol(client, s, mkt, ex) for client, s, mkt, ex in all_pairs]
+                await asyncio.gather(*tasks)
+
+                hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:CONFIG.HOT_COINS_LIMIT])
+                all_pairs = ema_survivors
                 
-                vol_tasks = [check_vol(client, s, mkt) for client, s, mkt, ex in all_pairs]
-                await asyncio.gather(*vol_tasks)
-                
-                hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:60])
-                logging.info(f"Vol Calc: {len(vol_scores)}/{len(all_pairs)} success | Hot: {len(hot_coins)}")
+                logging.info(f"I/O Success: {successful_fetches}/{total_sym_count} symbols fetched.")
+                logging.info(f"EMA Filter: {len(all_pairs)} symbols above 34 EMA.")
+                logging.info(f"Volatility Ranking: {len(hot_coins)} coins marked with 🔥")
                 
                 # ── Determine Which Timeframes to Scan ──
                 sent_state = await self.cache.get_sent_state()
