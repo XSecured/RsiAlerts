@@ -58,7 +58,7 @@ class Config:
 
     IGNORED_SYMBOLS: Set[str] = field(default_factory=lambda: {
         "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDYUSDT", "PYUSDUSDT",
-        "USDEUSDT", "USDDUSDT", "BFUSDUSDT", "BTTCUSDT"
+        "USDEUSDT", "USDDUSDT", "BFUSDUSDT", "BTTCUSDT", "XUSDUSDT"
     })
 
     BYBIT_ENABLED: bool = False
