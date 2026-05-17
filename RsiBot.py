@@ -43,6 +43,7 @@ class Config:
     MIN_CANDLES: int = 36
 
     EMA_LENGTH: int = 34
+    EMA_THRESHOLD_PCT: float = 3.0
     HOT_COINS_LIMIT: int = 60
 
     UPPER_TOUCH_THRESHOLD: float = 0.02
@@ -933,14 +934,15 @@ def resample_to_daily(hourly_closes: List[float]) -> List[float]:
         daily_closes.append(hourly_closes[i])
     return daily_closes[::-1]
 
-def check_above_ema(closes: List[float], period: int) -> bool:
+def check_above_ema(closes: List[float], period: int, threshold_pct: float) -> bool:
     if len(closes) < period:
         return False
     np_c = np.array(closes, dtype=float)
     ema = talib.EMA(np_c, timeperiod=period)
     if np.isnan(ema[-1]):
         return False
-    return closes[-1] > ema[-1]
+    threshold_factor = 1.0 - (threshold_pct / 100.0)
+    return closes[-1] >= (ema[-1] * threshold_factor)
 
 def classify_middle_band_direction(
     rsi_array: np.ndarray,
@@ -1536,7 +1538,7 @@ class RsiBot:
                                 return
 
                             d_closes = resample_to_daily(h_closes)
-                            if check_above_ema(d_closes, CONFIG.EMA_LENGTH):
+                            if check_above_ema(d_closes, CONFIG.EMA_LENGTH, CONFIG.EMA_THRESHOLD_PCT):
                                 # Calculate volatility using last 48h of the same data
                                 v = calculate_volatility(h_closes[-48:])
                                 if v > 0:
