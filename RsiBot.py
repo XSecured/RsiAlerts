@@ -43,7 +43,7 @@ class Config:
     MIN_CANDLES: int = 36
 
     EMA_LENGTH: int = 34
-    EMA_THRESHOLD_PCT: float = 3.0
+    EMA_THRESHOLD_PCT: float = 5.5
     HOT_COINS_LIMIT: int = 60
 
     UPPER_TOUCH_THRESHOLD: float = 0.02
