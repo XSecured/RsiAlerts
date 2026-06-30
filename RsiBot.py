@@ -43,11 +43,11 @@ class Config:
     MIN_CANDLES: int = 36
 
     EMA_LENGTH: int = 34
-    EMA_THRESHOLD_PCT: float = 5.5
+    EMA_THRESHOLD_PCT: float = 15.5
     HOT_COINS_LIMIT: int = 60
 
-    UPPER_TOUCH_THRESHOLD: float = 0.02
-    LOWER_TOUCH_THRESHOLD: float = 0.02
+    UPPER_TOUCH_THRESHOLD: float = 0.035
+    LOWER_TOUCH_THRESHOLD: float = 0.035
     MIDDLE_TOUCH_THRESHOLD: float = 0.035
 
     # Number of lookback candles for middle band direction analysis
