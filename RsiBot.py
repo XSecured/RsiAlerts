@@ -50,6 +50,19 @@ class Config:
     LOWER_TOUCH_THRESHOLD: float = 0.035
     MIDDLE_TOUCH_THRESHOLD: float = 0.035
 
+    # ── Adaptive band-width threshold scaling ──
+    # The *_TOUCH_THRESHOLD values above are multiplied by a factor derived
+    # from how wide the RSI Bollinger Bands currently are (upper - lower),
+    # relative to BB_WIDTH_REFERENCE (a "normal" bandwidth in RSI points).
+    # A wide band -> looser touch tolerance (up to ADAPTIVE_THRESHOLD_MAX_MULT).
+    # A narrow band -> tighter tolerance (down to ADAPTIVE_THRESHOLD_MIN_MULT).
+    # Set ADAPTIVE_THRESHOLD_ENABLED to False to fall back to the fixed
+    # thresholds above (multiplier pinned at 1.0).
+    ADAPTIVE_THRESHOLD_ENABLED: bool = True
+    BB_WIDTH_REFERENCE: float = 20.0
+    ADAPTIVE_THRESHOLD_MIN_MULT: float = 0.5
+    ADAPTIVE_THRESHOLD_MAX_MULT: float = 2.0
+
     # Number of lookback candles for middle band direction analysis
     MIDDLE_BAND_LOOKBACK: int = 5
 
@@ -63,6 +76,12 @@ class Config:
     })
 
     BYBIT_ENABLED: bool = False
+
+    # Timeframes listed here skip the EMA-34 trend filter entirely and are
+    # scanned against every deduplicated symbol, independent of trend. Use
+    # this for a "see everything" view on slower timeframes (e.g. weekly)
+    # while faster timeframes still scan only EMA-confirmed trend coins.
+    EMA_FILTER_EXEMPT_TFS: Set[str] = field(default_factory=lambda: {'1w'})
 
 CONFIG = Config()
 
@@ -1083,6 +1102,25 @@ def classify_middle_band_direction(
                 return "bearish"
 
 
+def compute_adaptive_multiplier(band_width: float) -> float:
+    """
+    Map the current RSI-BB band width to a touch-threshold scaling factor.
+
+    Wider bands (more RSI dispersion, e.g. during volatile regimes) need a
+    proportionally larger tolerance to sensibly call something a "touch";
+    narrow, calm-regime bands should use a tighter tolerance so touches stay
+    meaningful. The multiplier is linear in band_width / BB_WIDTH_REFERENCE
+    and clamped to [ADAPTIVE_THRESHOLD_MIN_MULT, ADAPTIVE_THRESHOLD_MAX_MULT].
+    """
+    if not CONFIG.ADAPTIVE_THRESHOLD_ENABLED or CONFIG.BB_WIDTH_REFERENCE <= 0:
+        return 1.0
+    raw_mult = band_width / CONFIG.BB_WIDTH_REFERENCE
+    return min(
+        max(raw_mult, CONFIG.ADAPTIVE_THRESHOLD_MIN_MULT),
+        CONFIG.ADAPTIVE_THRESHOLD_MAX_MULT,
+    )
+
+
 def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[str], float]:
     """
     Check if the RSI Bollinger Band touch condition is met.
@@ -1113,19 +1151,30 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
         return None, None, 0.0
     
     curr_rsi = rsi[idx]
-    
+
+    # ── Adaptive threshold scaling based on current band width ──
+    band_width = upper[idx] - lower[idx]
+    adaptive_mult = (
+        compute_adaptive_multiplier(band_width)
+        if not np.isnan(band_width) and band_width > 0
+        else 1.0
+    )
+    upper_threshold = CONFIG.UPPER_TOUCH_THRESHOLD * adaptive_mult
+    lower_threshold = CONFIG.LOWER_TOUCH_THRESHOLD * adaptive_mult
+    middle_threshold = CONFIG.MIDDLE_TOUCH_THRESHOLD * adaptive_mult
+
     # Check upper band touch
-    if curr_rsi >= upper[idx] * (1 - CONFIG.UPPER_TOUCH_THRESHOLD):
+    if curr_rsi >= upper[idx] * (1 - upper_threshold):
         return "UPPER", "", curr_rsi
     
     # Check lower band touch
-    if curr_rsi <= lower[idx] * (1 + CONFIG.LOWER_TOUCH_THRESHOLD):
+    if curr_rsi <= lower[idx] * (1 + lower_threshold):
         return "LOWER", "", curr_rsi
     
     # Check middle band touch (only for configured timeframes)
     if tf in MIDDLE_BAND_TFS:
         mid_val = mid[idx]
-        if mid_val > 0 and abs(curr_rsi - mid_val) <= (mid_val * CONFIG.MIDDLE_TOUCH_THRESHOLD):
+        if mid_val > 0 and abs(curr_rsi - mid_val) <= (mid_val * middle_threshold):
             # Use the multi-signal classification system
             direction = classify_middle_band_direction(
                 rsi_array=rsi,
@@ -1537,30 +1586,79 @@ class RsiBot:
                             if len(h_closes) < required_hours:
                                 return
 
+                            # Volatility is recorded for every symbol (not just
+                            # EMA survivors) so EMA-exempt timeframes, which
+                            # scan the full universe, can still mark 🔥 hot
+                            # coins among symbols that never passed the trend
+                            # filter.
+                            v = calculate_volatility(h_closes[-48:])
+                            if v > 0:
+                                vol_scores[sym] = v
+
                             d_closes = resample_to_daily(h_closes)
                             if check_above_ema(d_closes, CONFIG.EMA_LENGTH, CONFIG.EMA_THRESHOLD_PCT):
-                                # Calculate volatility using last 48h of the same data
-                                v = calculate_volatility(h_closes[-48:])
-                                if v > 0:
-                                    vol_scores[sym] = v
-                                    ema_survivors.append((client, sym, mkt, ex))
+                                ema_survivors.append((client, sym, mkt, ex))
                         except Exception as e:
                             logging.debug(f"Processing failed for {sym}: {e}")
 
                 tasks = [process_symbol(client, s, mkt, ex) for client, s, mkt, ex in all_pairs]
                 await asyncio.gather(*tasks)
 
-                hot_coins = set(sorted(vol_scores, key=vol_scores.get, reverse=True)[:CONFIG.HOT_COINS_LIMIT])
-                all_pairs = ema_survivors
-                
+                # ── Two symbol universes going forward ──
+                # full_universe_pairs: every deduplicated symbol, pre-EMA-filter.
+                # ema_filtered_pairs: only symbols above the EMA trend filter.
+                # Timeframes in CONFIG.EMA_FILTER_EXEMPT_TFS scan the full
+                # universe (no trend filtering); every other timeframe scans
+                # only the EMA-confirmed subset.
+                full_universe_pairs = all_pairs
+                ema_filtered_pairs = ema_survivors
+
+                def pairs_for_timeframe(tf: str) -> List[Tuple[Any, str, str, str]]:
+                    if tf in CONFIG.EMA_FILTER_EXEMPT_TFS:
+                        return full_universe_pairs
+                    return ema_filtered_pairs
+
+                # ── Two hot-coin rankings, matching the two universes ──
+                # hot_coins_filtered: top volatility among EMA-confirmed coins
+                #                     only (used by trend-filtered timeframes,
+                #                     so 🔥 still means "hot among trending").
+                # hot_coins_full:     top volatility across every symbol
+                #                     (used by EMA-exempt timeframes, so they
+                #                     can mark 🔥 even on non-trending coins).
+                ema_filtered_symbols = {sym for _, sym, _, _ in ema_filtered_pairs}
+                hot_coins_filtered = set(
+                    sorted(
+                        (s for s in vol_scores if s in ema_filtered_symbols),
+                        key=vol_scores.get,
+                        reverse=True,
+                    )[:CONFIG.HOT_COINS_LIMIT]
+                )
+                hot_coins_full = set(
+                    sorted(vol_scores, key=vol_scores.get, reverse=True)[:CONFIG.HOT_COINS_LIMIT]
+                )
+
+                def hot_coins_for_timeframe(tf: str) -> Set[str]:
+                    if tf in CONFIG.EMA_FILTER_EXEMPT_TFS:
+                        return hot_coins_full
+                    return hot_coins_filtered
+
                 logging.info(f"I/O Success: {successful_fetches}/{total_sym_count} symbols fetched.")
-                logging.info(f"EMA Filter: {len(all_pairs)} symbols above {CONFIG.EMA_LENGTH} EMA.")
-                logging.info(f"Volatility Ranking: {len(hot_coins)} coins marked with 🔥")
+                logging.info(f"EMA Filter: {len(ema_filtered_pairs)} symbols above {CONFIG.EMA_LENGTH} EMA.")
+                logging.info(f"Volatility Ranking (trend-filtered): {len(hot_coins_filtered)} coins marked with 🔥")
+                if CONFIG.EMA_FILTER_EXEMPT_TFS:
+                    logging.info(
+                        f"Volatility Ranking (full universe, for EMA-exempt TFs): "
+                        f"{len(hot_coins_full)} coins marked with 🔥"
+                    )
+                    logging.info(
+                        f"EMA-exempt timeframes {sorted(CONFIG.EMA_FILTER_EXEMPT_TFS)}: "
+                        f"scanning full universe of {len(full_universe_pairs)} symbols (no trend filter)"
+                    )
                 
                 # ── Determine Which Timeframes to Scan ──
                 sent_state = await self.cache.get_sent_state()
                 scan_stats = {
-                    tf: ScanStats(tf, "Unknown", total_symbols=total_sym_count)
+                    tf: ScanStats(tf, "Unknown", total_symbols=len(pairs_for_timeframe(tf)))
                     for tf in ACTIVE_TFS
                 }
                 
@@ -1640,17 +1738,18 @@ class RsiBot:
                                         rsi=rsi_val,
                                         touch_type=t_type,
                                         direction=direction if direction else "",
-                                        hot=sym in hot_coins
+                                        hot=sym in hot_coins_for_timeframe(scan_tf)
                                     )]
                                 return []
                             except Exception as e:
                                 logging.debug(f"Scan failed for {sym} on {scan_tf}: {e}")
                                 return []
                         
-                        # Build tasks for this timeframe
+                        # Build tasks for this timeframe (full universe if
+                        # this tf is EMA-exempt, otherwise the filtered set)
                         tf_tasks = [
                             scan_one(client, sym, mkt, ex, tf)
-                            for client, sym, mkt, ex in all_pairs
+                            for client, sym, mkt, ex in pairs_for_timeframe(tf)
                         ]
                         
                         results = await asyncio.gather(*tf_tasks, return_exceptions=True)
