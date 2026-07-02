@@ -60,7 +60,7 @@ class Config:
     # thresholds above (multiplier pinned at 1.0).
     ADAPTIVE_THRESHOLD_ENABLED: bool = True
     BB_WIDTH_REFERENCE: float = 20.0
-    ADAPTIVE_THRESHOLD_MIN_MULT: float = 0.5
+    ADAPTIVE_THRESHOLD_MIN_MULT: float = 1.0
     ADAPTIVE_THRESHOLD_MAX_MULT: float = 2.0
 
     # Number of lookback candles for middle band direction analysis
