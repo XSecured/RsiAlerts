@@ -82,7 +82,7 @@ class Config:
     # scanned against every deduplicated symbol, independent of trend. Use
     # this for a "see everything" view on slower timeframes (e.g. weekly)
     # while faster timeframes still scan only EMA-confirmed trend coins.
-    EMA_FILTER_EXEMPT_TFS: Set[str] = field(default_factory=lambda: {'1w, 1d'})
+    EMA_FILTER_EXEMPT_TFS: Set[str] = field(default_factory=lambda: {'1w', '1d'})
 
 CONFIG = Config()
 
