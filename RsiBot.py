@@ -50,17 +50,34 @@ class Config:
     LOWER_TOUCH_THRESHOLD: float = 0.035
     MIDDLE_TOUCH_THRESHOLD: float = 0.035
 
-    # ── Adaptive band-width threshold scaling ──
+    # ── Touch threshold mode ──
+    # "percentage": current/default behavior. Tolerance is a % of the band's
+    #               own level (upper[idx] / lower[idx] / mid[idx]), further
+    #               scaled by the adaptive band-width multiplier below. This
+    #               means the effective RSI-point tolerance changes with both
+    #               where the band sits and how wide it currently is.
+    # "points":     tolerance is a flat number of RSI points (0-100 scale),
+    #               completely independent of band level and band width.
+    #               e.g. with MIDDLE_TOUCH_POINTS=1.5, a middle band at 34.0
+    #               and RSI at 35.5 is a hit — regardless of how wide the
+    #               bands are or where the middle band sits.
+    TOUCH_THRESHOLD_MODE: str = "points"  # "percentage" or "points"
+
+    UPPER_TOUCH_POINTS: float = 2.0
+    LOWER_TOUCH_POINTS: float = 2.0
+    MIDDLE_TOUCH_POINTS: float = 2.0
+
+    # ── Adaptive band-width threshold scaling (percentage mode only) ──
     # The *_TOUCH_THRESHOLD values above are multiplied by a factor derived
     # from how wide the RSI Bollinger Bands currently are (upper - lower),
     # relative to BB_WIDTH_REFERENCE (a "normal" bandwidth in RSI points).
     # A wide band -> looser touch tolerance (up to ADAPTIVE_THRESHOLD_MAX_MULT).
     # A narrow band -> tighter tolerance (down to ADAPTIVE_THRESHOLD_MIN_MULT).
     # Set ADAPTIVE_THRESHOLD_ENABLED to False to fall back to the fixed
-    # thresholds above (multiplier pinned at 1.0).
+    # thresholds above (multiplier pinned at 1.0). Has no effect in "points" mode.
     ADAPTIVE_THRESHOLD_ENABLED: bool = True
     BB_WIDTH_REFERENCE: float = 20.0
-    ADAPTIVE_THRESHOLD_MIN_MULT: float = 1.0
+    ADAPTIVE_THRESHOLD_MIN_MULT: float = 0.5
     ADAPTIVE_THRESHOLD_MAX_MULT: float = 2.0
 
     # Number of lookback candles for middle band direction analysis
@@ -72,8 +89,7 @@ class Config:
 
     IGNORED_SYMBOLS: Set[str] = field(default_factory=lambda: {
         "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDYUSDT", "PYUSDUSDT",
-        "USDEUSDT", "USDDUSDT", "BFUSDUSDT", "BTTCUSDT", "XUSDUSDT", "RLUSDUSDT", "FDUSDUSDT", "UUSDT",
-        "USDSUSDT"
+        "USDEUSDT", "USDDUSDT", "BFUSDUSDT", "BTTCUSDT", "XUSDUSDT", "RLUSDUSDT", "FDUSDUSDT"
     })
 
     BYBIT_ENABLED: bool = False
@@ -1125,7 +1141,15 @@ def compute_adaptive_multiplier(band_width: float) -> float:
 def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[str], float]:
     """
     Check if the RSI Bollinger Band touch condition is met.
-    
+
+    Two threshold modes, controlled by CONFIG.TOUCH_THRESHOLD_MODE:
+      - "percentage": tolerance is a % of the band's own level (upper/lower/
+        mid), further scaled by the adaptive band-width multiplier. The
+        effective RSI-point tolerance therefore shifts with band level and
+        band width.
+      - "points": tolerance is a flat number of RSI points (0-100 scale),
+        independent of band level and band width entirely.
+
     Returns:
         (touch_type, direction, rsi_value)
         touch_type: "UPPER", "MIDDLE", "LOWER", or None
@@ -1152,30 +1176,39 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
         return None, None, 0.0
     
     curr_rsi = rsi[idx]
+    mid_val = mid[idx]
 
-    # ── Adaptive threshold scaling based on current band width ──
-    band_width = upper[idx] - lower[idx]
-    adaptive_mult = (
-        compute_adaptive_multiplier(band_width)
-        if not np.isnan(band_width) and band_width > 0
-        else 1.0
-    )
-    upper_threshold = CONFIG.UPPER_TOUCH_THRESHOLD * adaptive_mult
-    lower_threshold = CONFIG.LOWER_TOUCH_THRESHOLD * adaptive_mult
-    middle_threshold = CONFIG.MIDDLE_TOUCH_THRESHOLD * adaptive_mult
+    if CONFIG.TOUCH_THRESHOLD_MODE == "points":
+        # Flat RSI-point tolerance zones — band level and band width play no
+        # role at all. E.g. UPPER_TOUCH_POINTS=2 means "within 2 RSI points
+        # of the upper band" no matter where that band sits or how wide it is.
+        upper_zone = CONFIG.UPPER_TOUCH_POINTS
+        lower_zone = CONFIG.LOWER_TOUCH_POINTS
+        middle_zone = CONFIG.MIDDLE_TOUCH_POINTS
+    else:
+        # Percentage mode: tolerance is a % of the band's own level, further
+        # scaled by how wide the band currently is (adaptive multiplier).
+        band_width = upper[idx] - lower[idx]
+        adaptive_mult = (
+            compute_adaptive_multiplier(band_width)
+            if not np.isnan(band_width) and band_width > 0
+            else 1.0
+        )
+        upper_zone = upper[idx] * CONFIG.UPPER_TOUCH_THRESHOLD * adaptive_mult
+        lower_zone = lower[idx] * CONFIG.LOWER_TOUCH_THRESHOLD * adaptive_mult
+        middle_zone = mid_val * CONFIG.MIDDLE_TOUCH_THRESHOLD * adaptive_mult
 
     # Check upper band touch
-    if curr_rsi >= upper[idx] * (1 - upper_threshold):
+    if curr_rsi >= upper[idx] - upper_zone:
         return "UPPER", "", curr_rsi
     
     # Check lower band touch
-    if curr_rsi <= lower[idx] * (1 + lower_threshold):
+    if curr_rsi <= lower[idx] + lower_zone:
         return "LOWER", "", curr_rsi
     
     # Check middle band touch (only for configured timeframes)
     if tf in MIDDLE_BAND_TFS:
-        mid_val = mid[idx]
-        if mid_val > 0 and abs(curr_rsi - mid_val) <= (mid_val * middle_threshold):
+        if mid_val > 0 and abs(curr_rsi - mid_val) <= middle_zone:
             # Use the multi-signal classification system
             direction = classify_middle_band_direction(
                 rsi_array=rsi,
