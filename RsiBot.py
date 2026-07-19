@@ -1231,7 +1231,7 @@ class RsiBot:
         self.proxies = RobustProxyPool(
             validation_concurrency=100,
             allow_direct_fallback=False,
-            max_pool_size=20,
+            max_pool_size=30,
             request_timeout=CONFIG.REQUEST_TIMEOUT,
             validation_timeout=4.0
         )
