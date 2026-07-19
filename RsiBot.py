@@ -70,15 +70,29 @@ class Config:
     # ── Adaptive band-width threshold scaling (percentage mode only) ──
     # The *_TOUCH_THRESHOLD values above are multiplied by a factor derived
     # from how wide the RSI Bollinger Bands currently are (upper - lower),
-    # relative to BB_WIDTH_REFERENCE (a "normal" bandwidth in RSI points).
-    # A wide band -> looser touch tolerance (up to ADAPTIVE_THRESHOLD_MAX_MULT).
-    # A narrow band -> tighter tolerance (down to ADAPTIVE_THRESHOLD_MIN_MULT).
-    # Set ADAPTIVE_THRESHOLD_ENABLED to False to fall back to the fixed
-    # thresholds above (multiplier pinned at 1.0). Has no effect in "points" mode.
+    # relative to a reference width. A wide band -> looser touch tolerance
+    # (up to ADAPTIVE_THRESHOLD_MAX_MULT). A narrow band -> tighter tolerance
+    # (down to ADAPTIVE_THRESHOLD_MIN_MULT). Set ADAPTIVE_THRESHOLD_ENABLED to
+    # False to disable scaling entirely (multiplier pinned at 1.0). Has no
+    # effect in "points" mode.
     ADAPTIVE_THRESHOLD_ENABLED: bool = True
-    BB_WIDTH_REFERENCE: float = 20.0
     ADAPTIVE_THRESHOLD_MIN_MULT: float = 0.5
     ADAPTIVE_THRESHOLD_MAX_MULT: float = 2.0
+
+    # ── Width reference: what counts as a "normal" band width ──
+    # "dynamic": each symbol/timeframe uses its OWN trailing median band
+    #            width (over BB_WIDTH_REFERENCE_LOOKBACK candles) as the
+    #            reference, so "normal" is relative to that specific coin's
+    #            recent behavior rather than one number applied to everything.
+    #            Falls back to the static value below during warm-up or if
+    #            fewer than BB_WIDTH_REFERENCE_MIN_SAMPLES history points
+    #            are available yet.
+    # "static":  always use BB_WIDTH_REFERENCE, unchanged for every symbol
+    #            and timeframe.
+    BB_WIDTH_REFERENCE_MODE: str = "dynamic"  # "dynamic" or "static"
+    BB_WIDTH_REFERENCE: float = 20.0
+    BB_WIDTH_REFERENCE_LOOKBACK: int = 20
+    BB_WIDTH_REFERENCE_MIN_SAMPLES: int = 5
 
     # Number of lookback candles for middle band direction analysis
     MIDDLE_BAND_LOOKBACK: int = 5
@@ -89,8 +103,7 @@ class Config:
 
     IGNORED_SYMBOLS: Set[str] = field(default_factory=lambda: {
         "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDYUSDT", "PYUSDUSDT",
-        "USDEUSDT", "USDDUSDT", "BFUSDUSDT", "BTTCUSDT", "XUSDUSDT", "RLUSDUSDT", "FDUSDUSDT", "USDSUSDT",
-        "UUSDT"
+        "USDEUSDT", "USDDUSDT", "BFUSDUSDT", "BTTCUSDT", "XUSDUSDT", "RLUSDUSDT", "FDUSDUSDT"
     })
 
     BYBIT_ENABLED: bool = False
@@ -99,7 +112,7 @@ class Config:
     # scanned against every deduplicated symbol, independent of trend. Use
     # this for a "see everything" view on slower timeframes (e.g. weekly)
     # while faster timeframes still scan only EMA-confirmed trend coins.
-    EMA_FILTER_EXEMPT_TFS: Set[str] = field(default_factory=lambda: {'1w', '1d'})
+    EMA_FILTER_EXEMPT_TFS: Set[str] = field(default_factory=lambda: {'1w'})
 
 CONFIG = Config()
 
@@ -137,6 +150,7 @@ class ScanStats:
     source: str
     total_symbols: int = 0
     successful_scans: int = 0
+    failed_scans: int = 0
     hits_found: int = 0
 
 # ==========================================
@@ -1120,19 +1134,56 @@ def classify_middle_band_direction(
                 return "bearish"
 
 
-def compute_adaptive_multiplier(band_width: float) -> float:
+def compute_width_reference(upper: np.ndarray, lower: np.ndarray, idx: int) -> float:
     """
-    Map the current RSI-BB band width to a touch-threshold scaling factor.
+    Determine the "normal" band-width reference used to scale both the
+    adaptive multiplier and the touch zones themselves.
 
-    Wider bands (more RSI dispersion, e.g. during volatile regimes) need a
+    "static": always CONFIG.BB_WIDTH_REFERENCE — one fixed number applied
+              to every symbol and timeframe alike.
+    "dynamic": this specific symbol/timeframe's OWN trailing median band
+               width over CONFIG.BB_WIDTH_REFERENCE_LOOKBACK candles,
+               excluding the current (still-forming) candle so the
+               reference isn't influenced by the very touch it's judging.
+               Falls back to the static value if fewer than
+               BB_WIDTH_REFERENCE_MIN_SAMPLES valid historical points are
+               available (e.g. during warm-up on a freshly listed symbol).
+
+    Note: with typical CANDLE_LIMIT/BB_LENGTH settings, RSI+BBANDS warm-up
+    consumes most of the fetched history, so the "dynamic" lookback window
+    is usually short (a handful of points) rather than deep history. It's
+    still specific to this symbol and timeframe, just not a long baseline.
+    """
+    if CONFIG.BB_WIDTH_REFERENCE_MODE != "dynamic":
+        return CONFIG.BB_WIDTH_REFERENCE
+
+    pos_idx = len(upper) + idx if idx < 0 else idx
+    start = max(0, pos_idx - CONFIG.BB_WIDTH_REFERENCE_LOOKBACK)
+    hist_width = upper[start:pos_idx] - lower[start:pos_idx]
+    hist_width = hist_width[~np.isnan(hist_width)]
+
+    if hist_width.size < CONFIG.BB_WIDTH_REFERENCE_MIN_SAMPLES:
+        return CONFIG.BB_WIDTH_REFERENCE
+
+    return float(np.median(hist_width))
+
+
+def compute_adaptive_multiplier(band_width: float, width_reference: float) -> float:
+    """
+    Map the current RSI-BB band width to a touch-threshold scaling factor,
+    relative to width_reference (this symbol/timeframe's own typical width
+    in "dynamic" mode, or the fixed CONFIG.BB_WIDTH_REFERENCE in "static"
+    mode — see compute_width_reference).
+
+    Wider-than-reference bands (e.g. during volatile regimes) need a
     proportionally larger tolerance to sensibly call something a "touch";
-    narrow, calm-regime bands should use a tighter tolerance so touches stay
-    meaningful. The multiplier is linear in band_width / BB_WIDTH_REFERENCE
+    narrower-than-reference bands should use a tighter tolerance so touches
+    stay meaningful. The multiplier is linear in band_width / width_reference
     and clamped to [ADAPTIVE_THRESHOLD_MIN_MULT, ADAPTIVE_THRESHOLD_MAX_MULT].
     """
-    if not CONFIG.ADAPTIVE_THRESHOLD_ENABLED or CONFIG.BB_WIDTH_REFERENCE <= 0:
+    if not CONFIG.ADAPTIVE_THRESHOLD_ENABLED or width_reference <= 0:
         return 1.0
-    raw_mult = band_width / CONFIG.BB_WIDTH_REFERENCE
+    raw_mult = band_width / width_reference
     return min(
         max(raw_mult, CONFIG.ADAPTIVE_THRESHOLD_MIN_MULT),
         CONFIG.ADAPTIVE_THRESHOLD_MAX_MULT,
@@ -1144,10 +1195,11 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
     Check if the RSI Bollinger Band touch condition is met.
 
     Two threshold modes, controlled by CONFIG.TOUCH_THRESHOLD_MODE:
-      - "percentage": tolerance is a % of the band's own level (upper/lower/
-        mid), further scaled by the adaptive band-width multiplier. The
-        effective RSI-point tolerance therefore shifts with band level and
-        band width.
+      - "percentage": tolerance is a % of a shared width_reference (this
+        symbol/timeframe's own typical band width in "dynamic" mode, or
+        CONFIG.BB_WIDTH_REFERENCE in "static" mode), further scaled by how
+        wide the band currently is relative to that same reference. Zones
+        are symmetric regardless of where RSI currently sits.
       - "points": tolerance is a flat number of RSI points (0-100 scale),
         independent of band level and band width entirely.
 
@@ -1187,17 +1239,20 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
         lower_zone = CONFIG.LOWER_TOUCH_POINTS
         middle_zone = CONFIG.MIDDLE_TOUCH_POINTS
     else:
-        # Percentage mode: tolerance is a % of the band's own level, further
-        # scaled by how wide the band currently is (adaptive multiplier).
+        # Percentage mode: tolerance is a % of a shared width_reference (not
+        # the band's own level, which would make upper/lower/middle zones
+        # asymmetric depending on where RSI currently sits), further scaled
+        # by how wide the band is relative to that same reference.
         band_width = upper[idx] - lower[idx]
+        width_reference = compute_width_reference(upper, lower, idx)
         adaptive_mult = (
-            compute_adaptive_multiplier(band_width)
+            compute_adaptive_multiplier(band_width, width_reference)
             if not np.isnan(band_width) and band_width > 0
             else 1.0
         )
-        upper_zone = upper[idx] * CONFIG.UPPER_TOUCH_THRESHOLD * adaptive_mult
-        lower_zone = lower[idx] * CONFIG.LOWER_TOUCH_THRESHOLD * adaptive_mult
-        middle_zone = mid_val * CONFIG.MIDDLE_TOUCH_THRESHOLD * adaptive_mult
+        upper_zone = width_reference * CONFIG.UPPER_TOUCH_THRESHOLD * adaptive_mult
+        lower_zone = width_reference * CONFIG.LOWER_TOUCH_THRESHOLD * adaptive_mult
+        middle_zone = width_reference * CONFIG.MIDDLE_TOUCH_THRESHOLD * adaptive_mult
 
     # Check upper band touch
     if curr_rsi >= upper[idx] - upper_zone:
@@ -1231,7 +1286,7 @@ class RsiBot:
         self.proxies = RobustProxyPool(
             validation_concurrency=100,
             allow_direct_fallback=False,
-            max_pool_size=30,
+            max_pool_size=20,
             request_timeout=CONFIG.REQUEST_TIMEOUT,
             validation_timeout=4.0
         )
@@ -1699,6 +1754,11 @@ class RsiBot:
                 
                 tfs_to_scan_fresh: List[str] = []
                 cached_hits_to_use: List[TouchHit] = []
+                # Tracks candles this cycle definitively resolved a result for
+                # (hit or not) — used later to mark sent_state correctly even
+                # on zero-hit candles, instead of only marking it when a hit
+                # happens to exist.
+                resolved_candle_keys: Dict[str, int] = {}
                 
                 for tf in ACTIVE_TFS:
                     # ── Weekly Timing Gate ──
@@ -1729,6 +1789,7 @@ class RsiBot:
                             scan_stats[tf].source = "Cached"
                             scan_stats[tf].hits_found = len(hits)
                             scan_stats[tf].successful_scans = 0
+                            resolved_candle_keys[tf] = candle_key
                             logging.info(f"📦 Using cached results for {tf}: {len(hits)} hits")
                         else:
                             tfs_to_scan_fresh.append(tf)
@@ -1752,20 +1813,30 @@ class RsiBot:
                             mkt: str,
                             ex: str,
                             scan_tf: str
-                        ) -> List[TouchHit]:
+                        ) -> Tuple[bool, List[TouchHit]]:
                             """
                             Scan a single symbol on a single timeframe.
-                            Returns list of TouchHit (0 or 1 items).
-                            Catches all exceptions internally to prevent task failures.
+
+                            Returns (fetched_ok, hits):
+                              fetched_ok: True only if usable close data was
+                                actually returned (touch found or not). False
+                                if the fetch failed / returned nothing — this
+                                is what makes proxy or network outages show up
+                                in the scan summary instead of being silently
+                                indistinguishable from "checked, no touch".
+                              hits: 0 or 1 TouchHit.
+
+                            Catches all exceptions internally to prevent task
+                            failures from propagating to asyncio.gather.
                             """
                             try:
                                 closes = await client.fetch_closes(sym, scan_tf, mkt)
                                 if not closes:
-                                    return []
+                                    return False, []
                                 
                                 t_type, direction, rsi_val = check_bb_rsi(closes, scan_tf)
                                 if t_type:
-                                    return [TouchHit(
+                                    return True, [TouchHit(
                                         symbol=sym,
                                         exchange=ex,
                                         market=mkt,
@@ -1775,10 +1846,10 @@ class RsiBot:
                                         direction=direction if direction else "",
                                         hot=sym in hot_coins_for_timeframe(scan_tf)
                                     )]
-                                return []
+                                return True, []
                             except Exception as e:
                                 logging.debug(f"Scan failed for {sym} on {scan_tf}: {e}")
-                                return []
+                                return False, []
                         
                         # Build tasks for this timeframe (full universe if
                         # this tf is EMA-exempt, otherwise the filtered set)
@@ -1790,16 +1861,33 @@ class RsiBot:
                         results = await asyncio.gather(*tf_tasks, return_exceptions=True)
                         
                         successful_count = 0
+                        failed_count = 0
                         for result in results:
-                            if isinstance(result, list):
-                                tf_hits.extend(result)
-                                successful_count += 1
+                            if isinstance(result, tuple):
+                                fetched_ok, hits = result
+                                tf_hits.extend(hits)
+                                if fetched_ok:
+                                    successful_count += 1
+                                else:
+                                    failed_count += 1
                             elif isinstance(result, Exception):
-                                # This should rarely happen since scan_one catches internally
+                                # Should be rare since scan_one catches internally,
+                                # but still counts as a failure, not a silent drop.
+                                failed_count += 1
                                 logging.error(f"⚠️ Unexpected scan task exception: {result}")
                         
                         scan_stats[tf].successful_scans = successful_count
+                        scan_stats[tf].failed_scans = failed_count
                         scan_stats[tf].hits_found = len(tf_hits)
+
+                        if scan_stats[tf].total_symbols > 0:
+                            fail_ratio = failed_count / scan_stats[tf].total_symbols
+                            if fail_ratio > 0.2:
+                                logging.warning(
+                                    f"⚠️ {tf}: {failed_count}/{scan_stats[tf].total_symbols} "
+                                    f"scans failed to fetch data ({fail_ratio:.0%}). Results for "
+                                    f"this timeframe are likely incomplete — check proxy pool health."
+                                )
                         
                         final_hits.extend(tf_hits)
                         
@@ -1811,15 +1899,16 @@ class RsiBot:
                                 candle_key,
                                 [h.to_dict() for h in tf_hits]
                             )
+                            resolved_candle_keys[tf] = candle_key
                             logging.info(f"💾 Cached {len(tf_hits)} hits for {tf} (key: {candle_key})")
                 
                 # Merge cached hits with fresh hits
                 final_hits.extend(cached_hits_to_use)
                 
                 # ── Print Scan Summary ──
-                logging.info("=" * 65)
-                logging.info(f"{'TF':<5} | {'Source':<28} | {'Scanned':<18} | {'Hits'}")
-                logging.info("-" * 65)
+                logging.info("=" * 73)
+                logging.info(f"{'TF':<5} | {'Source':<28} | {'Scanned':<14} | {'Failed':<8} | {'Hits'}")
+                logging.info("-" * 73)
                 
                 tf_display_order = [
                     t for t in ["3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1w"]
@@ -1829,17 +1918,27 @@ class RsiBot:
                     st = scan_stats[tf]
                     if st.source in ("Cached", "Already Sent", "Skipped (Weekly Delay)"):
                         scanned_str = "—"
+                        failed_str = "—"
                     else:
                         scanned_str = f"{st.successful_scans}/{st.total_symbols}"
+                        failed_str = str(st.failed_scans)
                     logging.info(
-                        f"[{tf:<3}] {st.source:<28} | {scanned_str:<18} | {st.hits_found}"
+                        f"[{tf:<3}] {st.source:<28} | {scanned_str:<14} | {failed_str:<8} | {st.hits_found}"
                     )
-                logging.info("=" * 65)
+                logging.info("=" * 73)
                 logging.info(f"Total hits to send: {len(final_hits)}")
                 
                 # ── Filter Hits & Update Sent State ──
+                # new_state is marked from resolved_candle_keys — every
+                # candle this cycle definitively resolved a result for,
+                # whether or not any hits were found. Marking only on hits
+                # (the old behavior) meant a zero-hit candle never recorded
+                # that it had been handled, so a later cycle would redo the
+                # same "fresh" scan indefinitely instead of skipping via
+                # "Already Sent".
                 hits_to_send: List[TouchHit] = []
                 new_state = sent_state.copy()
+                new_state.update(resolved_candle_keys)
                 
                 for h in final_hits:
                     tf = h.timeframe
@@ -1847,7 +1946,6 @@ class RsiBot:
                         candle_key = get_cache_key(tf)
                         if sent_state.get(tf, 0) != candle_key:
                             hits_to_send.append(h)
-                            new_state[tf] = candle_key
                     else:
                         hits_to_send.append(h)
                 
