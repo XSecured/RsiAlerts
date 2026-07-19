@@ -23,7 +23,7 @@ import redis.asyncio as aioredis
 
 @dataclass
 class Config:
-    MAX_CONCURRENCY: int = 50
+    MAX_CONCURRENCY: int = 30
     REQUEST_TIMEOUT: int = 7
     MAX_RETRIES: int = 3
     
@@ -103,7 +103,8 @@ class Config:
 
     IGNORED_SYMBOLS: Set[str] = field(default_factory=lambda: {
         "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDYUSDT", "PYUSDUSDT",
-        "USDEUSDT", "USDDUSDT", "BFUSDUSDT", "BTTCUSDT", "XUSDUSDT", "RLUSDUSDT", "FDUSDUSDT"
+        "USDEUSDT", "USDDUSDT", "BFUSDUSDT", "BTTCUSDT", "XUSDUSDT", "RLUSDUSDT", "FDUSDUSDT", "USDSUSDT",
+        "UUSDT"
     })
 
     BYBIT_ENABLED: bool = False
@@ -112,7 +113,7 @@ class Config:
     # scanned against every deduplicated symbol, independent of trend. Use
     # this for a "see everything" view on slower timeframes (e.g. weekly)
     # while faster timeframes still scan only EMA-confirmed trend coins.
-    EMA_FILTER_EXEMPT_TFS: Set[str] = field(default_factory=lambda: {'1w'})
+    EMA_FILTER_EXEMPT_TFS: Set[str] = field(default_factory=lambda: {'1w', '1d'})
 
 CONFIG = Config()
 
@@ -1286,7 +1287,7 @@ class RsiBot:
         self.proxies = RobustProxyPool(
             validation_concurrency=100,
             allow_direct_fallback=False,
-            max_pool_size=20,
+            max_pool_size=30,
             request_timeout=CONFIG.REQUEST_TIMEOUT,
             validation_timeout=4.0
         )
