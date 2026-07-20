@@ -23,7 +23,7 @@ import redis.asyncio as aioredis
 
 @dataclass
 class Config:
-    MAX_CONCURRENCY: int = 30
+    MAX_CONCURRENCY: int = 10
     REQUEST_TIMEOUT: int = 7
     MAX_RETRIES: int = 3
     
@@ -1287,7 +1287,7 @@ class RsiBot:
         self.proxies = RobustProxyPool(
             validation_concurrency=100,
             allow_direct_fallback=False,
-            max_pool_size=30,
+            max_pool_size=20,
             request_timeout=CONFIG.REQUEST_TIMEOUT,
             validation_timeout=4.0
         )
