@@ -109,6 +109,19 @@ class Config:
 
     BYBIT_ENABLED: bool = False
 
+    # ── Failed-symbol retry ──
+    # If a symbol's fetch still fails after exhausting MAX_RETRIES proxy
+    # attempts inside ExchangeClient._request, RETRY_FAILED_SYMBOLS
+    # controls whether that symbol gets FAILED_SYMBOL_RETRY_ROUNDS more
+    # whole attempts — each one a fresh Thompson Sampling draw against a
+    # proxy pool whose posterior has, by then, already been updated to
+    # disfavor whatever proxy just failed — rather than being dropped from
+    # this scan cycle entirely. Set to False (or ROUNDS=0) to restore the
+    # old behavior: a symbol that fails all MAX_RETRIES attempts is simply
+    # skipped for this cycle.
+    RETRY_FAILED_SYMBOLS: bool = True
+    FAILED_SYMBOL_RETRY_ROUNDS: int = 1
+
     # Timeframes listed here skip the EMA-34 trend filter entirely and are
     # scanned against every deduplicated symbol, independent of trend. Use
     # this for a "see everything" view on slower timeframes (e.g. weekly)
@@ -2006,30 +2019,81 @@ class RsiBot:
                                 logging.debug(f"Scan failed for {sym} on {scan_tf}: {e}")
                                 return False, []
                         
-                        # Build tasks for this timeframe (full universe if
-                        # this tf is EMA-exempt, otherwise the filtered set)
-                        tf_tasks = [
-                            scan_one(client, sym, mkt, ex, tf)
-                            for client, sym, mkt, ex in pairs_for_timeframe(tf)
-                        ]
-                        
-                        results = await asyncio.gather(*tf_tasks, return_exceptions=True)
-                        
+                        # Build the initial task batch for this timeframe
+                        # (full universe if this tf is EMA-exempt, otherwise
+                        # the filtered set).
+                        pending_pairs = pairs_for_timeframe(tf)
+
                         successful_count = 0
-                        failed_count = 0
-                        for result in results:
-                            if isinstance(result, tuple):
-                                fetched_ok, hits = result
-                                tf_hits.extend(hits)
-                                if fetched_ok:
-                                    successful_count += 1
+                        first_round_failed_count = 0
+
+                        # CONFIG.RETRY_FAILED_SYMBOLS controls whether a
+                        # symbol that's still failing after _request's own
+                        # MAX_RETRIES proxy attempts gets one or more whole
+                        # extra rounds against freshly drawn proxies, rather
+                        # than being dropped for this scan cycle. With the
+                        # flag off (or FAILED_SYMBOL_RETRY_ROUNDS=0),
+                        # max_rounds=1 and this reproduces the old
+                        # single-pass behavior exactly.
+                        max_rounds = 1 + (
+                            CONFIG.FAILED_SYMBOL_RETRY_ROUNDS
+                            if CONFIG.RETRY_FAILED_SYMBOLS
+                            else 0
+                        )
+
+                        for round_num in range(1, max_rounds + 1):
+                            if not pending_pairs:
+                                break
+
+                            if round_num > 1:
+                                # Brief pause before re-hitting the same
+                                # symbols — courtesy to the exchange
+                                # endpoints. The proxies that just failed
+                                # are already excluded from Thompson
+                                # Sampling selection via the pool's
+                                # cooldown state, so this delay isn't
+                                # needed for proxy diversity, just pacing.
+                                await asyncio.sleep(2)
+                                logging.info(
+                                    f"🔁 [{tf}] Retrying {len(pending_pairs)} symbol(s) "
+                                    f"that failed to fetch (round {round_num - 1}/"
+                                    f"{max_rounds - 1})..."
+                                )
+
+                            round_tasks = [
+                                scan_one(client, sym, mkt, ex, tf)
+                                for client, sym, mkt, ex in pending_pairs
+                            ]
+                            round_results = await asyncio.gather(*round_tasks, return_exceptions=True)
+
+                            still_failed: List[Tuple[Any, str, str, str]] = []
+                            for pair, result in zip(pending_pairs, round_results):
+                                if isinstance(result, tuple):
+                                    fetched_ok, hits = result
+                                    if fetched_ok:
+                                        successful_count += 1
+                                        tf_hits.extend(hits)
+                                    else:
+                                        still_failed.append(pair)
                                 else:
-                                    failed_count += 1
-                            elif isinstance(result, Exception):
-                                # Should be rare since scan_one catches internally,
-                                # but still counts as a failure, not a silent drop.
-                                failed_count += 1
-                                logging.error(f"⚠️ Unexpected scan task exception: {result}")
+                                    # Should be rare since scan_one catches internally,
+                                    # but still counts as a failure, not a silent drop.
+                                    logging.error(
+                                        f"⚠️ Unexpected scan task exception for {pair[1]}: {result}"
+                                    )
+                                    still_failed.append(pair)
+
+                            if round_num == 1:
+                                first_round_failed_count = len(still_failed)
+                            pending_pairs = still_failed
+
+                        failed_count = len(pending_pairs)
+                        recovered_count = first_round_failed_count - failed_count
+                        if recovered_count > 0:
+                            logging.info(
+                                f"✅ [{tf}] Recovered {recovered_count} symbol(s) via retry "
+                                f"(failed initially, succeeded on a later round)"
+                            )
                         
                         scan_stats[tf].successful_scans = successful_count
                         scan_stats[tf].failed_scans = failed_count
