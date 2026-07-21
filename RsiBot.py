@@ -192,28 +192,6 @@ class ProxyStats:
             return 9999.0
         return self.total_latency_ms / self.successes
 
-    def compute_score(self) -> float:
-        """Higher = better. Combines success rate, latency, freshness."""
-        if self.state != ProxyState.ACTIVE:
-            return 0.0
-
-        score = self.success_rate
-
-        # Exponential penalty for consecutive failures
-        score *= (0.5 ** self.consecutive_failures)
-
-        # Latency bonus (faster = better)
-        if self.avg_latency_ms < 9999:
-            latency_factor = max(0.1, 1.0 - (self.avg_latency_ms / 5000))
-            score *= (0.6 + 0.4 * latency_factor)
-
-        # Freshness bonus for untested proxies
-        if self.total_uses < 3:
-            score += 0.15
-
-        return max(0.001, min(1.0, score))
-
-
 class RobustProxyPool:
     """
     Production-grade async proxy pool with:
@@ -473,30 +451,60 @@ class RobustProxyPool:
                         else:
                             self._record_failure(proxy)
 
-    def _select_weighted(self) -> Optional[str]:
-        """Select proxy using weighted random based on scores."""
+    def _select_thompson_sampling(self) -> Optional[str]:
+        """
+        Select a proxy via Thompson Sampling over a Beta-Bernoulli model of
+        each active proxy's success rate.
+
+        Each proxy's true (unknown) success probability is modeled as a
+        Beta(alpha, beta) posterior, where alpha = 1 + successes and
+        beta = 1 + failures (Beta(1,1) is a uniform "no information yet"
+        prior). We draw one random sample from every active proxy's
+        posterior and pick whichever proxy's draw is highest.
+
+        Why this beats the old fixed-formula score (success_rate scaled by
+        a consecutive-failure penalty, a latency factor, and a flat
+        "freshness bonus" for new proxies): that formula treated a
+        proxy's history as a single point estimate, and a point estimate
+        can't distinguish "reliably 100%" from "won its only try so far".
+        A proxy with 1 success and 0 failures has a WIDE posterior — its
+        true rate could plausibly be anywhere from ~20% to ~100% — so it
+        will occasionally draw a high sample and get tried again, earning
+        more evidence. A proxy with 8 successes and 2 failures has a
+        NARROW posterior centered near 80%, so its draws cluster tightly
+        around 80% and it gets picked reliably. That explore/exploit
+        balance falls out of the sampling itself, with no separate
+        hand-tuned "freshness bonus" needed — this is the standard
+        solution to exactly this class of problem (the multi-armed
+        bandit), with convergence guarantees a fixed formula doesn't have.
+
+        Latency isn't modeled as a separate term here: timeouts and
+        connection errors already count as failures via report_failure
+        (see ExchangeClient._request), so a proxy that's slow enough to
+        matter is already accumulating failures and getting down-weighted
+        through the same posterior — a second signal for the same
+        underlying problem would be redundant.
+        """
         active = self.active_proxies
         if not active:
             return None
 
-        scored = [(p, self._proxies[p].compute_score()) for p in active]
-        total = sum(s for _, s in scored)
+        best_proxy: Optional[str] = None
+        best_sample = -1.0
+        for proxy in active:
+            stats = self._proxies[proxy]
+            alpha = 1.0 + stats.successes
+            beta_param = 1.0 + stats.failures
+            sample = random.betavariate(alpha, beta_param)
+            if sample > best_sample:
+                best_sample = sample
+                best_proxy = proxy
 
-        if total <= 0:
-            return random.choice(active)
-
-        r = random.random() * total
-        cumulative = 0.0
-        for proxy, score in scored:
-            cumulative += score
-            if cumulative >= r:
-                return proxy
-
-        return scored[-1][0]
+        return best_proxy
 
     async def get_proxy(self) -> Optional[str]:
-        """Get the best available proxy."""
-        proxy = self._select_weighted()
+        """Get a proxy via Thompson Sampling (see _select_thompson_sampling)."""
+        proxy = self._select_thompson_sampling()
         if proxy:
             self._proxies[proxy].last_used = time.time()
         return proxy
@@ -830,6 +838,88 @@ class CacheManager:
 # EXCHANGE CLIENTS
 # ==========================================
 
+def validate_klines_payload(
+    raw: Any,
+    interval: str,
+    requested_limit: int,
+    now_ms: Optional[int] = None,
+) -> Tuple[bool, str]:
+    """
+    Plausibility check for a raw klines payload, run before any of it is
+    trusted.
+
+    Threat model: a public proxy (the whole reason RobustProxyPool exists)
+    can return HTTP 200 with a JSON body SHAPED exactly like real klines —
+    a list of lists, numeric-looking strings in the right positions —
+    while the content is wrong: a stale cached response, a truncated one,
+    or in the worst case a deliberately altered one. `resp.json()`
+    succeeding and `float(row[4])` parsing without raising tell us nothing
+    about whether the data is current or sane — a genuine response and a
+    garbage-but-well-shaped one pass both identically. Without this check,
+    that failure mode doesn't show up as a failed_scan — it shows up as a
+    completed "successful" scan feeding check_bb_rsi() real-looking but
+    wrong numbers, which can produce a fake touch alert or silently
+    swallow a real one.
+
+    Two checks, deliberately simple rather than clever:
+      1. Freshness — the most recent candle's open time must be recent
+         relative to the timeframe's own duration. A "successful" 4h
+         fetch returning data from yesterday is exactly the stale-proxy-
+         cache scenario this exists to catch.
+      2. Price sanity — every close must be a finite, positive number.
+         Catches corrupted payloads that still parse as floats (nulls
+         coerced to 0.0, negative placeholders, NaN/Infinity literals a
+         misbehaving proxy might inject).
+
+    Deliberately NOT checked: array length vs. requested_limit. A newly
+    listed symbol can legitimately return far fewer candles than
+    requested, and that's already handled correctly downstream — both
+    check_bb_rsi's MIN_CANDLES gate and the EMA path's required_hours gate
+    already treat "too little history" as "not enough data yet", not a
+    failure. Rejecting on length here would misclassify a legitimate young
+    listing as a fetch failure, and it isn't needed to catch the actual
+    threat (wrong-but-plausible data), which the two checks above already
+    cover without that false-positive risk.
+
+    Returns (is_valid, reason); reason is only meaningful when False and
+    is logged by the caller so bad data shows up in the scan summary as a
+    failure instead of silently vanishing into a "successful" scan.
+    """
+    if not raw or not isinstance(raw, list) or len(raw) < 3:
+        got = len(raw) if isinstance(raw, list) else type(raw).__name__
+        return False, f"empty or degenerate payload ({got})"
+
+    try:
+        open_time_ms = int(float(raw[-1][0]))
+    except (IndexError, TypeError, ValueError):
+        return False, "malformed last candle (unreadable open time)"
+
+    # Tolerance is generous (3x the interval + 5 min) to absorb normal
+    # candle-close lag and clock skew without being so loose it misses
+    # genuinely stale data. abs() catches both stale (positive skew) and
+    # suspiciously-future (negative skew, e.g. a fabricated timestamp)
+    # payloads.
+    interval_seconds = TIMEFRAME_MINUTES.get(interval, 60) * 60
+    tolerance_seconds = interval_seconds * 3 + 300
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    age_seconds = (now_ms - open_time_ms) / 1000.0
+    if abs(age_seconds) > tolerance_seconds:
+        return False, (
+            f"last candle is {age_seconds:.0f}s from now "
+            f"(tolerance {tolerance_seconds}s for {interval})"
+        )
+
+    for row in raw:
+        try:
+            close = float(row[4])
+        except (IndexError, TypeError, ValueError):
+            return False, "malformed close price in payload"
+        if not math.isfinite(close) or close <= 0:
+            return False, f"non-finite or non-positive close price ({close})"
+
+    return True, ""
+
+
 class ExchangeClient:
     def __init__(self, session: aiohttp.ClientSession, proxy_pool: RobustProxyPool):
         self.session = session
@@ -892,12 +982,20 @@ class BinanceClient(ExchangeClient):
         base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
         data = await self._request(base, {'symbol': symbol, 'interval': '1h', 'limit': limit})
         if not data: return []
+        is_valid, reason = validate_klines_payload(data, '1h', limit)
+        if not is_valid:
+            logging.warning(f"⚠️ Rejected implausible klines for {symbol} (EMA fetch, {market}, Binance): {reason}")
+            return []
         try: return [float(c[4]) for c in data]
         except: return []
     async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
         base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
         data = await self._request(base, {'symbol': symbol, 'interval': interval, 'limit': CONFIG.CANDLE_LIMIT})
         if not data: return []
+        is_valid, reason = validate_klines_payload(data, interval, CONFIG.CANDLE_LIMIT)
+        if not is_valid:
+            logging.warning(f"⚠️ Rejected implausible klines for {symbol} {interval} ({market}, Binance): {reason}")
+            return []
         try: return [float(c[4]) for c in data]
         except: return []
 
@@ -917,8 +1015,16 @@ class BybitClient(ExchangeClient):
         if not data: return []
         raw = data.get('result', {}).get('list', [])
         if not raw: return []
-        closes = [float(c[4]) for c in raw]
-        return closes[::-1]
+        # Bybit returns newest-first; normalize to oldest-first (matching
+        # Binance's native ordering) before the shared plausibility check,
+        # which assumes the most recent candle is last.
+        ordered = raw[::-1]
+        is_valid, reason = validate_klines_payload(ordered, '1h', limit)
+        if not is_valid:
+            logging.warning(f"⚠️ Rejected implausible klines for {symbol} (EMA fetch, {market}, Bybit): {reason}")
+            return []
+        try: return [float(c[4]) for c in ordered]
+        except: return []
     async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
         url = 'https://api.bybit.com/v5/market/kline'
         cat = 'linear' if market == 'perp' else 'spot'
@@ -927,20 +1033,45 @@ class BybitClient(ExchangeClient):
         if not data: return []
         raw = data.get('result', {}).get('list', [])
         if not raw: return []
-        closes = [float(c[4]) for c in raw]
-        return closes[::-1]
+        ordered = raw[::-1]
+        is_valid, reason = validate_klines_payload(ordered, interval, CONFIG.CANDLE_LIMIT)
+        if not is_valid:
+            logging.warning(f"⚠️ Rejected implausible klines for {symbol} {interval} ({market}, Bybit): {reason}")
+            return []
+        try: return [float(c[4]) for c in ordered]
+        except: return []
 
 # ==========================================
 # CORE LOGIC
 # ==========================================
 
+# Unix epoch (1970-01-01 00:00:00 UTC) was a Thursday. Monday falls 4 days
+# *forward* from Thursday (Thu -> Fri -> Sat -> Sun -> Mon), so every real
+# Monday 00:00 UTC timestamp satisfies `timestamp % 604800 == MONDAY_EPOCH_OFFSET`.
+# This is the shift used below to re-anchor the weekly floor-division from
+# Thursday (the epoch's natural alignment) to Monday. Verified against a
+# known date: 1970-01-05 00:00:00 UTC (timestamp 345600) was a Monday, and
+# 2026-07-20 00:00:00 UTC (timestamp 1784505600, also a real Monday) reduces
+# to the same 345600 remainder mod 604800.
+#
+# A previous version of this used 259200 (3 days) here, from "Thursday back
+# to Monday is 3 days" — true going *backwards*, but this formula needs the
+# *forward* distance. That off-by-one-direction error anchored every weekly
+# boundary to Sunday instead of Monday: the bot's internal "weekly candle"
+# rolled over a full day before Binance's actual Monday-anchored weekly
+# candle opened, got scanned and cached then, and by the time the real
+# Monday candle opened sent_state already matched — logging "Already Sent"
+# instead of scanning. See _self_check_weekly_alignment() below, added to
+# catch a regression of this exact class of bug immediately on import.
+MONDAY_EPOCH_OFFSET = 4 * 86400  # 345600
+
+
 def get_cache_key(tf: str) -> int:
     """
     Returns stable integer timestamp for the current TF candle open.
     
-    For weekly: Aligns to Monday 00:00 UTC.
-    The Unix epoch (Jan 1, 1970) was a Thursday, so we offset by 3 days (259200s)
-    to align the 604800-second weekly boundary with Monday.
+    For weekly: Aligns to Monday 00:00 UTC via MONDAY_EPOCH_OFFSET (see the
+    derivation in the comment above it).
     
     For daily: 86400 divides evenly from epoch and aligns with UTC midnight.
     
@@ -951,15 +1082,38 @@ def get_cache_key(tf: str) -> int:
     now = int(time.time())
     
     if tf == '1w':
-        # Offset: Unix epoch was Thursday. Monday is 3 days (259200s) before the next Thursday boundary.
-        # To align: subtract the Thursday offset, do modular arithmetic, then add it back.
-        thursday_offset = 259200  # 3 days in seconds (Thu -> Mon)
-        adjusted = now - thursday_offset
-        candle_start = adjusted - (adjusted % period_seconds) + thursday_offset
+        adjusted = now - MONDAY_EPOCH_OFFSET
+        candle_start = adjusted - (adjusted % period_seconds) + MONDAY_EPOCH_OFFSET
         return candle_start
     else:
         # Daily and sub-daily align naturally with epoch
         return now - (now % period_seconds)
+
+
+def _self_check_weekly_alignment() -> None:
+    """
+    Runs once at import time: verifies get_cache_key's Monday-alignment
+    arithmetic actually lands on a real Monday 00:00 UTC boundary.
+
+    This exists because of a real, previously-shipped bug: the old offset
+    anchored to Sunday instead of Monday (see MONDAY_EPOCH_OFFSET's comment
+    for the full story), which silently made every weekly scan fire and
+    record sent_state a day early. Fails loudly and immediately on import
+    if that class of bug is ever reintroduced, instead of silently shifting
+    every weekly report by a day again.
+    """
+    known_monday_ts = MONDAY_EPOCH_OFFSET  # 1970-01-05 00:00:00 UTC, a Monday
+    period_seconds = TIMEFRAME_MINUTES['1w'] * 60
+    adjusted = known_monday_ts - MONDAY_EPOCH_OFFSET
+    computed = adjusted - (adjusted % period_seconds) + MONDAY_EPOCH_OFFSET
+    assert computed == known_monday_ts, (
+        f"1w weekly alignment sanity check failed: expected boundary at "
+        f"{known_monday_ts} (a known Monday), computed {computed}. "
+        f"get_cache_key('1w') is almost certainly anchoring to the wrong weekday."
+    )
+
+
+_self_check_weekly_alignment()
 
 
 def is_weekly_scan_ready() -> bool:
@@ -1677,11 +1831,11 @@ class RsiBot:
                             if len(h_closes) < required_hours:
                                 return
 
-                            # Volatility is recorded for every symbol (not just
-                            # EMA survivors) so EMA-exempt timeframes, which
-                            # scan the full universe, can still mark 🔥 hot
-                            # coins among symbols that never passed the trend
-                            # filter.
+                            # Volatility is recorded for every symbol (not
+                            # just EMA survivors) so EMA-exempt timeframes,
+                            # which scan the full universe, can still mark
+                            # 🔥 hot coins among symbols that never passed
+                            # the trend filter.
                             v = calculate_volatility(h_closes[-48:])
                             if v > 0:
                                 vol_scores[sym] = v
