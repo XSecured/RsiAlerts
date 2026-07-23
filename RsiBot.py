@@ -107,6 +107,20 @@ class Config:
         "UUSDT"
     })
 
+    # ── Overall run watchdog ──
+    # Hard ceiling on total execution time for one bot.run() call, as a
+    # last line of defense. A normal run (symbol fetch, EMA/volatility
+    # scan, RSI touch scan, any retry rounds, proxy pool validation,
+    # Telegram send) takes a few minutes even in a slow case; this gives
+    # generous headroom above that while still bounding the worst case.
+    # This exists because of a real incident: a swallowed CancelledError
+    # in the proxy pool's shutdown path (see RobustProxyPool.shutdown's
+    # docstring) let one run silently occupy a GitHub Actions runner for
+    # hours with no error, until an external cancellation ended it. If a
+    # run ever exceeds this, something is genuinely wrong and it should
+    # fail loudly rather than idle unnoticed.
+    RUN_TIMEOUT_SECONDS: float = 1200.0  # 20 minutes
+
     BYBIT_ENABLED: bool = False
 
     # ── Failed-symbol retry ──
@@ -233,6 +247,7 @@ class RobustProxyPool:
         request_timeout: float = 7.0,
         validation_timeout: float = 4.0,
         allow_direct_fallback: bool = False,
+        shutdown_timeout_seconds: float = 15.0,
     ):
         self.max_pool_size = max_pool_size
         self.min_pool_size = min_pool_size
@@ -245,6 +260,7 @@ class RobustProxyPool:
         self.request_timeout = request_timeout
         self.validation_timeout = validation_timeout
         self.allow_direct_fallback = allow_direct_fallback
+        self.SHUTDOWN_TIMEOUT_SECONDS = shutdown_timeout_seconds
 
         self._proxies: Dict[str, ProxyStats] = {}
         self._lock = asyncio.Lock()
@@ -306,13 +322,37 @@ class RobustProxyPool:
             return False
 
     async def shutdown(self):
-        """Gracefully shutdown background tasks."""
+        """
+        Gracefully shut down the background refresh task.
+
+        Wrapped in a bounded timeout as defense-in-depth: task.cancel()
+        only works if the cancelled coroutine actually lets the
+        CancelledError propagate. This codebase now does that correctly
+        everywhere (every bare `except:` was changed to `except Exception:`,
+        which doesn't catch CancelledError — see _validate_proxy and
+        _populate_pool for the specific bug this fixes), but a bounded
+        wait here means that if a similar mistake is ever reintroduced —
+        here or in a future change — the process still exits within
+        SHUTDOWN_TIMEOUT_SECONDS instead of hanging for hours. This is
+        exactly the failure mode that happened before: the background
+        loop's cancellation got silently swallowed, so `await
+        self._refresh_task` (with no timeout) blocked forever, and the
+        whole bot sat idle until GitHub Actions force-killed the job.
+        """
         if self._refresh_task and not self._refresh_task.done():
             self._refresh_task.cancel()
             try:
-                await self._refresh_task
+                await asyncio.wait_for(self._refresh_task, timeout=self.SHUTDOWN_TIMEOUT_SECONDS)
             except asyncio.CancelledError:
                 pass
+            except asyncio.TimeoutError:
+                logging.error(
+                    f"⚠️ Background refresh task did not stop within "
+                    f"{self.SHUTDOWN_TIMEOUT_SECONDS}s of being cancelled — "
+                    f"abandoning it so the process can still exit. This "
+                    f"means something is catching CancelledError and not "
+                    f"re-raising it; worth a look."
+                )
         logging.info("🛑 Proxy Pool shut down")
 
     async def _fetch_from_source(self, url: str) -> Set[str]:
@@ -349,7 +389,7 @@ class RobustProxyPool:
                     if "serverTime" in data:
                         latency_ms = (time.time() - start) * 1000
                         return proxy, True, latency_ms
-        except:
+        except Exception:
             pass
         return proxy, False, 0.0
 
@@ -397,7 +437,7 @@ class RobustProxyPool:
 
                             if len(self.active_proxies) >= self.max_pool_size:
                                 break
-            except:
+            except Exception:
                 pass
 
         for t in tasks:
@@ -798,7 +838,7 @@ class CacheManager:
             self.redis = await aioredis.from_url(CONFIG.REDIS_URL, decode_responses=True)
             await self.redis.ping()
             logging.info("✅ Redis Connected")
-        except:
+        except Exception:
             logging.warning("⚠️ Redis failed. Caching disabled.")
             self.redis = None
 
@@ -827,25 +867,25 @@ class CacheManager:
         try:
             data = await self.redis.get(self._scan_key(tf, candle_key))
             return json.loads(data) if data else None
-        except: return None
+        except Exception: return None
 
     async def save_scan_results(self, tf: str, candle_key: int, results: List[Dict]):
         if not self.redis: return
         ttl = CONFIG.CACHE_TTL_MAP.get(tf, 3600)
         try: await self.redis.set(self._scan_key(tf, candle_key), json.dumps(results), ex=ttl)
-        except: pass
+        except Exception: pass
 
     async def get_sent_state(self) -> Dict[str, int]:
         if not self.redis: return {}
         try:
             val = await self.redis.get("bb_bot:sent_state")
             return json.loads(val) if val else {}
-        except: return {}
+        except Exception: return {}
 
     async def save_sent_state(self, state: Dict[str, int]):
         if not self.redis: return
         try: await self.redis.set("bb_bot:sent_state", json.dumps(state))
-        except: pass
+        except Exception: pass
 
 # ==========================================
 # EXCHANGE CLIENTS
@@ -1000,7 +1040,7 @@ class BinanceClient(ExchangeClient):
             logging.warning(f"⚠️ Rejected implausible klines for {symbol} (EMA fetch, {market}, Binance): {reason}")
             return []
         try: return [float(c[4]) for c in data]
-        except: return []
+        except Exception: return []
     async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
         base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
         data = await self._request(base, {'symbol': symbol, 'interval': interval, 'limit': CONFIG.CANDLE_LIMIT})
@@ -1010,7 +1050,7 @@ class BinanceClient(ExchangeClient):
             logging.warning(f"⚠️ Rejected implausible klines for {symbol} {interval} ({market}, Binance): {reason}")
             return []
         try: return [float(c[4]) for c in data]
-        except: return []
+        except Exception: return []
 
 class BybitClient(ExchangeClient):
     async def get_perp_symbols(self) -> List[str]:
@@ -1037,7 +1077,7 @@ class BybitClient(ExchangeClient):
             logging.warning(f"⚠️ Rejected implausible klines for {symbol} (EMA fetch, {market}, Bybit): {reason}")
             return []
         try: return [float(c[4]) for c in ordered]
-        except: return []
+        except Exception: return []
     async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
         url = 'https://api.bybit.com/v5/market/kline'
         cat = 'linear' if market == 'perp' else 'spot'
@@ -1052,7 +1092,7 @@ class BybitClient(ExchangeClient):
             logging.warning(f"⚠️ Rejected implausible klines for {symbol} {interval} ({market}, Bybit): {reason}")
             return []
         try: return [float(c[4]) for c in ordered]
-        except: return []
+        except Exception: return []
 
 # ==========================================
 # CORE LOGIC
@@ -2191,8 +2231,27 @@ class RsiBot:
         logging.info("🏁 Scan cycle complete")
 
 
+async def _run_with_watchdog(bot: "RsiBot") -> None:
+    """
+    Run the bot under a hard ceiling on total execution time.
+
+    See CONFIG.RUN_TIMEOUT_SECONDS for the reasoning. If this ever fires,
+    it means something hung well past what a normal run should take —
+    fail loudly (non-zero exit) rather than let CI notice hours later.
+    """
+    try:
+        await asyncio.wait_for(bot.run(), timeout=CONFIG.RUN_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logging.error(
+            f"⛔ Bot run exceeded the {CONFIG.RUN_TIMEOUT_SECONDS:.0f}s watchdog "
+            f"timeout and was force-cancelled. This should not happen under "
+            f"normal conditions — treat it as a bug, not routine behavior."
+        )
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
     if os.name == 'nt':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     bot = RsiBot()
-    asyncio.run(bot.run())
+    asyncio.run(_run_with_watchdog(bot))
