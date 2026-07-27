@@ -34,7 +34,8 @@ class Config:
     
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
-    PROXY_URL: str = "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
+    PROXY_URL: str = "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/refs/heads/main/https.txt"
+    #  "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
 
     RSI_PERIOD: int = 14
     BB_LENGTH: int = 34
@@ -231,7 +232,7 @@ class RobustProxyPool:
     """
 
     PROXY_SOURCES = [
-        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
+        #"https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt"
     ]
 
     def __init__(
