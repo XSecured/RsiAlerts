@@ -1,9 +1,9 @@
 name: Run BB Touch Bot
 
 on:
-  schedule:
-    - cron: '1 */4 * * *'  # Every 4 Hour
-  workflow_dispatch:  # Manual trigger
+  repository_dispatch:
+    types: [run-my-task]
+  workflow_dispatch:
 
 jobs:
   run-bot:
