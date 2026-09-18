@@ -29,7 +29,7 @@ class Config:
     
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     CACHE_TTL_MAP: Dict[str, int] = field(default_factory=lambda: {
-        '4h': 14400 + 600, '1d': 86400 + 1800, '1w': 604800 + 3600
+        '4h': 14400 + 600, '1h': 3600 + 300, '1d': 86400 + 1800, '1w': 604800 + 3600
     })
     
     TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -141,7 +141,28 @@ class Config:
     # scanned against every deduplicated symbol, independent of trend. Use
     # this for a "see everything" view on slower timeframes (e.g. weekly)
     # while faster timeframes still scan only EMA-confirmed trend coins.
-    EMA_FILTER_EXEMPT_TFS: Set[str] = field(default_factory=lambda: {'1w', '1d'})
+    # 1h is included here deliberately (full-universe scan, used to test the
+    # power leaderboard against the whole market); 4h stays EMA-filtered.
+    EMA_FILTER_EXEMPT_TFS: Set[str] = field(default_factory=lambda: {'1w', '1d', '1h'})
+
+    # ── Power Leaderboard (RSI Band-Walk Strength Ranking) ──
+    # Ranks symbols by how far above/into the RSI-BB upper band they've been
+    # sitting over a short trailing window, independent of touch-alert logic.
+    # Reuses the same closes already fetched for the standard scan on a given
+    # timeframe — no additional API calls beyond the slightly larger fetch
+    # size from candle_fetch_limit_for_timeframe().
+    POWER_LEADERBOARD_ENABLED: bool = True
+    POWER_LEADERBOARD_WINDOW_DEFAULT: int = 10
+    POWER_LEADERBOARD_WINDOW_OVERRIDES: Dict[str, int] = field(default_factory=lambda: {
+        '1h': 20
+    })
+    POWER_LEADERBOARD_SIZE: int = 20
+
+    # Buffer added on top of the computed (warmup + window) requirement when
+    # fetching candles, to absorb minor off-by-one warmup estimation and any
+    # exchange returning slightly fewer candles than requested near a
+    # symbol's listing date.
+    CANDLE_FETCH_SAFETY_MARGIN: int = 10
 
 CONFIG = Config()
 
@@ -150,9 +171,36 @@ TIMEFRAME_MINUTES = {
     '1d': 1440, '1w': 10080
 }
 
-ACTIVE_TFS = ['4h', '1d', '1w']
-MIDDLE_BAND_TFS = ['4h', '1d', '1w']
-CACHED_TFS = {'4h', '1d', '1w'}
+ACTIVE_TFS = ['4h', '1h', '1d', '1w']
+MIDDLE_BAND_TFS = ['4h', '1h', '1d', '1w']
+CACHED_TFS = {'4h', '1h', '1d', '1w'}
+
+# See compute_power_score / candle_fetch_limit_for_timeframe: RSI needs
+# RSI_PERIOD prior candles before its first valid output, then BBANDS
+# needs BB_LENGTH consecutive valid RSI values before *its* first valid
+# output — so this many leading candles produce nothing but NaN.
+INDICATOR_WARMUP = CONFIG.RSI_PERIOD + CONFIG.BB_LENGTH  # 48
+
+
+def power_leaderboard_window_for_timeframe(tf: str) -> int:
+    return CONFIG.POWER_LEADERBOARD_WINDOW_OVERRIDES.get(tf, CONFIG.POWER_LEADERBOARD_WINDOW_DEFAULT)
+
+
+def candle_fetch_limit_for_timeframe(tf: str) -> int:
+    """
+    How many candles to request for a given timeframe's scan.
+
+    Must clear INDICATOR_WARMUP + this timeframe's power-leaderboard
+    window, or compute_power_score has zero valid points to work with and
+    silently returns None for every symbol on that timeframe — no error,
+    just an empty leaderboard every cycle. CONFIG.CANDLE_LIMIT is used as
+    a floor, not a ceiling: a timeframe with a larger window (e.g. 1h at
+    20, landing around 78) gets a larger fetch; everything else still gets
+    at least the configured default.
+    """
+    window = power_leaderboard_window_for_timeframe(tf)
+    required = INDICATOR_WARMUP + window + CONFIG.CANDLE_FETCH_SAFETY_MARGIN
+    return max(CONFIG.CANDLE_LIMIT, required)
 
 # ==========================================
 # DATA MODELS
@@ -172,6 +220,19 @@ class TouchHit:
     def to_dict(self): return asdict(self)
     @staticmethod
     def from_dict(d): return TouchHit(**d)
+
+@dataclass
+class PowerScore:
+    symbol: str
+    exchange: str
+    market: str
+    timeframe: str
+    score: float          # signed mean(RSI - upper_band) over the window
+    hot: bool = False
+
+    def to_dict(self): return asdict(self)
+    @staticmethod
+    def from_dict(d): return PowerScore(**d)
 
 @dataclass
 class ScanStats:
@@ -600,231 +661,6 @@ class RobustProxyPool:
         """Report failed request."""
         async with self._lock:
             self._record_failure(proxy)
-            
-    ############UNUSED BUILT IN CORE PROXY SYSTEM FUNCTIONS, PROXY SYSTEM ONLY WORK 100% WITH THEM
-    '''async def fetch(
-        self,
-        url: str,
-        method: str = "GET",
-        max_retries: int = 8,
-        base_delay: float = 0.05,
-        **kwargs,
-    ) -> Tuple[bool, Any]:
-        """
-        Fetch URL with automatic proxy rotation and retry.
-        
-        Returns:
-            (True, response_data) on success
-            (False, error_message) on failure
-        """
-        if not self._session:
-            return False, "Session not initialized"
-
-        self._total_requests += 1
-        tried_proxies: Set[str] = set()
-        last_error = "Unknown error"
-
-        for attempt in range(max_retries):
-            proxy = None
-            available = set(self.active_proxies) - tried_proxies
-            
-            if available:
-                proxy = self._select_from_set(available)
-            elif self.active_proxies:
-                proxy = self._select_weighted()
-
-            if proxy is None and self.allow_direct_fallback:
-                logging.debug("🔄 Attempting direct connection (no proxy)")
-                self._direct_fallbacks += 1
-
-            if proxy:
-                tried_proxies.add(proxy)
-
-            start_time = time.time()
-
-            try:
-                timeout = aiohttp.ClientTimeout(total=self.request_timeout)
-                async with self._session.request(
-                    method, url, proxy=proxy, timeout=timeout, **kwargs
-                ) as resp:
-                    
-                    latency_ms = (time.time() - start_time) * 1000
-
-                    if resp.status == 200:
-                        try:
-                            data = await resp.json()
-                        except:
-                            data = await resp.text()
-
-                        if proxy:
-                            await self.report_success(proxy, latency_ms)
-
-                        self._successful_requests += 1
-                        return True, data
-
-                    if resp.status in (403, 407, 429, 502, 503):
-                        if proxy:
-                            await self.report_failure(proxy)
-                        last_error = f"HTTP {resp.status}"
-                    else:
-                        last_error = f"HTTP {resp.status}"
-
-            except asyncio.TimeoutError:
-                if proxy:
-                    await self.report_failure(proxy)
-                last_error = "Timeout"
-
-            except (aiohttp.ClientProxyConnectionError, aiohttp.ClientHttpProxyError) as e:
-                if proxy:
-                    await self.report_failure(proxy)
-                last_error = f"Proxy connection error"
-
-            except aiohttp.ClientError as e:
-                if proxy:
-                    await self.report_failure(proxy)
-                last_error = f"Client error: {type(e).__name__}"
-
-            except Exception as e:
-                if proxy:
-                    await self.report_failure(proxy)
-                last_error = f"Error: {type(e).__name__}"
-
-            if attempt < max_retries - 1:
-                delay = base_delay * (1.5 ** attempt) + random.uniform(0, 0.05)
-                await asyncio.sleep(delay)
-
-        return False, f"All {max_retries} attempts failed. Last: {last_error}"
-
-    def _select_from_set(self, candidates: Set[str]) -> Optional[str]:
-        """Select best proxy from a specific set."""
-        if not candidates:
-            return None
-        
-        scored = [(p, self._proxies[p].compute_score()) for p in candidates if p in self._proxies]
-        if not scored:
-            return None
-            
-        total = sum(s for _, s in scored)
-        if total <= 0:
-            return random.choice(list(candidates))
-
-        r = random.random() * total
-        cumulative = 0.0
-        for proxy, score in scored:
-            cumulative += score
-            if cumulative >= r:
-                return proxy
-        return scored[-1][0]
-
-    async def fetch_json(self, url: str, max_retries: int = 8, **kwargs) -> Tuple[bool, Any]:
-        """Convenience wrapper for JSON endpoints."""
-        return await self.fetch(url, max_retries=max_retries, **kwargs)
-
-    async def fetch_binance_klines(
-        self,
-        symbol: str,
-        interval: str,
-        limit: int = 500,
-        start_time: Optional[int] = None,
-        end_time: Optional[int] = None,
-        max_retries: int = 10,
-    ) -> Tuple[bool, Any]:
-        """
-        Optimized method for Binance klines with extra retries.
-        
-        Returns:
-            (True, klines_list) on success
-            (False, error_message) on failure
-        """
-        url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        }
-        if start_time:
-            params["startTime"] = start_time
-        if end_time:
-            params["endTime"] = end_time
-
-        success, data = await self.fetch(url, params=params, max_retries=max_retries)
-
-        if success and isinstance(data, list):
-            return True, data
-        elif success:
-            return False, f"Unexpected response type: {type(data)}"
-        else:
-            return False, data
-
-    async def fetch_multiple_symbols(
-        self,
-        symbols: List[str],
-        interval: str,
-        limit: int = 500,
-        concurrency: int = 10,
-    ) -> Dict[str, Tuple[bool, Any]]:
-        """
-        Fetch klines for multiple symbols with controlled concurrency.
-        Returns dict: {symbol: (success, data_or_error)}
-        """
-        sem = asyncio.Semaphore(concurrency)
-        results = {}
-
-        async def fetch_one(symbol: str):
-            async with sem:
-                return symbol, await self.fetch_binance_klines(symbol, interval, limit)
-
-        tasks = [fetch_one(s) for s in symbols]
-        for coro in asyncio.as_completed(tasks):
-            symbol, result = await coro
-            results[symbol] = result
-
-        return results
-
-    async def force_refresh(self):
-        """Force an immediate pool refresh."""
-        logging.info("🔄 Force refreshing proxy pool...")
-        await self._populate_pool()
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get detailed pool statistics."""
-        states = {"active": 0, "cooling": 0, "banned": 0}
-        total_success_rate = 0.0
-        total_latency = 0.0
-        count_for_avg = 0
-
-        for proxy, stats in self._proxies.items():
-            states[stats.state.value] += 1
-            if stats.state == ProxyState.ACTIVE and stats.total_uses > 0:
-                total_success_rate += stats.success_rate
-                total_latency += stats.avg_latency_ms
-                count_for_avg += 1
-
-        request_success_rate = 0
-        if self._total_requests > 0:
-            request_success_rate = self._successful_requests / self._total_requests
-
-        return {
-            "pool_size": self.pool_size,
-            "total_proxies": len(self._proxies),
-            "active": states["active"],
-            "cooling": states["cooling"],
-            "banned": states["banned"],
-            "avg_proxy_success_rate": (total_success_rate / count_for_avg) if count_for_avg else 0,
-            "avg_latency_ms": (total_latency / count_for_avg) if count_for_avg else 0,
-            "total_requests": self._total_requests,
-            "successful_requests": self._successful_requests,
-            "request_success_rate": request_success_rate,
-            "direct_fallbacks": self._direct_fallbacks,
-            "is_healthy": self.is_healthy,
-        }
-
-    def get_top_proxies(self, n: int = 10) -> List[Tuple[str, float, float]]:
-        """Get top N proxies by score. Returns [(proxy, score, success_rate), ...]"""
-        active = self.active_proxies
-        scored = [(p, self._proxies[p].compute_score(), self._proxies[p].success_rate) for p in active]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:n]'''
 
 # ==========================================
 # REDIS CACHE MANAGER
@@ -1043,10 +879,11 @@ class BinanceClient(ExchangeClient):
         try: return [float(c[4]) for c in data]
         except Exception: return []
     async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
+        limit = candle_fetch_limit_for_timeframe(interval)
         base = 'https://api.binance.com/api/v3/klines' if market == "spot" else 'https://fapi.binance.com/fapi/v1/klines'
-        data = await self._request(base, {'symbol': symbol, 'interval': interval, 'limit': CONFIG.CANDLE_LIMIT})
+        data = await self._request(base, {'symbol': symbol, 'interval': interval, 'limit': limit})
         if not data: return []
-        is_valid, reason = validate_klines_payload(data, interval, CONFIG.CANDLE_LIMIT)
+        is_valid, reason = validate_klines_payload(data, interval, limit)
         if not is_valid:
             logging.warning(f"⚠️ Rejected implausible klines for {symbol} {interval} ({market}, Binance): {reason}")
             return []
@@ -1080,15 +917,16 @@ class BybitClient(ExchangeClient):
         try: return [float(c[4]) for c in ordered]
         except Exception: return []
     async def fetch_closes(self, symbol: str, interval: str, market: str) -> List[float]:
+        limit = candle_fetch_limit_for_timeframe(interval)
         url = 'https://api.bybit.com/v5/market/kline'
         cat = 'linear' if market == 'perp' else 'spot'
         b_int = {"15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W"}.get(interval, "D")
-        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': b_int, 'limit': CONFIG.CANDLE_LIMIT})
+        data = await self._request(url, {'category': cat, 'symbol': symbol, 'interval': b_int, 'limit': limit})
         if not data: return []
         raw = data.get('result', {}).get('list', [])
         if not raw: return []
         ordered = raw[::-1]
-        is_valid, reason = validate_klines_payload(ordered, interval, CONFIG.CANDLE_LIMIT)
+        is_valid, reason = validate_klines_payload(ordered, interval, limit)
         if not is_valid:
             logging.warning(f"⚠️ Rejected implausible klines for {symbol} {interval} ({market}, Bybit): {reason}")
             return []
@@ -1485,9 +1323,56 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
     
     return None, None, 0.0
 
+
+def compute_power_score(closes: List[float], window: int) -> Optional[float]:
+    """
+    Mean signed distance (RSI - upper_band) over the last `window`
+    completed candles, ending at the same "last completed candle" (idx=-2)
+    convention check_bb_rsi uses. Signed, not clamped at zero — a candle
+    where RSI sits above the upper band contributes positively, so
+    "walking above the band" outscores "sitting right at it" for free.
+
+    Returns None if there aren't `window` valid, non-NaN candles to fill
+    the window (insufficient history / still in RSI+BBANDS warmup) —
+    callers must not treat None as a score of 0, it means "couldn't score
+    this one", not "scored low."
+    """
+    if not CONFIG.POWER_LEADERBOARD_ENABLED or len(closes) < CONFIG.MIN_CANDLES:
+        return None
+
+    np_c = np.array(closes, dtype=float)
+    rsi = talib.RSI(np_c, timeperiod=CONFIG.RSI_PERIOD)
+    upper, mid, lower = talib.BBANDS(
+        rsi,
+        timeperiod=CONFIG.BB_LENGTH,
+        nbdevup=CONFIG.BB_STDDEV,
+        nbdevdn=CONFIG.BB_STDDEV,
+        matype=0
+    )
+
+    if len(rsi) < window + 1:
+        return None
+
+    # [-(window+1):-1] = the `window` candles ending at idx=-2, matching
+    # check_bb_rsi's "last completed candle" convention.
+    window_rsi = rsi[-(window + 1):-1]
+    window_upper = upper[-(window + 1):-1]
+
+    if np.isnan(window_rsi).any() or np.isnan(window_upper).any():
+        return None
+
+    return float(np.mean(window_rsi - window_upper))
+
 # ==========================================
 # MAIN BOT
 # ==========================================
+
+def clean_name(s: str) -> str:
+    """Clean symbol name: remove USDT suffix and common prefixes, cap at 6 chars."""
+    s = s.replace("USDT", "")
+    s = re.sub(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])", "", s)
+    return s[:6]
+
 
 class RsiBot:
     def __init__(self):
@@ -1500,7 +1385,12 @@ class RsiBot:
             validation_timeout=4.0
         )
         
-    async def send_report(self, session: aiohttp.ClientSession, hits: List[TouchHit]):
+    async def send_report(
+        self,
+        session: aiohttp.ClientSession,
+        hits: List[TouchHit],
+        power_scores_by_tf: Dict[str, List[PowerScore]],
+    ):
         """
         Send formatted Telegram report using HTML parse mode with <pre> tags
         for guaranteed monospace alignment across all Telegram clients.
@@ -1514,8 +1404,12 @@ class RsiBot:
         Smart batching: packs as many sections as possible into each message
         before splitting to the next one. Never sends a single section alone
         unless it genuinely fills a message by itself.
+
+        Right after a timeframe's touch-alert message(s) go out, that same
+        timeframe's power leaderboard (if one was computed this cycle) is
+        sent as its own follow-up message — see the tf_order loop below.
         """
-        if not hits:
+        if not hits and not power_scores_by_tf:
             return
 
         # ── Group hits by timeframe → section ──
@@ -1535,12 +1429,6 @@ class RsiBot:
 
         tf_order = ["1w", "1d", "4h", "2h", "1h", "30m", "15m", "5m", "3m"]
         ts_footer = datetime.now(timezone.utc).strftime('%d %b %H:%M UTC')
-
-        def clean_name(s: str) -> str:
-            """Clean symbol name: remove USDT suffix and common prefixes, cap at 6 chars."""
-            s = s.replace("USDT", "")
-            s = re.sub(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])", "", s)
-            return s[:6]
 
         def format_cell(item: TouchHit) -> str:
             """
@@ -1596,131 +1484,172 @@ class RsiBot:
             return "\n".join(lines)
 
         # ── Process each timeframe ──
+        # For a timeframe with touch hits, the touch section message(s) are
+        # batched and sent first (unchanged logic below); if that same
+        # timeframe also has a power leaderboard computed this cycle, it
+        # goes out right after, as its own follow-up message. A timeframe
+        # can also have a leaderboard with zero touch hits — that still
+        # sends just the leaderboard message.
         for tf in tf_order:
-            if tf not in grouped:
-                continue
-            
-            tf_sections = grouped[tf]
-            total_hits = sum(len(v) for v in tf_sections.values())
-            if total_hits == 0:
+            has_hits = tf in grouped
+            has_leaderboard = tf in power_scores_by_tf and bool(power_scores_by_tf[tf])
+
+            if not has_hits and not has_leaderboard:
                 continue
 
-            # Build all section blocks for this timeframe
-            section_blocks: List[str] = []
-            for section_key, section_label, sort_descending in section_defs:
-                items = tf_sections.get(section_key, [])
-                if not items:
-                    continue
-                block = build_section_block(section_key, section_label, sort_descending, items)
-                section_blocks.append(block)
+            if has_hits:
+                tf_sections = grouped[tf]
+                total_hits = sum(len(v) for v in tf_sections.values())
 
-            if not section_blocks:
-                continue
+                # Build all section blocks for this timeframe
+                section_blocks: List[str] = []
+                for section_key, section_label, sort_descending in section_defs:
+                    items = tf_sections.get(section_key, [])
+                    if not items:
+                        continue
+                    block = build_section_block(section_key, section_label, sort_descending, items)
+                    section_blocks.append(block)
 
-            # ── Smart Batching ──
-            # Pack as many sections as possible into each message.
-            # Only split to a new message when adding the next section would exceed the limit.
-            
-            tf_header = f"⏱ <b>{tf} Timeframe</b> ({total_hits})\n"
-            
-            # Overhead per message: tf_header + <pre></pre> tags + footer + padding
-            # <pre>\n</pre> = 11 chars, footer ~25 chars, safety margin
-            overhead = len(tf_header) + len(ts_footer) + 30  # ~30 for tags + newlines + safety
-            max_content_chars = 4000 - overhead
-            
-            # Batch sections greedily
-            current_batch: List[str] = []
-            current_batch_chars: int = 0
-            
-            for block in section_blocks:
-                block_len = len(block)
-                
-                # Check if adding this block to current batch would exceed limit
-                if current_batch and (current_batch_chars + block_len + 1) > max_content_chars:
-                    # Send current batch first
-                    batch_content = "\n".join(current_batch)
-                    message = tf_header + f"<pre>{batch_content}</pre>"
-                    await self._safe_send(session, message, ts_footer)
-                    
-                    # Start new batch with this block
-                    current_batch = [block]
-                    current_batch_chars = block_len
-                
-                elif block_len > max_content_chars:
-                    # This single section is too large to fit in one message by itself.
-                    # Send whatever is in the current batch first.
+                if section_blocks:
+                    # ── Smart Batching ──
+                    # Pack as many sections as possible into each message.
+                    # Only split to a new message when adding the next section would exceed the limit.
+
+                    tf_header = f"⏱ <b>{tf} Timeframe</b> ({total_hits})\n"
+
+                    # Overhead per message: tf_header + <pre></pre> tags + footer + padding
+                    # <pre>\n</pre> = 11 chars, footer ~25 chars, safety margin
+                    overhead = len(tf_header) + len(ts_footer) + 30  # ~30 for tags + newlines + safety
+                    max_content_chars = 4000 - overhead
+
+                    # Batch sections greedily
+                    current_batch: List[str] = []
+                    current_batch_chars: int = 0
+
+                    for block in section_blocks:
+                        block_len = len(block)
+
+                        # Check if adding this block to current batch would exceed limit
+                        if current_batch and (current_batch_chars + block_len + 1) > max_content_chars:
+                            # Send current batch first
+                            batch_content = "\n".join(current_batch)
+                            message = tf_header + f"<pre>{batch_content}</pre>"
+                            await self._safe_send(session, message, ts_footer)
+
+                            # Start new batch with this block
+                            current_batch = [block]
+                            current_batch_chars = block_len
+
+                        elif block_len > max_content_chars:
+                            # This single section is too large to fit in one message by itself.
+                            # Send whatever is in the current batch first.
+                            if current_batch:
+                                batch_content = "\n".join(current_batch)
+                                message = tf_header + f"<pre>{batch_content}</pre>"
+                                await self._safe_send(session, message, ts_footer)
+                                current_batch = []
+                                current_batch_chars = 0
+
+                            # Split this oversized section by rows.
+                            # Re-parse the block into its component lines.
+                            block_lines = block.split("\n")
+
+                            # Separate the header part (first 3 lines: empty, label, top border)
+                            # and the footer part (last line: bottom border)
+                            # from the content rows in between.
+                            section_header_lines = []
+                            section_footer_line = ""
+                            content_lines = []
+
+                            for i, line in enumerate(block_lines):
+                                if line.startswith("└"):
+                                    section_footer_line = line
+                                elif line.startswith("┌") or line.startswith("🔼") or line.startswith("💠") or line.startswith("🔽") or line == "":
+                                    section_header_lines.append(line)
+                                elif line.startswith("│"):
+                                    content_lines.append(line)
+                                else:
+                                    # Catch any other header-like lines (section label without emoji match)
+                                    if not content_lines:
+                                        section_header_lines.append(line)
+                                    else:
+                                        content_lines.append(line)
+
+                            # Now batch the content rows with the section header repeated
+                            section_header_text = "\n".join(section_header_lines)
+                            section_header_len = len(section_header_text) + len(section_footer_line) + 2
+                            available_for_rows = max_content_chars - section_header_len
+
+                            row_batch: List[str] = []
+                            row_batch_chars: int = 0
+
+                            for row_line in content_lines:
+                                row_len = len(row_line) + 1  # +1 for newline
+
+                                if row_batch and (row_batch_chars + row_len) > available_for_rows:
+                                    # Send this chunk with header and footer
+                                    chunk_lines = section_header_lines + row_batch + [section_footer_line]
+                                    chunk_content = "\n".join(chunk_lines)
+                                    message = tf_header + f"<pre>{chunk_content}</pre>"
+                                    await self._safe_send(session, message, ts_footer)
+                                    row_batch = []
+                                    row_batch_chars = 0
+
+                                row_batch.append(row_line)
+                                row_batch_chars += row_len
+
+                            # Send remaining rows
+                            if row_batch:
+                                chunk_lines = section_header_lines + row_batch + [section_footer_line]
+                                chunk_content = "\n".join(chunk_lines)
+                                message = tf_header + f"<pre>{chunk_content}</pre>"
+                                await self._safe_send(session, message, ts_footer)
+
+                        else:
+                            # Block fits — add to current batch
+                            current_batch.append(block)
+                            current_batch_chars += block_len + 1  # +1 for the joining newline
+
+                    # ── Send remaining batch for this timeframe ──
                     if current_batch:
                         batch_content = "\n".join(current_batch)
                         message = tf_header + f"<pre>{batch_content}</pre>"
                         await self._safe_send(session, message, ts_footer)
-                        current_batch = []
-                        current_batch_chars = 0
-                    
-                    # Split this oversized section by rows.
-                    # Re-parse the block into its component lines.
-                    block_lines = block.split("\n")
-                    
-                    # Separate the header part (first 3 lines: empty, label, top border)
-                    # and the footer part (last line: bottom border)
-                    # from the content rows in between.
-                    section_header_lines = []
-                    section_footer_line = ""
-                    content_lines = []
-                    
-                    for i, line in enumerate(block_lines):
-                        if line.startswith("└"):
-                            section_footer_line = line
-                        elif line.startswith("┌") or line.startswith("🔼") or line.startswith("💠") or line.startswith("🔽") or line == "":
-                            section_header_lines.append(line)
-                        elif line.startswith("│"):
-                            content_lines.append(line)
-                        else:
-                            # Catch any other header-like lines (section label without emoji match)
-                            if not content_lines:
-                                section_header_lines.append(line)
-                            else:
-                                content_lines.append(line)
-                    
-                    # Now batch the content rows with the section header repeated
-                    section_header_text = "\n".join(section_header_lines)
-                    section_header_len = len(section_header_text) + len(section_footer_line) + 2
-                    available_for_rows = max_content_chars - section_header_len
-                    
-                    row_batch: List[str] = []
-                    row_batch_chars: int = 0
-                    
-                    for row_line in content_lines:
-                        row_len = len(row_line) + 1  # +1 for newline
-                        
-                        if row_batch and (row_batch_chars + row_len) > available_for_rows:
-                            # Send this chunk with header and footer
-                            chunk_lines = section_header_lines + row_batch + [section_footer_line]
-                            chunk_content = "\n".join(chunk_lines)
-                            message = tf_header + f"<pre>{chunk_content}</pre>"
-                            await self._safe_send(session, message, ts_footer)
-                            row_batch = []
-                            row_batch_chars = 0
-                        
-                        row_batch.append(row_line)
-                        row_batch_chars += row_len
-                    
-                    # Send remaining rows
-                    if row_batch:
-                        chunk_lines = section_header_lines + row_batch + [section_footer_line]
-                        chunk_content = "\n".join(chunk_lines)
-                        message = tf_header + f"<pre>{chunk_content}</pre>"
-                        await self._safe_send(session, message, ts_footer)
-                
-                else:
-                    # Block fits — add to current batch
-                    current_batch.append(block)
-                    current_batch_chars += block_len + 1  # +1 for the joining newline
-            
-            # ── Send remaining batch for this timeframe ──
-            if current_batch:
-                batch_content = "\n".join(current_batch)
-                message = tf_header + f"<pre>{batch_content}</pre>"
-                await self._safe_send(session, message, ts_footer)
+
+            # ── Power leaderboard, sent as a follow-up message right after
+            # this timeframe's touch section(s), if one was computed. ──
+            if has_leaderboard:
+                await self._send_power_leaderboard_message(session, tf, power_scores_by_tf[tf], ts_footer)
+
+    async def _send_power_leaderboard_message(
+        self,
+        session: aiohttp.ClientSession,
+        tf: str,
+        scores: List[PowerScore],
+        footer: str,
+    ):
+        """
+        Send the RSI band-walk power leaderboard for a single timeframe as
+        its own Telegram message, right after that timeframe's regular
+        touch-alert message(s) (see the caller, send_report). Capped at
+        POWER_LEADERBOARD_SIZE entries, so unlike send_report's sections
+        this always fits one message — no batching needed.
+        """
+        if not scores:
+            return
+
+        top = sorted(scores, key=lambda s: s.score, reverse=True)[:CONFIG.POWER_LEADERBOARD_SIZE]
+
+        rows = []
+        for rank, item in enumerate(top, start=1):
+            sym = clean_name(item.symbol)
+            hot = " 🔥" if item.hot else ""
+            rows.append(f"{rank:>2}. {sym:<6}{item.score:+6.2f}{hot}")
+
+        window = power_leaderboard_window_for_timeframe(tf)
+        header = f"⚡ <b>{tf} Power Leaderboard</b> (last {window} candles)\n"
+        message = header + f"<pre>{chr(10).join(rows)}</pre>"
+        await self._safe_send(session, message, footer)
 
     async def _safe_send(self, session: aiohttp.ClientSession, text: str, footer: str):
         """
@@ -2009,12 +1938,14 @@ class RsiBot:
                 
                 # ── Execute Fresh Scans ──
                 final_hits: List[TouchHit] = []
+                power_scores_by_tf: Dict[str, List[PowerScore]] = {}
                 
                 if tfs_to_scan_fresh:
                     logging.info(f"Scanning fresh TFs: {tfs_to_scan_fresh} across {total_sym_count} symbols...")
                     
                     for tf in tfs_to_scan_fresh:
                         tf_hits: List[TouchHit] = []
+                        tf_power_scores: List[PowerScore] = []
                         
                         async def scan_one(
                             client: ExchangeClient,
@@ -2022,11 +1953,13 @@ class RsiBot:
                             mkt: str,
                             ex: str,
                             scan_tf: str
-                        ) -> Tuple[bool, List[TouchHit]]:
+                        ) -> Tuple[bool, List[TouchHit], Optional[float]]:
                             """
-                            Scan a single symbol on a single timeframe.
+                            Scan a single symbol on a single timeframe for both a touch
+                            hit and a power-leaderboard score, off the same fetched
+                            closes (no extra fetch for the leaderboard).
 
-                            Returns (fetched_ok, hits):
+                            Returns (fetched_ok, hits, power_score):
                               fetched_ok: True only if usable close data was
                                 actually returned (touch found or not). False
                                 if the fetch failed / returned nothing — this
@@ -2034,6 +1967,10 @@ class RsiBot:
                                 in the scan summary instead of being silently
                                 indistinguishable from "checked, no touch".
                               hits: 0 or 1 TouchHit.
+                              power_score: signed mean(RSI - upper) over this
+                                timeframe's power-leaderboard window, or None
+                                if leaderboard scoring is disabled or there's
+                                insufficient valid history for this symbol.
 
                             Catches all exceptions internally to prevent task
                             failures from propagating to asyncio.gather.
@@ -2041,11 +1978,12 @@ class RsiBot:
                             try:
                                 closes = await client.fetch_closes(sym, scan_tf, mkt)
                                 if not closes:
-                                    return False, []
+                                    return False, [], None
                                 
                                 t_type, direction, rsi_val = check_bb_rsi(closes, scan_tf)
+                                hits: List[TouchHit] = []
                                 if t_type:
-                                    return True, [TouchHit(
+                                    hits.append(TouchHit(
                                         symbol=sym,
                                         exchange=ex,
                                         market=mkt,
@@ -2054,11 +1992,14 @@ class RsiBot:
                                         touch_type=t_type,
                                         direction=direction if direction else "",
                                         hot=sym in hot_coins_for_timeframe(scan_tf)
-                                    )]
-                                return True, []
+                                    ))
+
+                                window = power_leaderboard_window_for_timeframe(scan_tf)
+                                power_score = compute_power_score(closes, window)
+                                return True, hits, power_score
                             except Exception as e:
                                 logging.debug(f"Scan failed for {sym} on {scan_tf}: {e}")
-                                return False, []
+                                return False, [], None
                         
                         # Build the initial task batch for this timeframe
                         # (full universe if this tf is EMA-exempt, otherwise
@@ -2110,10 +2051,20 @@ class RsiBot:
                             still_failed: List[Tuple[Any, str, str, str]] = []
                             for pair, result in zip(pending_pairs, round_results):
                                 if isinstance(result, tuple):
-                                    fetched_ok, hits = result
+                                    fetched_ok, hits, power_score = result
                                     if fetched_ok:
                                         successful_count += 1
                                         tf_hits.extend(hits)
+                                        if power_score is not None:
+                                            _, sym, mkt, ex = pair
+                                            tf_power_scores.append(PowerScore(
+                                                symbol=sym,
+                                                exchange=ex,
+                                                market=mkt,
+                                                timeframe=tf,
+                                                score=power_score,
+                                                hot=sym in hot_coins_for_timeframe(tf)
+                                            ))
                                     else:
                                         still_failed.append(pair)
                                 else:
@@ -2150,6 +2101,14 @@ class RsiBot:
                                 )
                         
                         final_hits.extend(tf_hits)
+
+                        # Power leaderboard: per-cycle only (not persisted to
+                        # Redis the way touch hits are) — a re-run mid-candle
+                        # simply recomputes it fresh, which is fine since it's
+                        # a ranking snapshot, not an alert that must survive
+                        # a restart.
+                        if tf_power_scores:
+                            power_scores_by_tf[tf] = tf_power_scores
                         
                         # Cache the results for cacheable timeframes
                         if tf in CACHED_TFS:
@@ -2210,12 +2169,15 @@ class RsiBot:
                         hits_to_send.append(h)
                 
                 # ── Send Report ──
-                if hits_to_send:
-                    logging.info(f"📤 Sending {len(hits_to_send)} hits to Telegram...")
-                    await self.send_report(session, hits_to_send)
+                if hits_to_send or power_scores_by_tf:
+                    logging.info(
+                        f"📤 Sending report: {len(hits_to_send)} touch hits, "
+                        f"leaderboards for {len(power_scores_by_tf)} timeframe(s)..."
+                    )
+                    await self.send_report(session, hits_to_send, power_scores_by_tf)
                     logging.info("✅ Report sent successfully")
                 else:
-                    logging.info("📭 No new hits to send")
+                    logging.info("📭 No new hits or leaderboards to send")
                 
                 # ── Persist Sent State ──
                 await self.cache.save_sent_state(new_state)
