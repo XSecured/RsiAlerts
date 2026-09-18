@@ -156,7 +156,8 @@ class Config:
     POWER_LEADERBOARD_WINDOW_OVERRIDES: Dict[str, int] = field(default_factory=lambda: {
         '1h': 20
     })
-    POWER_LEADERBOARD_SIZE: int = 20
+    POWER_LEADERBOARD_SIZE: int = 20          # top N, all scored symbols
+    POWER_LEADERBOARD_HOT_SIZE: int = 20      # top N, volatile (🔥) symbols only — same message, second section
 
     # Buffer added on top of the computed (warmup + window) requirement when
     # fetching candles, to absorb minor off-by-one warmup estimation and any
@@ -1616,10 +1617,22 @@ class RsiBot:
                         message = tf_header + f"<pre>{batch_content}</pre>"
                         await self._safe_send(session, message, ts_footer)
 
-            # ── Power leaderboard, sent as a follow-up message right after
-            # this timeframe's touch section(s), if one was computed. ──
+            # ── Power leaderboard, sent as one follow-up message right
+            # after this timeframe's touch section(s), if one was computed.
+            # The message itself has two sections: top POWER_LEADERBOARD_SIZE
+            # across all scored symbols, and top POWER_LEADERBOARD_HOT_SIZE
+            # restricted to symbols already flagged 🔥 volatile. ──
             if has_leaderboard:
                 await self._send_power_leaderboard_message(session, tf, power_scores_by_tf[tf], ts_footer)
+
+    def _format_power_board_section(self, label: str, items: List[PowerScore]) -> str:
+        """Build one ranked section (header line + numbered rows) for the power-leaderboard message."""
+        lines = [label]
+        for rank, item in enumerate(items, start=1):
+            sym = clean_name(item.symbol)
+            hot = " 🔥" if item.hot else ""
+            lines.append(f"{rank:>2}. {sym:<6}{item.score:+6.2f}{hot}")
+        return "\n".join(lines)
 
     async def _send_power_leaderboard_message(
         self,
@@ -1629,27 +1642,42 @@ class RsiBot:
         footer: str,
     ):
         """
-        Send the RSI band-walk power leaderboard for a single timeframe as
-        its own Telegram message, right after that timeframe's regular
-        touch-alert message(s) (see the caller, send_report). Capped at
-        POWER_LEADERBOARD_SIZE entries, so unlike send_report's sections
-        this always fits one message — no batching needed.
+        Send the power leaderboard for a timeframe as a single Telegram
+        message, right after that timeframe's regular touch-alert
+        message(s) (see the caller, send_report). One message, two
+        sections:
+          - all scored symbols, ranked, capped at POWER_LEADERBOARD_SIZE
+          - symbols already flagged 🔥 by hot_coins_for_timeframe, ranked
+            within just that pool (not sliced from the section above),
+            capped at POWER_LEADERBOARD_HOT_SIZE
+
+        Both caps are small and fixed (20 rows apiece by default), so the
+        combined message stays well under Telegram's 4096-char limit —
+        no batching logic needed here, unlike send_report's touch sections.
         """
         if not scores:
             return
 
-        top = sorted(scores, key=lambda s: s.score, reverse=True)[:CONFIG.POWER_LEADERBOARD_SIZE]
+        general_top = sorted(scores, key=lambda s: s.score, reverse=True)[:CONFIG.POWER_LEADERBOARD_SIZE]
 
-        rows = []
-        for rank, item in enumerate(top, start=1):
-            sym = clean_name(item.symbol)
-            hot = " 🔥" if item.hot else ""
-            rows.append(f"{rank:>2}. {sym:<6}{item.score:+6.2f}{hot}")
+        hot_pool = [s for s in scores if s.hot]
+        volatile_top = sorted(hot_pool, key=lambda s: s.score, reverse=True)[:CONFIG.POWER_LEADERBOARD_HOT_SIZE]
+
+        if not general_top and not volatile_top:
+            return
+
+        sections: List[str] = []
+        if general_top:
+            sections.append(self._format_power_board_section(f"⚡ TOP {len(general_top)}", general_top))
+        if volatile_top:
+            sections.append(self._format_power_board_section(f"🔥 TOP {len(volatile_top)} VOLATILE", volatile_top))
 
         window = power_leaderboard_window_for_timeframe(tf)
         header = f"⚡ <b>{tf} Power Leaderboard</b> (last {window} candles)\n"
-        message = header + f"<pre>{chr(10).join(rows)}</pre>"
+        body = "\n\n".join(sections)
+        message = header + f"<pre>{body}</pre>"
         await self._safe_send(session, message, footer)
+
 
     async def _safe_send(self, session: aiohttp.ClientSession, text: str, footer: str):
         """
