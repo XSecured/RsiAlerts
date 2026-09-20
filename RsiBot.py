@@ -158,6 +158,7 @@ class Config:
     })
     POWER_LEADERBOARD_SIZE: int = 20          # top N, all scored symbols
     POWER_LEADERBOARD_HOT_SIZE: int = 20      # top N, volatile (🔥) symbols only — same message, second section
+    POWER_LEADERBOARD_WEEKLY_SIZE: int = 20   # top N by rolling ~7-day peak score — same message, third section
 
     # Buffer added on top of the computed (warmup + window) requirement when
     # fetching candles, to absorb minor off-by-one warmup estimation and any
@@ -724,6 +725,95 @@ class CacheManager:
         if not self.redis: return
         try: await self.redis.set("bb_bot:sent_state", json.dumps(state))
         except Exception: pass
+
+    # ── Weekly Power Peak (rolling ~7-day high per symbol/timeframe) ──
+    # Bucketed by UTC calendar day rather than a strict trailing 168h
+    # window: record_power_scores merges each cycle's HOT-ONLY scores into
+    # TODAY's bucket (keeping the max per symbol if called more than once
+    # today), and get_weekly_peak_scores reads today's bucket plus the 6
+    # preceding calendar-day buckets and takes the max per symbol across
+    # all seven. This is an approximation — the actual elapsed span
+    # covered varies with time of day, from a bit under 7 days to a bit
+    # under 8 — traded for O(7) Redis reads per call instead of
+    # maintaining and pruning a full timestamped history per symbol. Good
+    # enough for "roughly this week's peak power among the most volatile
+    # coins"; not a substitute for precise backtesting if that's ever
+    # needed instead.
+
+    def _power_daily_key(self, tf: str, date_str: str) -> str:
+        return f"bb_bot:power_daily_peak:{tf}:{date_str}"
+
+    async def record_power_scores(self, tf: str, scores: List["PowerScore"]) -> None:
+        """
+        Merge this cycle's power scores into today's UTC daily-peak bucket
+        for this timeframe, keeping the higher of (existing bucket value,
+        this cycle's score) per symbol.
+
+        Only symbols flagged hot=True (🔥 volatile, per
+        hot_coins_for_timeframe) THIS cycle are recorded — the weekly peak
+        board is specifically "peak power among the most volatile coins,"
+        not a peak across the whole scanned universe. A symbol that isn't
+        volatile this cycle simply contributes nothing to today's bucket,
+        even if it was scored; a symbol that cools off for a stretch just
+        stops adding new entries, while whatever it already banked stays
+        live in the rolling window until that day's bucket ages past the
+        7-day mark on its own.
+
+        Read-then-write (one HGETALL, then one HSET) rather than a
+        per-symbol round trip: this runs once per scan cycle per
+        timeframe, not once per symbol, so two Redis calls is the actual
+        cost here regardless of how many hundreds of symbols are in
+        `scores`.
+        """
+        hot_scores = [s for s in scores if s.hot]
+        if not self.redis or not hot_scores:
+            return
+        date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        key = self._power_daily_key(tf, date_str)
+        try:
+            existing = await self.redis.hgetall(key)
+            merged: Dict[str, float] = {sym: float(val) for sym, val in existing.items()} if existing else {}
+            for s in hot_scores:
+                if s.symbol not in merged or s.score > merged[s.symbol]:
+                    merged[s.symbol] = s.score
+            if merged:
+                await self.redis.hset(key, mapping={sym: str(val) for sym, val in merged.items()})
+                # TTL is a safety net so a stopped bot doesn't leave buckets
+                # growing forever — it is NOT the windowing mechanism. The
+                # window is decided entirely by which 7 date keys
+                # get_weekly_peak_scores chooses to read, independent of
+                # this TTL. 9 days gives a full day of margin past the
+                # 7-day window before a bucket can expire out from under it.
+                await self.redis.expire(key, 9 * 86400)
+        except Exception as e:
+            logging.debug(f"record_power_scores failed for {tf}/{date_str}: {e}")
+
+    async def get_weekly_peak_scores(self, tf: str) -> Dict[str, float]:
+        """
+        Rolling ~7-calendar-day peak power score per symbol for a
+        timeframe, among symbols that were volatile (hot) on at least one
+        of the days contributing to the window — see record_power_scores
+        for the hot-only filtering and the class-level comment above it
+        for the bucketing approximation.
+        """
+        if not self.redis:
+            return {}
+        peaks: Dict[str, float] = {}
+        now = datetime.now(timezone.utc)
+        try:
+            for days_back in range(7):
+                date_str = (now - timedelta(days=days_back)).strftime('%Y-%m-%d')
+                bucket = await self.redis.hgetall(self._power_daily_key(tf, date_str))
+                if not bucket:
+                    continue
+                for sym, val in bucket.items():
+                    score = float(val)
+                    if sym not in peaks or score > peaks[sym]:
+                        peaks[sym] = score
+        except Exception as e:
+            logging.debug(f"get_weekly_peak_scores failed for {tf}: {e}")
+            return {}
+        return peaks
 
 # ==========================================
 # EXCHANGE CLIENTS
@@ -1391,6 +1481,7 @@ class RsiBot:
         session: aiohttp.ClientSession,
         hits: List[TouchHit],
         power_scores_by_tf: Dict[str, List[PowerScore]],
+        weekly_peaks_by_tf: Dict[str, Dict[str, float]],
     ):
         """
         Send formatted Telegram report using HTML parse mode with <pre> tags
@@ -1619,19 +1710,30 @@ class RsiBot:
 
             # ── Power leaderboard, sent as one follow-up message right
             # after this timeframe's touch section(s), if one was computed.
-            # The message itself has two sections: top POWER_LEADERBOARD_SIZE
-            # across all scored symbols, and top POWER_LEADERBOARD_HOT_SIZE
-            # restricted to symbols already flagged 🔥 volatile. ──
+            # The message itself has three sections: top POWER_LEADERBOARD_SIZE
+            # across all scored symbols this cycle, top POWER_LEADERBOARD_HOT_SIZE
+            # restricted to symbols already flagged 🔥 volatile, and top
+            # POWER_LEADERBOARD_WEEKLY_SIZE by rolling ~7-day peak score
+            # (see CacheManager.get_weekly_peak_scores). ──
             if has_leaderboard:
-                await self._send_power_leaderboard_message(session, tf, power_scores_by_tf[tf], ts_footer)
+                await self._send_power_leaderboard_message(
+                    session, tf, power_scores_by_tf[tf], weekly_peaks_by_tf.get(tf, {}), ts_footer
+                )
 
-    def _format_power_board_section(self, label: str, items: List[PowerScore]) -> str:
-        """Build one ranked section (header line + numbered rows) for the power-leaderboard message."""
+    def _format_power_board_section(self, label: str, rows: List[Tuple[str, float, bool]]) -> str:
+        """
+        Build one ranked section (header line + numbered rows) for the
+        power-leaderboard message. Takes plain (symbol, score, hot) tuples
+        rather than PowerScore objects, since the weekly-peak section has
+        no PowerScore to draw from (its score comes from a Redis hash, not
+        a fresh scan) — the general and volatile sections just unpack
+        their PowerScore lists into the same tuple shape before calling in.
+        """
         lines = [label]
-        for rank, item in enumerate(items, start=1):
-            sym = clean_name(item.symbol)
-            hot = " 🔥" if item.hot else ""
-            lines.append(f"{rank:>2}. {sym:<6}{item.score:+6.2f}{hot}")
+        for rank, (symbol, score, hot) in enumerate(rows, start=1):
+            sym = clean_name(symbol)
+            hot_marker = " 🔥" if hot else ""
+            lines.append(f"{rank:>2}. {sym:<6}{score:+6.2f}{hot_marker}")
         return "\n".join(lines)
 
     async def _send_power_leaderboard_message(
@@ -1639,23 +1741,37 @@ class RsiBot:
         session: aiohttp.ClientSession,
         tf: str,
         scores: List[PowerScore],
+        weekly_peaks: Dict[str, float],
         footer: str,
     ):
         """
         Send the power leaderboard for a timeframe as a single Telegram
         message, right after that timeframe's regular touch-alert
-        message(s) (see the caller, send_report). One message, two
+        message(s) (see the caller, send_report). One message, three
         sections:
-          - all scored symbols, ranked, capped at POWER_LEADERBOARD_SIZE
+          - all symbols scored THIS cycle, ranked, capped at
+            POWER_LEADERBOARD_SIZE
           - symbols already flagged 🔥 by hot_coins_for_timeframe, ranked
             within just that pool (not sliced from the section above),
             capped at POWER_LEADERBOARD_HOT_SIZE
+          - rolling ~7-day peak score per symbol for this timeframe,
+            among the MOST VOLATILE coins only (weekly_peaks, from
+            CacheManager.get_weekly_peak_scores — that's what
+            record_power_scores restricts itself to recording; already
+            includes THIS cycle's hot scores, since record_power_scores
+            is called before this is read), capped at
+            POWER_LEADERBOARD_WEEKLY_SIZE. The 🔥 marker on this section
+            reflects CURRENT volatility status, not necessarily the
+            symbol's status on the day its peak actually happened — a
+            week-old peak on a now-cooled-off coin still gets ranked
+            (it earned its spot in the bucket while it WAS hot), just
+            without the fire today.
 
-        Both caps are small and fixed (20 rows apiece by default), so the
-        combined message stays well under Telegram's 4096-char limit —
+        All three caps are small and fixed (20 rows apiece by default), so
+        the combined message stays well under Telegram's 4096-char limit —
         no batching logic needed here, unlike send_report's touch sections.
         """
-        if not scores:
+        if not scores and not weekly_peaks:
             return
 
         general_top = sorted(scores, key=lambda s: s.score, reverse=True)[:CONFIG.POWER_LEADERBOARD_SIZE]
@@ -1663,14 +1779,22 @@ class RsiBot:
         hot_pool = [s for s in scores if s.hot]
         volatile_top = sorted(hot_pool, key=lambda s: s.score, reverse=True)[:CONFIG.POWER_LEADERBOARD_HOT_SIZE]
 
-        if not general_top and not volatile_top:
+        hot_symbols_now = {s.symbol for s in scores if s.hot}
+        weekly_top = sorted(weekly_peaks.items(), key=lambda kv: kv[1], reverse=True)[:CONFIG.POWER_LEADERBOARD_WEEKLY_SIZE]
+
+        if not general_top and not volatile_top and not weekly_top:
             return
 
         sections: List[str] = []
         if general_top:
-            sections.append(self._format_power_board_section(f"⚡ TOP {len(general_top)}", general_top))
+            rows = [(s.symbol, s.score, s.hot) for s in general_top]
+            sections.append(self._format_power_board_section(f"⚡ TOP {len(rows)}", rows))
         if volatile_top:
-            sections.append(self._format_power_board_section(f"🔥 TOP {len(volatile_top)} VOLATILE", volatile_top))
+            rows = [(s.symbol, s.score, s.hot) for s in volatile_top]
+            sections.append(self._format_power_board_section(f"🔥 TOP {len(rows)} VOLATILE", rows))
+        if weekly_top:
+            rows = [(sym, peak, sym in hot_symbols_now) for sym, peak in weekly_top]
+            sections.append(self._format_power_board_section(f"🏆 TOP {len(rows)} — 7D PEAK (VOLATILE)", rows))
 
         window = power_leaderboard_window_for_timeframe(tf)
         header = f"⚡ <b>{tf} Power Leaderboard</b> (last {window} candles)\n"
@@ -2130,13 +2254,19 @@ class RsiBot:
                         
                         final_hits.extend(tf_hits)
 
-                        # Power leaderboard: per-cycle only (not persisted to
-                        # Redis the way touch hits are) — a re-run mid-candle
-                        # simply recomputes it fresh, which is fine since it's
-                        # a ranking snapshot, not an alert that must survive
-                        # a restart.
+                        # Power leaderboard: the per-cycle snapshot itself
+                        # (power_scores_by_tf) is not persisted — a re-run
+                        # mid-candle just recomputes it fresh, same as
+                        # before. What IS persisted now is each HOT score's
+                        # contribution to the rolling weekly-peak record —
+                        # record_power_scores filters to hot=True internally
+                        # and merges into today's UTC daily bucket — which
+                        # is what the "7D PEAK (VOLATILE)" section in the
+                        # Telegram message reads back via
+                        # get_weekly_peak_scores, below.
                         if tf_power_scores:
                             power_scores_by_tf[tf] = tf_power_scores
+                            await self.cache.record_power_scores(tf, tf_power_scores)
                         
                         # Cache the results for cacheable timeframes
                         if tf in CACHED_TFS:
@@ -2196,13 +2326,25 @@ class RsiBot:
                     else:
                         hits_to_send.append(h)
                 
+                # ── Weekly Peak Lookup ──
+                # One 7-key Redis read per timeframe that has a leaderboard
+                # this cycle — done once here, reused by send_report for
+                # that timeframe's "7D PEAK (VOLATILE)" section, rather
+                # than re-queried per message. Only ever contains symbols
+                # that were hot on at least one contributing day (see
+                # record_power_scores). Already reflects THIS cycle's hot
+                # scores, since record_power_scores (above) ran before this.
+                weekly_peaks_by_tf: Dict[str, Dict[str, float]] = {}
+                for tf in power_scores_by_tf:
+                    weekly_peaks_by_tf[tf] = await self.cache.get_weekly_peak_scores(tf)
+
                 # ── Send Report ──
                 if hits_to_send or power_scores_by_tf:
                     logging.info(
                         f"📤 Sending report: {len(hits_to_send)} touch hits, "
                         f"leaderboards for {len(power_scores_by_tf)} timeframe(s)..."
                     )
-                    await self.send_report(session, hits_to_send, power_scores_by_tf)
+                    await self.send_report(session, hits_to_send, power_scores_by_tf, weekly_peaks_by_tf)
                     logging.info("✅ Report sent successfully")
                 else:
                     logging.info("📭 No new hits or leaderboards to send")
