@@ -46,54 +46,19 @@ class Config:
     EMA_LENGTH: int = 34
     EMA_THRESHOLD_PCT: float = 5.5
     HOT_COINS_LIMIT: int = 60
+    VOLATILITY_LOOKBACK_HOURS: int = 100
 
-    UPPER_TOUCH_THRESHOLD: float = 0.035
-    LOWER_TOUCH_THRESHOLD: float = 0.035
-    MIDDLE_TOUCH_THRESHOLD: float = 0.035
-
-    # ── Touch threshold mode ──
-    # "percentage": current/default behavior. Tolerance is a % of the band's
-    #               own level (upper[idx] / lower[idx] / mid[idx]), further
-    #               scaled by the adaptive band-width multiplier below. This
-    #               means the effective RSI-point tolerance changes with both
-    #               where the band sits and how wide it currently is.
-    # "points":     tolerance is a flat number of RSI points (0-100 scale),
-    #               completely independent of band level and band width.
-    #               e.g. with MIDDLE_TOUCH_POINTS=1.5, a middle band at 34.0
-    #               and RSI at 35.5 is a hit — regardless of how wide the
-    #               bands are or where the middle band sits.
-    TOUCH_THRESHOLD_MODE: str = "points"  # "percentage" or "points"
-
-    UPPER_TOUCH_POINTS: float = 2.0
-    LOWER_TOUCH_POINTS: float = 2.0
-    MIDDLE_TOUCH_POINTS: float = 2.0
-
-    # ── Adaptive band-width threshold scaling (percentage mode only) ──
-    # The *_TOUCH_THRESHOLD values above are multiplied by a factor derived
-    # from how wide the RSI Bollinger Bands currently are (upper - lower),
-    # relative to a reference width. A wide band -> looser touch tolerance
-    # (up to ADAPTIVE_THRESHOLD_MAX_MULT). A narrow band -> tighter tolerance
-    # (down to ADAPTIVE_THRESHOLD_MIN_MULT). Set ADAPTIVE_THRESHOLD_ENABLED to
-    # False to disable scaling entirely (multiplier pinned at 1.0). Has no
-    # effect in "points" mode.
-    ADAPTIVE_THRESHOLD_ENABLED: bool = True
-    ADAPTIVE_THRESHOLD_MIN_MULT: float = 0.5
-    ADAPTIVE_THRESHOLD_MAX_MULT: float = 2.0
-
-    # ── Width reference: what counts as a "normal" band width ──
-    # "dynamic": each symbol/timeframe uses its OWN trailing median band
-    #            width (over BB_WIDTH_REFERENCE_LOOKBACK candles) as the
-    #            reference, so "normal" is relative to that specific coin's
-    #            recent behavior rather than one number applied to everything.
-    #            Falls back to the static value below during warm-up or if
-    #            fewer than BB_WIDTH_REFERENCE_MIN_SAMPLES history points
-    #            are available yet.
-    # "static":  always use BB_WIDTH_REFERENCE, unchanged for every symbol
-    #            and timeframe.
-    BB_WIDTH_REFERENCE_MODE: str = "dynamic"  # "dynamic" or "static"
-    BB_WIDTH_REFERENCE: float = 20.0
-    BB_WIDTH_REFERENCE_LOOKBACK: int = 20
-    BB_WIDTH_REFERENCE_MIN_SAMPLES: int = 5
+    # ── Touch tolerance ──
+    # Flat RSI-point tolerance zones — band level and band width play no
+    # role at all. E.g. UPPER_TOUCH_POINTS=3.5 means "within 3.5 RSI
+    # points of the upper band" no matter where that band sits or how
+    # wide it currently is. This is the only threshold mode the bot
+    # supports; the earlier percentage-of-band-width mode (with its
+    # adaptive multiplier and dynamic/static width reference) was removed
+    # entirely rather than kept as a disabled alternative.
+    UPPER_TOUCH_POINTS: float = 3.5
+    LOWER_TOUCH_POINTS: float = 3.5
+    MIDDLE_TOUCH_POINTS: float = 3.5
 
     # Number of lookback candles for middle band direction analysis
     MIDDLE_BAND_LOOKBACK: int = 5
@@ -1272,74 +1237,16 @@ def classify_middle_band_direction(
                 return "bearish"
 
 
-def compute_width_reference(upper: np.ndarray, lower: np.ndarray, idx: int) -> float:
-    """
-    Determine the "normal" band-width reference used to scale both the
-    adaptive multiplier and the touch zones themselves.
-
-    "static": always CONFIG.BB_WIDTH_REFERENCE — one fixed number applied
-              to every symbol and timeframe alike.
-    "dynamic": this specific symbol/timeframe's OWN trailing median band
-               width over CONFIG.BB_WIDTH_REFERENCE_LOOKBACK candles,
-               excluding the current (still-forming) candle so the
-               reference isn't influenced by the very touch it's judging.
-               Falls back to the static value if fewer than
-               BB_WIDTH_REFERENCE_MIN_SAMPLES valid historical points are
-               available (e.g. during warm-up on a freshly listed symbol).
-
-    Note: with typical CANDLE_LIMIT/BB_LENGTH settings, RSI+BBANDS warm-up
-    consumes most of the fetched history, so the "dynamic" lookback window
-    is usually short (a handful of points) rather than deep history. It's
-    still specific to this symbol and timeframe, just not a long baseline.
-    """
-    if CONFIG.BB_WIDTH_REFERENCE_MODE != "dynamic":
-        return CONFIG.BB_WIDTH_REFERENCE
-
-    pos_idx = len(upper) + idx if idx < 0 else idx
-    start = max(0, pos_idx - CONFIG.BB_WIDTH_REFERENCE_LOOKBACK)
-    hist_width = upper[start:pos_idx] - lower[start:pos_idx]
-    hist_width = hist_width[~np.isnan(hist_width)]
-
-    if hist_width.size < CONFIG.BB_WIDTH_REFERENCE_MIN_SAMPLES:
-        return CONFIG.BB_WIDTH_REFERENCE
-
-    return float(np.median(hist_width))
-
-
-def compute_adaptive_multiplier(band_width: float, width_reference: float) -> float:
-    """
-    Map the current RSI-BB band width to a touch-threshold scaling factor,
-    relative to width_reference (this symbol/timeframe's own typical width
-    in "dynamic" mode, or the fixed CONFIG.BB_WIDTH_REFERENCE in "static"
-    mode — see compute_width_reference).
-
-    Wider-than-reference bands (e.g. during volatile regimes) need a
-    proportionally larger tolerance to sensibly call something a "touch";
-    narrower-than-reference bands should use a tighter tolerance so touches
-    stay meaningful. The multiplier is linear in band_width / width_reference
-    and clamped to [ADAPTIVE_THRESHOLD_MIN_MULT, ADAPTIVE_THRESHOLD_MAX_MULT].
-    """
-    if not CONFIG.ADAPTIVE_THRESHOLD_ENABLED or width_reference <= 0:
-        return 1.0
-    raw_mult = band_width / width_reference
-    return min(
-        max(raw_mult, CONFIG.ADAPTIVE_THRESHOLD_MIN_MULT),
-        CONFIG.ADAPTIVE_THRESHOLD_MAX_MULT,
-    )
-
-
 def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[str], float]:
     """
     Check if the RSI Bollinger Band touch condition is met.
 
-    Two threshold modes, controlled by CONFIG.TOUCH_THRESHOLD_MODE:
-      - "percentage": tolerance is a % of a shared width_reference (this
-        symbol/timeframe's own typical band width in "dynamic" mode, or
-        CONFIG.BB_WIDTH_REFERENCE in "static" mode), further scaled by how
-        wide the band currently is relative to that same reference. Zones
-        are symmetric regardless of where RSI currently sits.
-      - "points": tolerance is a flat number of RSI points (0-100 scale),
-        independent of band level and band width entirely.
+    Tolerance is a flat number of RSI points (0-100 scale) — see
+    CONFIG.UPPER_TOUCH_POINTS / LOWER_TOUCH_POINTS / MIDDLE_TOUCH_POINTS —
+    independent of band level and band width entirely. This is the only
+    threshold mode the bot supports; an earlier percentage-of-band-width
+    mode (with an adaptive multiplier and a dynamic/static width
+    reference) has been removed.
 
     Returns:
         (touch_type, direction, rsi_value)
@@ -1369,28 +1276,9 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
     curr_rsi = rsi[idx]
     mid_val = mid[idx]
 
-    if CONFIG.TOUCH_THRESHOLD_MODE == "points":
-        # Flat RSI-point tolerance zones — band level and band width play no
-        # role at all. E.g. UPPER_TOUCH_POINTS=2 means "within 2 RSI points
-        # of the upper band" no matter where that band sits or how wide it is.
-        upper_zone = CONFIG.UPPER_TOUCH_POINTS
-        lower_zone = CONFIG.LOWER_TOUCH_POINTS
-        middle_zone = CONFIG.MIDDLE_TOUCH_POINTS
-    else:
-        # Percentage mode: tolerance is a % of a shared width_reference (not
-        # the band's own level, which would make upper/lower/middle zones
-        # asymmetric depending on where RSI currently sits), further scaled
-        # by how wide the band is relative to that same reference.
-        band_width = upper[idx] - lower[idx]
-        width_reference = compute_width_reference(upper, lower, idx)
-        adaptive_mult = (
-            compute_adaptive_multiplier(band_width, width_reference)
-            if not np.isnan(band_width) and band_width > 0
-            else 1.0
-        )
-        upper_zone = width_reference * CONFIG.UPPER_TOUCH_THRESHOLD * adaptive_mult
-        lower_zone = width_reference * CONFIG.LOWER_TOUCH_THRESHOLD * adaptive_mult
-        middle_zone = width_reference * CONFIG.MIDDLE_TOUCH_THRESHOLD * adaptive_mult
+    upper_zone = CONFIG.UPPER_TOUCH_POINTS
+    lower_zone = CONFIG.LOWER_TOUCH_POINTS
+    middle_zone = CONFIG.MIDDLE_TOUCH_POINTS
 
     # Check upper band touch
     if curr_rsi >= upper[idx] - upper_zone:
@@ -1720,7 +1608,12 @@ class RsiBot:
                     session, tf, power_scores_by_tf[tf], weekly_peaks_by_tf.get(tf, {}), ts_footer
                 )
 
-    def _format_power_board_section(self, label: str, rows: List[Tuple[str, float, bool]]) -> str:
+    def _format_power_board_section(
+        self,
+        label: str,
+        rows: List[Tuple[str, float, bool]],
+        show_hot_marker: bool = True,
+    ) -> str:
         """
         Build one ranked section (header line + numbered rows) for the
         power-leaderboard message. Takes plain (symbol, score, hot) tuples
@@ -1728,11 +1621,17 @@ class RsiBot:
         no PowerScore to draw from (its score comes from a Redis hash, not
         a fresh scan) — the general and volatile sections just unpack
         their PowerScore lists into the same tuple shape before calling in.
+
+        show_hot_marker=False suppresses the 🔥 marker for the whole
+        section regardless of each row's hot value — used for the
+        VOLATILE and 7D PEAK sections, where every row is already known
+        to be volatile by construction, so printing 🔥 on every single
+        line would just repeat what the section header already says.
         """
         lines = [label]
         for rank, (symbol, score, hot) in enumerate(rows, start=1):
             sym = clean_name(symbol)
-            hot_marker = " 🔥" if hot else ""
+            hot_marker = " 🔥" if (show_hot_marker and hot) else ""
             lines.append(f"{rank:>2}. {sym:<6}{score:+6.2f}{hot_marker}")
         return "\n".join(lines)
 
@@ -1750,22 +1649,22 @@ class RsiBot:
         message(s) (see the caller, send_report). One message, three
         sections:
           - all symbols scored THIS cycle, ranked, capped at
-            POWER_LEADERBOARD_SIZE
+            POWER_LEADERBOARD_SIZE. Mixed hot/not-hot, so each row still
+            carries its own 🔥 marker here — it's the only section where
+            that marker actually distinguishes rows from each other.
           - symbols already flagged 🔥 by hot_coins_for_timeframe, ranked
             within just that pool (not sliced from the section above),
-            capped at POWER_LEADERBOARD_HOT_SIZE
+            capped at POWER_LEADERBOARD_HOT_SIZE. No per-row marker — the
+            section header already says VOLATILE.
           - rolling ~7-day peak score per symbol for this timeframe,
             among the MOST VOLATILE coins only (weekly_peaks, from
             CacheManager.get_weekly_peak_scores — that's what
             record_power_scores restricts itself to recording; already
             includes THIS cycle's hot scores, since record_power_scores
             is called before this is read), capped at
-            POWER_LEADERBOARD_WEEKLY_SIZE. The 🔥 marker on this section
-            reflects CURRENT volatility status, not necessarily the
-            symbol's status on the day its peak actually happened — a
-            week-old peak on a now-cooled-off coin still gets ranked
-            (it earned its spot in the bucket while it WAS hot), just
-            without the fire today.
+            POWER_LEADERBOARD_WEEKLY_SIZE. No per-row marker either, same
+            reasoning — every entry only got into this bucket by having
+            been hot on some contributing day.
 
         All three caps are small and fixed (20 rows apiece by default), so
         the combined message stays well under Telegram's 4096-char limit —
@@ -1779,7 +1678,6 @@ class RsiBot:
         hot_pool = [s for s in scores if s.hot]
         volatile_top = sorted(hot_pool, key=lambda s: s.score, reverse=True)[:CONFIG.POWER_LEADERBOARD_HOT_SIZE]
 
-        hot_symbols_now = {s.symbol for s in scores if s.hot}
         weekly_top = sorted(weekly_peaks.items(), key=lambda kv: kv[1], reverse=True)[:CONFIG.POWER_LEADERBOARD_WEEKLY_SIZE]
 
         if not general_top and not volatile_top and not weekly_top:
@@ -1791,10 +1689,14 @@ class RsiBot:
             sections.append(self._format_power_board_section(f"⚡ TOP {len(rows)}", rows))
         if volatile_top:
             rows = [(s.symbol, s.score, s.hot) for s in volatile_top]
-            sections.append(self._format_power_board_section(f"🔥 TOP {len(rows)} VOLATILE", rows))
+            sections.append(self._format_power_board_section(f"🔥 TOP {len(rows)} VOLATILE", rows, show_hot_marker=False))
         if weekly_top:
-            rows = [(sym, peak, sym in hot_symbols_now) for sym, peak in weekly_top]
-            sections.append(self._format_power_board_section(f"🏆 TOP {len(rows)} — 7D PEAK (VOLATILE)", rows))
+            # Third tuple field (hot) is irrelevant here since the marker
+            # is suppressed for this section anyway — every symbol that
+            # made it into weekly_peaks was hot on at least one
+            # contributing day by construction (record_power_scores).
+            rows = [(sym, peak, True) for sym, peak in weekly_top]
+            sections.append(self._format_power_board_section(f"🏆 TOP {len(rows)} — 7D PEAK (VOLATILE)", rows, show_hot_marker=False))
 
         window = power_leaderboard_window_for_timeframe(tf)
         header = f"⚡ <b>{tf} Power Leaderboard</b> (last {window} candles)\n"
@@ -1970,8 +1872,12 @@ class RsiBot:
                             # just EMA survivors) so EMA-exempt timeframes,
                             # which scan the full universe, can still mark
                             # 🔥 hot coins among symbols that never passed
-                            # the trend filter.
-                            v = calculate_volatility(h_closes[-48:])
+                            # the trend filter. Lookback window is
+                            # CONFIG.VOLATILITY_LOOKBACK_HOURS (100h) —
+                            # comfortably covered by required_hours (816h)
+                            # from the gate just above, so this slice is
+                            # always full, never partial.
+                            v = calculate_volatility(h_closes[-CONFIG.VOLATILITY_LOOKBACK_HOURS:])
                             if v > 0:
                                 vol_scores[sym] = v
 
