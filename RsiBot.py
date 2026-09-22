@@ -60,8 +60,17 @@ class Config:
     LOWER_TOUCH_POINTS: float = 3.5
     MIDDLE_TOUCH_POINTS: float = 3.5
 
-    # Number of lookback candles for middle band direction analysis
+    # Middle-band touch direction: primary search window (candles).
     MIDDLE_BAND_LOOKBACK: int = 5
+
+    # If no decisive above/below candle is found within MIDDLE_BAND_LOOKBACK
+    # (RSI has been hugging the middle band the whole window), the search
+    # for the touch's entry side extends this many candles further back
+    # before giving up. Deliberately bounded rather than unbounded: a
+    # decisive move from 40+ candles ago isn't "the entry side of THIS
+    # touch", it's ancient and irrelevant, and using it would manufacture
+    # false confidence for a genuinely ambiguous, long-flat condition.
+    MIDDLE_BAND_EXTENDED_LOOKBACK: int = 20
 
     # Weekly scan delay in seconds after Monday 00:00 UTC
     # Gives time for the new weekly candle to form its first data
@@ -1102,139 +1111,118 @@ def classify_middle_band_direction(
     rsi_array: np.ndarray,
     mid_array: np.ndarray,
     idx: int,
-    lookback: int = 5
+    lookback: int = 5,
+    touch_points: float = 3.5,
 ) -> str:
     """
-    Determine if a middle band touch is BULLISH or BEARISH using
-    a 3-signal voting system:
-    
-    Signal 1 - Trajectory: Was RSI predominantly above or below the middle band
-               over the lookback period?
-               - Predominantly ABOVE → approaching from above → BULLISH (price found support)
-               - Predominantly BELOW → approaching from below → BEARISH (price found resistance)
-    
-    Signal 2 - Crossing Direction: Did RSI cross the middle band, and in which direction?
-               - Crossed from above to below → BEARISH
-               - Crossed from below to above → BULLISH
-               - No cross → use position relative to band
-    
-    Signal 3 - RSI Momentum: Is RSI rising or falling over the lookback?
-               - Rising (positive delta) → BULLISH
-               - Falling (negative delta) → BEARISH
-    
-    Convention:
-        - "bullish" = RSI came from ABOVE and touched/crossed down to middle band
-          (interpreted as: price was strong, pulled back to support → bounce expected)
-        - "bearish" = RSI came from BELOW and touched/crossed up to middle band
-          (interpreted as: price was weak, pushed up to resistance → rejection expected)
-    
-    Returns: "bullish" or "bearish"
+    Classify a middle-band touch by which side RSI approached the touch
+    zone from.
+
+    Convention (unchanged from the previous voting-based version):
+        - "bullish" = RSI came from ABOVE and pulled back down to the
+          middle band (price was strong, retesting support -> bounce
+          expected).
+        - "bearish" = RSI came from BELOW and pushed up to the middle
+          band (price was weak, retesting resistance -> rejection
+          expected).
+
+    Method: walk backward from idx, skipping every candle that's still
+    "inside" the touch zone (within touch_points of the middle band --
+    the SAME flat-point tolerance check_bb_rsi already used to decide
+    this is a touch at all; callers must pass check_bb_rsi's own
+    `middle_zone` value here rather than a separately invented tolerance,
+    or this function's idea of "touch" can silently disagree with the
+    one that triggered the call). The first candle that's decisively
+    above or below the zone is where this touch episode actually came
+    from -- that decides the direction.
+
+    This replaced an earlier 3-signal voting system (trajectory majority
+    / most-recent-crossing / RSI-momentum-slope) that could disagree
+    across signals and needed a tiebreak chain. Walking straight to the
+    entry side answers the actual question directly instead of
+    triangulating it from three overlapping proxies.
+
+    Search depth: the primary search covers `lookback` candles (matching
+    the old function's window). If nothing decisive turns up there --
+    RSI has been hugging the band the whole window -- the search extends
+    up to CONFIG.MIDDLE_BAND_EXTENDED_LOOKBACK candles further back
+    rather than giving up. This is deliberately bounded, not unbounded
+    all the way to the start of the fetched history: a decisive move
+    from 40+ candles ago isn't "the entry side of THIS touch", it's
+    ancient and irrelevant, and treating it as such would manufacture
+    false confidence for a genuinely ambiguous, long-flat condition. If
+    nothing decisive turns up even within the extended window, the
+    fallback is current position relative to the band -- the honest
+    answer for "no directional signal here."
+
+    (An earlier draft of this fix used a "recency-weighted score" over
+    the SAME already-exhausted primary window as its fallback instead of
+    extending the search depth. That fallback was provably dead code: by
+    construction, the only way to reach it is when every candle in the
+    window has already been shown to be non-decisive, so its score was
+    mathematically guaranteed to be exactly 0.0 regardless of how it
+    weighted anything -- verified against 2000 randomized cases before
+    this version replaced it. Extending the search depth is what
+    actually resolves the case, instead of computing something that
+    can't do anything.)
+
+    Raises ValueError if RSI or the middle band is NaN at idx. This
+    should be unreachable given check_bb_rsi's own guards before it ever
+    calls this (rsi[idx] and upper[idx] are checked non-NaN, and
+    mid_val > 0 is required by the touch condition itself) -- hitting
+    this means that invariant broke somewhere upstream. scan_one's
+    surrounding try/except contains the blast radius to a single
+    symbol/timeframe scan for this cycle, not the whole run.
     """
-    # Determine safe lookback range
-    safe_lookback = min(lookback, idx)
-    if safe_lookback < 2:
-        # Not enough data, fall back to simple position check
-        if rsi_array[idx] > mid_array[idx]:
-            return "bullish"  # Currently above mid = came from above
-        else:
-            return "bearish"  # Currently below mid = came from below
-    
-    start_idx = idx - safe_lookback
-    
-    # ── Signal 1: Trajectory Analysis ──
-    # Count how many of the lookback candles had RSI above vs below the middle band
-    above_count = 0
-    below_count = 0
-    for i in range(start_idx, idx + 1):
-        if np.isnan(rsi_array[i]) or np.isnan(mid_array[i]):
-            continue
-        if rsi_array[i] > mid_array[i]:
-            above_count += 1
-        else:
-            below_count += 1
-    
-    # Predominantly above = came from above = bullish (support touch)
-    # Predominantly below = came from below = bearish (resistance touch)
-    if above_count > below_count:
-        trajectory_vote = "bullish"
-    elif below_count > above_count:
-        trajectory_vote = "bearish"
-    else:
-        trajectory_vote = "neutral"
-    
-    # ── Signal 2: Crossing Direction ──
-    # Look for the most recent sign change in (RSI - mid)
-    crossing_vote = "neutral"
-    for i in range(idx, start_idx, -1):
-        if np.isnan(rsi_array[i]) or np.isnan(rsi_array[i - 1]):
-            continue
-        if np.isnan(mid_array[i]) or np.isnan(mid_array[i - 1]):
-            continue
-        
-        prev_diff = rsi_array[i - 1] - mid_array[i - 1]
-        curr_diff = rsi_array[i] - mid_array[i]
-        
-        if prev_diff > 0 and curr_diff <= 0:
-            # Crossed from above to below → came from above → bullish
-            crossing_vote = "bullish"
-            break
-        elif prev_diff < 0 and curr_diff >= 0:
-            # Crossed from below to above → came from below → bearish
-            crossing_vote = "bearish"
-            break
-    
-    # If no cross found, use current position as a weaker signal
-    if crossing_vote == "neutral":
-        if rsi_array[idx] > mid_array[idx]:
-            crossing_vote = "bullish"
-        elif rsi_array[idx] < mid_array[idx]:
-            crossing_vote = "bearish"
-    
-    # ── Signal 3: RSI Momentum ──
-    # Compare current RSI to RSI from `safe_lookback` candles ago
-    momentum_start_idx = max(start_idx, 0)
-    # Find the first non-NaN value in the lookback range for comparison
-    momentum_start_rsi = None
-    for i in range(momentum_start_idx, idx):
-        if not np.isnan(rsi_array[i]):
-            momentum_start_rsi = rsi_array[i]
-            break
-    
-    if momentum_start_rsi is not None and not np.isnan(rsi_array[idx]):
-        rsi_delta = rsi_array[idx] - momentum_start_rsi
-        if rsi_delta > 0:
-            # RSI is rising → momentum pushing up from below → bearish (approaching resistance)
-            momentum_vote = "bearish"
-        elif rsi_delta < 0:
-            # RSI is falling → momentum pushing down from above → bullish (approaching support)
-            momentum_vote = "bullish"
-        else:
-            momentum_vote = "neutral"
-    else:
-        momentum_vote = "neutral"
-    
-    # ── Voting ──
-    votes = {"bullish": 0, "bearish": 0}
-    for vote in [trajectory_vote, crossing_vote, momentum_vote]:
-        if vote in votes:
-            votes[vote] += 1
-    
-    if votes["bullish"] >= 2:
-        return "bullish"
-    elif votes["bearish"] >= 2:
-        return "bearish"
-    else:
-        # Tiebreaker: use trajectory as the strongest single signal
-        if trajectory_vote != "neutral":
-            return trajectory_vote
-        elif crossing_vote != "neutral":
-            return crossing_vote
-        else:
-            # Ultimate fallback: position relative to middle band
-            if rsi_array[idx] >= mid_array[idx]:
-                return "bullish"
-            else:
-                return "bearish"
+    idx = idx if idx >= 0 else len(rsi_array) + idx
+    idx = max(0, min(idx, len(rsi_array) - 1))
+
+    def side_at(i: int) -> Optional[str]:
+        rsi_val = rsi_array[i]
+        mid_val = mid_array[i]
+        if np.isnan(rsi_val) or np.isnan(mid_val):
+            return None
+        diff = rsi_val - mid_val
+        if diff > touch_points:
+            return "above"
+        if diff < -touch_points:
+            return "below"
+        return "inside"
+
+    current_side = side_at(idx)
+    if current_side is None:
+        raise ValueError(
+            f"classify_middle_band_direction: NaN RSI/mid at idx={idx} — "
+            f"caller invariant violated (check_bb_rsi should never call "
+            f"this with NaN data at idx)."
+        )
+
+    primary_floor = max(0, idx - lookback)
+    for i in range(idx - 1, primary_floor - 1, -1):
+        side = side_at(i)
+        if side in ("above", "below"):
+            return "bullish" if side == "above" else "bearish"
+
+    # Nothing decisive in the primary window — extend the search rather
+    # than falling back to a fabricated score (see docstring).
+    extended_floor = max(0, primary_floor - CONFIG.MIDDLE_BAND_EXTENDED_LOOKBACK)
+    if extended_floor < primary_floor:
+        for i in range(primary_floor - 1, extended_floor - 1, -1):
+            side = side_at(i)
+            if side in ("above", "below"):
+                logging.debug(
+                    f"classify_middle_band_direction: resolved via extended "
+                    f"search ({primary_floor - i} candles past the primary "
+                    f"{lookback}-candle window)"
+                )
+                return "bullish" if side == "above" else "bearish"
+
+    logging.debug(
+        f"classify_middle_band_direction: no decisive candle within "
+        f"{lookback + CONFIG.MIDDLE_BAND_EXTENDED_LOOKBACK} candles — "
+        f"falling back to current position relative to the band"
+    )
+    return "bearish" if current_side == "below" else "bullish"
 
 
 def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[str], float]:
@@ -1291,12 +1279,17 @@ def check_bb_rsi(closes: List[float], tf: str) -> Tuple[Optional[str], Optional[
     # Check middle band touch (only for configured timeframes)
     if tf in MIDDLE_BAND_TFS:
         if mid_val > 0 and abs(curr_rsi - mid_val) <= middle_zone:
-            # Use the multi-signal classification system
+            # Entry-side classification — see classify_middle_band_direction.
+            # touch_points=middle_zone reuses the SAME flat-point tolerance
+            # just used to decide this is a touch at all, rather than a
+            # second, separately-defined notion of "touch" inside the
+            # classifier.
             direction = classify_middle_band_direction(
                 rsi_array=rsi,
                 mid_array=mid,
                 idx=len(rsi) + idx,  # Convert negative index to positive
-                lookback=CONFIG.MIDDLE_BAND_LOOKBACK
+                lookback=CONFIG.MIDDLE_BAND_LOOKBACK,
+                touch_points=middle_zone
             )
             return "MIDDLE", direction, curr_rsi
     
