@@ -56,9 +56,9 @@ class Config:
     # supports; the earlier percentage-of-band-width mode (with its
     # adaptive multiplier and dynamic/static width reference) was removed
     # entirely rather than kept as a disabled alternative.
-    UPPER_TOUCH_POINTS: float = 3.5
-    LOWER_TOUCH_POINTS: float = 3.5
-    MIDDLE_TOUCH_POINTS: float = 3.5
+    UPPER_TOUCH_POINTS: float = 2.5
+    LOWER_TOUCH_POINTS: float = 2.5
+    MIDDLE_TOUCH_POINTS: float = 2.5
 
     # Middle-band touch direction: primary search window (candles).
     MIDDLE_BAND_LOOKBACK: int = 5
@@ -76,11 +76,34 @@ class Config:
     # Gives time for the new weekly candle to form its first data
     WEEKLY_SCAN_DELAY: int = 1800  # 30 minutes
 
+    # Static, always-on ignore list (full symbols, e.g. "USDCUSDT"). Merged
+    # with the remote list below at the start of every run.
     IGNORED_SYMBOLS: Set[str] = field(default_factory=lambda: {
         "USDPUSDT", "USD1USDT", "TUSDUSDT", "AEURUSDT", "USDCUSDT", "EURUSDT", "USDYUSDT", "PYUSDUSDT",
         "USDEUSDT", "USDDUSDT", "BFUSDUSDT", "BTTCUSDT", "XUSDUSDT", "RLUSDUSDT", "FDUSDUSDT", "USDSUSDT",
         "UUSDT"
     })
+
+    # ── Remote ignore list ──
+    # A plain-text list, ONE FULL SYMBOL PER LINE (e.g. "AAPLUSDT" — the
+    # same format as IGNORED_SYMBOLS above). Fetched directly (NOT through
+    # the proxy pool) at the start of every run and merged with
+    # IGNORED_SYMBOLS. Set the URL to "" to disable the remote list.
+    #
+    # Matching is EXACT on the full symbol — deliberately no base-asset or
+    # "1000x"-prefix guessing. The list names specific contracts, and
+    # stripping prefixes would let an entry like "CATUSDT" also knock out
+    # an unrelated "1000…" contract that merely shares the same base name.
+    #
+    # If the fetch fails (after IGNORED_SYMBOLS_RETRIES attempts), the bot
+    # falls back to the last successfully fetched copy stored in Redis,
+    # and only if there is none of those either, to IGNORED_SYMBOLS alone.
+    # An empty or non-list response (e.g. an HTML error page) counts as a
+    # failed fetch, not as "the list is now empty" — to genuinely stop
+    # using the remote list, set the URL to "".
+    IGNORED_SYMBOLS_URL: str = "https://pumpora.duckdns.org/api/ignored-symbols?format=txt"
+    IGNORED_SYMBOLS_TIMEOUT: int = 10
+    IGNORED_SYMBOLS_RETRIES: int = 3
 
     # ── Overall run watchdog ──
     # Hard ceiling on total execution time for one bot.run() call, as a
@@ -140,6 +163,33 @@ class Config:
     # symbol's listing date.
     CANDLE_FETCH_SAFETY_MARGIN: int = 10
 
+    # ── RSI Flip Scan (higher-timeframe breakout → retest) ──
+    # A "flip" is a two-candle pattern on the RSI itself:
+    #   1. candle N-1 (the candle before the last completed one): RSI
+    #      CLOSED ABOVE a reference line;
+    #   2. candle N (the last completed candle): RSI closed back ON that
+    #      same line — within a tolerance, on either side — i.e. the line
+    #      that was just broken is being retested.
+    # Coins often do this right before a strong expansion, so flips are
+    # reported as their own sections at the TOP of that timeframe's
+    # Telegram message.
+    #
+    # Reference lines:
+    #   - The RSI-BB UPPER band (always, whenever FLIP_ENABLED). Tolerance
+    #     is UPPER_TOUCH_POINTS — the same one upper-band touch hits use.
+    #   - Fixed RSI key levels (FLIP_KEY_LEVELS, e.g. 70 / 50 / 30) —
+    #     OPTIONAL: switch off with FLIP_KEY_LEVELS_ENABLED. Tolerance is
+    #     FLIP_LEVEL_TOUCH_POINTS. Edit the list to add/remove levels.
+    #
+    # Only timeframes in FLIP_TFS are checked. Costs no extra API calls —
+    # it runs on the closes already fetched for the touch scan. Add '4h'
+    # or '1h' here if you ever want flips on faster timeframes too.
+    FLIP_ENABLED: bool = True
+    FLIP_TFS: Set[str] = field(default_factory=lambda: {'1w', '1d'})
+    FLIP_KEY_LEVELS_ENABLED: bool = True
+    FLIP_KEY_LEVELS: List[float] = field(default_factory=lambda: [70.0, 50.0, 30.0])
+    FLIP_LEVEL_TOUCH_POINTS: float = 1.5
+
 CONFIG = Config()
 
 TIMEFRAME_MINUTES = {
@@ -189,6 +239,10 @@ class TouchHit:
     market: str   
     timeframe: str
     rsi: float
+    # "UPPER" / "MIDDLE" / "LOWER" for touch hits. RSI flip hits reuse this
+    # same model (so they ride the existing scan cache and send pipeline
+    # unchanged) with touch_type "FLIP_UPPER" or "FLIP_<level>" (e.g.
+    # "FLIP_70") — see check_rsi_flips.
     touch_type: str
     direction: str = ""   # "bullish" or "bearish" for middle band hits
     hot: bool = False
@@ -672,8 +726,41 @@ class CacheManager:
         await self.redis.set("bb_bot:symbols_cache_v3", json.dumps(payload))
         logging.info("💾 Saved symbol list to cache (Persistent)")
 
+    # ── Remote ignore list: last-known-good copy ──
+    # Only read when a live fetch of CONFIG.IGNORED_SYMBOLS_URL fails (see
+    # RsiBot.load_ignored_symbols), so a flaky or offline ignore-list
+    # server doesn't suddenly flood the report with symbols that were
+    # being filtered out until yesterday. No TTL on purpose: a stale list
+    # is a better fallback than no list.
+
+    _IGNORED_SYMBOLS_KEY = "bb_bot:ignored_symbols_v1"
+
+    async def get_cached_ignored_symbols(self) -> Optional[List[str]]:
+        if not self.redis: return None
+        try:
+            data = await self.redis.get(self._IGNORED_SYMBOLS_KEY)
+            if not data: return None
+            symbols = json.loads(data).get("symbols")
+            return list(symbols) if isinstance(symbols, list) else None
+        except Exception:
+            return None
+
+    async def save_cached_ignored_symbols(self, symbols: List[str]):
+        if not self.redis: return
+        try:
+            await self.redis.set(
+                self._IGNORED_SYMBOLS_KEY,
+                json.dumps({"timestamp": time.time(), "symbols": sorted(symbols)})
+            )
+        except Exception:
+            pass
+
+    # Scan-result cache key. "v2" because scan results now also carry RSI
+    # flip hits (touch_type FLIP_*): a v1 entry written by the previous
+    # version of the bot for the current candle has no flips in it, and
+    # reusing it would silently report "no flips" for that candle.
     def _scan_key(self, tf: str, candle_key: int) -> str:
-        return f"bb_touch:scan:{tf}:{candle_key}"
+        return f"bb_touch:scan:v2:{tf}:{candle_key}"
 
     async def get_scan_results(self, tf: str, candle_key: int) -> Optional[List[Dict]]:
         if not self.redis: return None
@@ -1335,15 +1422,160 @@ def compute_power_score(closes: List[float], window: int) -> Optional[float]:
 
     return float(np.mean(window_rsi - window_upper))
 
+
+# ==========================================
+# RSI FLIP DETECTION (breakout → retest)
+# ==========================================
+
+FLIP_UPPER_KEY = "FLIP_UPPER"
+
+
+def flip_key_for_level(level: float) -> str:
+    """touch_type / section key for a fixed-RSI-level flip: 70.0 -> 'FLIP_70'."""
+    return f"FLIP_{level:g}"
+
+
+def detect_rsi_flips(
+    rsi: np.ndarray,
+    upper: np.ndarray,
+    upper_tol: float,
+    key_levels: List[float],
+    level_tol: float,
+) -> List[Tuple[str, float]]:
+    """
+    Pure detection step (arrays in, list out — no TA-Lib, no config reads,
+    so it can be tested directly against hand-built RSI/band arrays).
+
+    Uses the same candle convention as check_bb_rsi / compute_power_score:
+    index -2 is the last COMPLETED candle (the forming candle at -1 is
+    never looked at), and -3 is the completed candle before it.
+
+    A flip on a reference line = BOTH of:
+      - RSI closed ABOVE the line on candle -3 (strictly above; for the
+        upper band, compared against the band's own value on that same
+        candle, since the band moves from candle to candle);
+      - RSI closed ON the line on candle -2: |rsi - line| <= tolerance,
+        on either side (a retest that dips a little under the line still
+        counts, and so does one that holds a little above it).
+
+    Returns [(flip_key, rsi_now), ...] — possibly several, e.g. an upper
+    band flip and a 70-level flip can both fire for the same candle.
+    Returns [] if there's too little data or either candle's RSI is NaN.
+    A NaN band value only disables the upper-band flip; fixed levels
+    don't depend on the band.
+    """
+    if len(rsi) < 3 or len(upper) < 3:
+        return []
+
+    rsi_prev, rsi_now = rsi[-3], rsi[-2]
+    if np.isnan(rsi_prev) or np.isnan(rsi_now):
+        return []
+
+    flips: List[Tuple[str, float]] = []
+
+    up_prev, up_now = upper[-3], upper[-2]
+    if not (np.isnan(up_prev) or np.isnan(up_now)):
+        if rsi_prev > up_prev and abs(rsi_now - up_now) <= upper_tol:
+            flips.append((FLIP_UPPER_KEY, float(rsi_now)))
+
+    for level in key_levels:
+        if rsi_prev > level and abs(rsi_now - level) <= level_tol:
+            flips.append((flip_key_for_level(level), float(rsi_now)))
+
+    return flips
+
+
+def check_rsi_flips(closes: List[float], tf: str) -> List[Tuple[str, float]]:
+    """
+    Config-aware wrapper around detect_rsi_flips: returns [] unless flips
+    are enabled and `tf` is in CONFIG.FLIP_TFS. Key-level flips are only
+    included when CONFIG.FLIP_KEY_LEVELS_ENABLED. The upper-band flip uses
+    CONFIG.UPPER_TOUCH_POINTS as its tolerance — deliberately the same
+    value the bot already uses for upper-band touch hits, not a second
+    separately-tuned number.
+
+    Runs on the same closes already fetched for check_bb_rsi (no extra
+    API call).
+    """
+    if not CONFIG.FLIP_ENABLED or tf not in CONFIG.FLIP_TFS:
+        return []
+    if len(closes) < CONFIG.MIN_CANDLES:
+        return []
+
+    np_c = np.array(closes, dtype=float)
+    rsi = talib.RSI(np_c, timeperiod=CONFIG.RSI_PERIOD)
+    upper, _mid, _lower = talib.BBANDS(
+        rsi,
+        timeperiod=CONFIG.BB_LENGTH,
+        nbdevup=CONFIG.BB_STDDEV,
+        nbdevdn=CONFIG.BB_STDDEV,
+        matype=0
+    )
+
+    key_levels = CONFIG.FLIP_KEY_LEVELS if CONFIG.FLIP_KEY_LEVELS_ENABLED else []
+    return detect_rsi_flips(
+        rsi,
+        upper,
+        upper_tol=CONFIG.UPPER_TOUCH_POINTS,
+        key_levels=key_levels,
+        level_tol=CONFIG.FLIP_LEVEL_TOUCH_POINTS,
+    )
+
 # ==========================================
 # MAIN BOT
 # ==========================================
 
+# Same multiplier-prefix pattern clean_name has always used, hoisted so the
+# display name cleanup lives in exactly one place.
+_MULTIPLIER_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])")
+
+# A plausible exchange symbol: letters/digits only. Used to sanity-check
+# lines of the remote ignore list.
+_SYMBOL_TOKEN_RE = re.compile(r"^[A-Z0-9]{2,40}$")
+
+
 def clean_name(s: str) -> str:
     """Clean symbol name: remove USDT suffix and common prefixes, cap at 6 chars."""
     s = s.replace("USDT", "")
-    s = re.sub(r"^(1000000|100000|10000|1000|100|10|1M)(?=[A-Z])", "", s)
+    s = _MULTIPLIER_PREFIX_RE.sub("", s)
     return s[:6]
+
+
+def parse_ignored_symbols(text: str) -> Optional[Set[str]]:
+    """
+    Parse the remote ignore list: one FULL symbol per line (e.g.
+    "AAPLUSDT"). Blank lines and '#' comment lines are skipped; each entry
+    is stripped and upper-cased. Entries are kept exactly as given — no
+    suffix stripping or prefix guessing (see CONFIG.IGNORED_SYMBOLS_URL).
+
+    Returns None — NOT an empty set — when the payload can't be trusted as
+    a symbol list: it looks like HTML (an error page, captive portal...),
+    it's empty, or it has content but not a single line that looks like a
+    symbol. The caller treats None as a failed fetch and falls back to the
+    last good copy, rather than reading "garbage" or "nothing" as "ignore
+    nothing" — which would silently un-ignore everything.
+
+    Individual lines that don't look like a symbol (spaces, punctuation,
+    slashes...) are dropped with a warning; the rest of the list is still
+    used.
+    """
+    if text.lstrip().startswith("<"):
+        return None
+
+    symbols: Set[str] = set()
+    dropped = 0
+    for line in text.splitlines():
+        token = line.strip().upper()
+        if not token or token.startswith("#"):
+            continue
+        if _SYMBOL_TOKEN_RE.match(token):
+            symbols.add(token)
+        else:
+            dropped += 1
+
+    if dropped:
+        logging.warning(f"⚠️ Ignore list: dropped {dropped} line(s) that don't look like symbols")
+    return symbols if symbols else None
 
 
 class RsiBot:
@@ -1356,6 +1588,84 @@ class RsiBot:
             request_timeout=CONFIG.REQUEST_TIMEOUT,
             validation_timeout=4.0
         )
+        # Static list until load_ignored_symbols() merges the remote one in
+        # at the start of run().
+        self.ignored_symbols: Set[str] = set(CONFIG.IGNORED_SYMBOLS)
+
+    async def fetch_remote_ignored_symbols(self, session: aiohttp.ClientSession) -> Optional[Set[str]]:
+        """
+        Fetch CONFIG.IGNORED_SYMBOLS_URL directly (no proxy — it's the
+        operator's own endpoint, and the proxy pool isn't even initialized
+        yet at this point in run()). Up to CONFIG.IGNORED_SYMBOLS_RETRIES
+        attempts with a short linear backoff.
+
+        Returns the parsed set on success, or None if every attempt failed
+        or returned something parse_ignored_symbols won't trust.
+
+        Only network/decoding errors are caught — deliberately NOT a bare
+        `except Exception`, so a CancelledError (the run watchdog firing)
+        still propagates instead of being swallowed.
+        """
+        url = CONFIG.IGNORED_SYMBOLS_URL
+        if not url:
+            return None
+
+        retries = max(1, CONFIG.IGNORED_SYMBOLS_RETRIES)
+        last_error = "unknown"
+        for attempt in range(1, retries + 1):
+            try:
+                timeout = aiohttp.ClientTimeout(total=CONFIG.IGNORED_SYMBOLS_TIMEOUT)
+                async with session.get(url, timeout=timeout) as resp:
+                    if resp.status != 200:
+                        last_error = f"HTTP {resp.status}"
+                    else:
+                        parsed = parse_ignored_symbols(await resp.text())
+                        if parsed is not None:
+                            return parsed
+                        last_error = "response was empty or not a symbol list"
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as e:
+                # ValueError covers UnicodeDecodeError from resp.text().
+                last_error = f"{type(e).__name__}: {e}"
+
+            if attempt < retries:
+                await asyncio.sleep(attempt)
+
+        logging.warning(f"⚠️ Ignore list fetch failed after {retries} attempt(s): {last_error}")
+        return None
+
+    async def load_ignored_symbols(self, session: aiohttp.ClientSession) -> Set[str]:
+        """
+        Build the effective ignore set: CONFIG.IGNORED_SYMBOLS (static) ∪
+        remote list. Remote list resolution order:
+          1. live fetch (and, on success, refresh the Redis copy);
+          2. last good copy from Redis, if the live fetch failed;
+          3. nothing — static IGNORED_SYMBOLS only (loudly logged).
+        """
+        ignored = set(CONFIG.IGNORED_SYMBOLS)
+        if not CONFIG.IGNORED_SYMBOLS_URL:
+            return ignored
+
+        remote = await self.fetch_remote_ignored_symbols(session)
+        if remote is not None:
+            await self.cache.save_cached_ignored_symbols(sorted(remote))
+            logging.info(f"🚫 Remote ignore list loaded: {len(remote)} symbols")
+        else:
+            cached = await self.cache.get_cached_ignored_symbols()
+            if cached:
+                remote = set(cached)
+                logging.warning(
+                    f"⚠️ Remote ignore list unavailable — using last known good "
+                    f"copy from Redis ({len(remote)} symbols)"
+                )
+            else:
+                remote = set()
+                logging.error(
+                    "❌ Remote ignore list unavailable and no cached copy exists — "
+                    "continuing with the static IGNORED_SYMBOLS only. Symbols from "
+                    "the remote list WILL appear in this run's report."
+                )
+
+        return ignored | remote
         
     async def send_report(
         self,
@@ -1369,6 +1679,8 @@ class RsiBot:
         for guaranteed monospace alignment across all Telegram clients.
         
         Layout per timeframe:
+        - 🔁 FLIP: UPPER BAND section        (HTF breakout → retest, if any)
+        - 🔁 FLIP: RSI <level> sections      (optional key levels, if any)
         - UPPER BAND section
         - MIDDLE BAND ▲ BULLISH section
         - MIDDLE BAND ▼ BEARISH section  
@@ -1426,8 +1738,18 @@ class RsiBot:
                 rows.append(f"│ {row} │")
             return rows
 
-        # Section definitions: key, emoji/label, sort_descending
-        section_defs = [
+        # Section definitions: key, emoji/label, sort_descending.
+        # RSI flip sections (HTF breakout → retest) come FIRST: they're the
+        # highest-signal alerts, so they lead each timeframe's message.
+        # The per-level sections only exist while FLIP_KEY_LEVELS_ENABLED
+        # is on, highest level first.
+        section_defs: List[Tuple[str, str, bool]] = []
+        if CONFIG.FLIP_ENABLED:
+            section_defs.append((FLIP_UPPER_KEY, "🔁 FLIP: UPPER BAND", True))
+            if CONFIG.FLIP_KEY_LEVELS_ENABLED:
+                for level in sorted(CONFIG.FLIP_KEY_LEVELS, reverse=True):
+                    section_defs.append((flip_key_for_level(level), f"🔁 FLIP: RSI {level:g}", True))
+        section_defs += [
             ("UPPER",          "🔼 UPPER BAND",           True),
             ("MIDDLE_BULLISH", "💠 MIDDLE ▲ BULLISH",      True),
             ("MIDDLE_BEARISH", "💠 MIDDLE ▼ BEARISH",      False),
@@ -1537,7 +1859,7 @@ class RsiBot:
                             for i, line in enumerate(block_lines):
                                 if line.startswith("└"):
                                     section_footer_line = line
-                                elif line.startswith("┌") or line.startswith("🔼") or line.startswith("💠") or line.startswith("🔽") or line == "":
+                                elif line.startswith("┌") or line.startswith("🔼") or line.startswith("💠") or line.startswith("🔽") or line.startswith("🔁") or line == "":
                                     section_header_lines.append(line)
                                 elif line.startswith("│"):
                                     content_lines.append(line)
@@ -1797,6 +2119,11 @@ class RsiBot:
         
         async with aiohttp.ClientSession() as session:
             try:
+                # ── Ignore list (static + remote) ──
+                # Fetched directly, before the proxy pool even starts —
+                # it doesn't need proxies and shouldn't depend on them.
+                self.ignored_symbols = await self.load_ignored_symbols(session)
+
                 await self.proxies.initialize(session, additional_sources=[CONFIG.PROXY_URL])
                 binance = BinanceClient(session, self.proxies)
                 bybit = BybitClient(session, self.proxies)
@@ -1809,6 +2136,7 @@ class RsiBot:
                 # We process in priority order. Once a normalized symbol is seen, skip it.
                 seen_normalized: Set[str] = set()
                 all_pairs: List[Tuple[Any, str, str, str]] = []
+                ignored_skipped: Set[str] = set()
                 
                 def add_with_dedup(
                     client: ExchangeClient,
@@ -1816,9 +2144,10 @@ class RsiBot:
                     market: str,
                     exchange: str
                 ):
-                    """Add symbols to all_pairs, skipping already-seen normalized names."""
+                    """Add symbols to all_pairs, skipping ignored and already-seen normalized names."""
                     for s in symbols:
-                        if s in CONFIG.IGNORED_SYMBOLS:
+                        if s in self.ignored_symbols:
+                            ignored_skipped.add(s)
                             continue
                         if not s.endswith("USDT"):
                             continue
@@ -1835,7 +2164,10 @@ class RsiBot:
                     add_with_dedup(bybit, ys, 'spot', 'Bybit')
                 
                 total_sym_count = len(all_pairs)
-                logging.info(f"Total unique symbols after dedup: {total_sym_count}")
+                logging.info(
+                    f"Total unique symbols after dedup: {total_sym_count} "
+                    f"(excluded {len(ignored_skipped)} via ignore lists)"
+                )
                 
                 # ── EMA Filter & Volatility Calculation ──                             
                 logging.info("Starting Unified EMA Filter & Volatility Scan...")
@@ -2006,9 +2338,10 @@ class RsiBot:
                             scan_tf: str
                         ) -> Tuple[bool, List[TouchHit], Optional[float]]:
                             """
-                            Scan a single symbol on a single timeframe for both a touch
-                            hit and a power-leaderboard score, off the same fetched
-                            closes (no extra fetch for the leaderboard).
+                            Scan a single symbol on a single timeframe for a touch
+                            hit, RSI flip hits (higher timeframes only — see
+                            CONFIG.FLIP_TFS) and a power-leaderboard score, all off
+                            the same fetched closes (no extra fetch).
 
                             Returns (fetched_ok, hits, power_score):
                               fetched_ok: True only if usable close data was
@@ -2017,7 +2350,10 @@ class RsiBot:
                                 is what makes proxy or network outages show up
                                 in the scan summary instead of being silently
                                 indistinguishable from "checked, no touch".
-                              hits: 0 or 1 TouchHit.
+                              hits: the touch hit (0 or 1) plus any flip hits
+                                (touch_type FLIP_UPPER / FLIP_<level>), all as
+                                TouchHit so they share the scan cache and
+                                send pipeline.
                               power_score: signed mean(RSI - upper) over this
                                 timeframe's power-leaderboard window, or None
                                 if leaderboard scoring is disabled or there's
@@ -2031,6 +2367,8 @@ class RsiBot:
                                 if not closes:
                                     return False, [], None
                                 
+                                is_hot = sym in hot_coins_for_timeframe(scan_tf)
+
                                 t_type, direction, rsi_val = check_bb_rsi(closes, scan_tf)
                                 hits: List[TouchHit] = []
                                 if t_type:
@@ -2042,7 +2380,22 @@ class RsiBot:
                                         rsi=rsi_val,
                                         touch_type=t_type,
                                         direction=direction if direction else "",
-                                        hot=sym in hot_coins_for_timeframe(scan_tf)
+                                        hot=is_hot
+                                    ))
+
+                                # RSI flips (breakout → retest). Returns [] for
+                                # any timeframe not in CONFIG.FLIP_TFS, so this
+                                # is a no-op on 4h/1h by default.
+                                for flip_type, flip_rsi in check_rsi_flips(closes, scan_tf):
+                                    hits.append(TouchHit(
+                                        symbol=sym,
+                                        exchange=ex,
+                                        market=mkt,
+                                        timeframe=scan_tf,
+                                        rsi=flip_rsi,
+                                        touch_type=flip_type,
+                                        direction="",
+                                        hot=is_hot
                                     ))
 
                                 window = power_leaderboard_window_for_timeframe(scan_tf)
@@ -2150,6 +2503,10 @@ class RsiBot:
                                     f"scans failed to fetch data ({fail_ratio:.0%}). Results for "
                                     f"this timeframe are likely incomplete — check proxy pool health."
                                 )
+
+                        flip_count = sum(1 for h in tf_hits if h.touch_type.startswith("FLIP_"))
+                        if flip_count:
+                            logging.info(f"🔁 [{tf}] {flip_count} RSI flip hit(s) found")
                         
                         final_hits.extend(tf_hits)
 
